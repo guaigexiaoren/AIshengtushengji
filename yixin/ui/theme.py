@@ -20,6 +20,12 @@ QLabel#BrandSubtitle {
     color: #9fb0ca;
     font-size: 11px;
 }
+QLabel#NavGroup {
+    color: #7f94b5;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 10px 14px 2px 14px;
+}
 QPushButton#NavButton {
     background: transparent;
     border: none;

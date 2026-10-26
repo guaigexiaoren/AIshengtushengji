@@ -10,7 +10,7 @@ a = Analysis(
         ("assets/app_icon.png", "assets"),
         ("yixin/collaboration/schema.sql", "yixin/collaboration"),
     ],
-    hiddenimports=["pymysql", "openpyxl"],
+    hiddenimports=["pymysql", "openpyxl", "cryptography"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

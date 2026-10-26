@@ -42,6 +42,7 @@ class CollaborationReportTests(unittest.TestCase):
                 submitted_at=start + timedelta(hours=3),
                 approved_at=start + timedelta(hours=4),
                 returned_at=start + timedelta(hours=2),
+                manual_image_count=2,
             ),
             ReportTaskRow(
                 project_id=1,
@@ -75,6 +76,7 @@ class CollaborationReportTests(unittest.TestCase):
         self.assertEqual(report.summary.approved_task_count, 1)
         self.assertEqual(report.summary.final_image_count, 2)
         self.assertEqual(report.summary.rework_count, 1)
+        self.assertEqual(report.summary.manual_image_count, 2)
         self.assertEqual(report.summary.total_cost, Decimal("9.00"))
         self.assertEqual(len(report.by_user), 2)
 
@@ -83,7 +85,7 @@ class CollaborationReportTests(unittest.TestCase):
             workbook = load_workbook(path, read_only=True)
             self.assertEqual(
                 workbook.sheetnames,
-                ["汇总", "项目明细", "人员绩效", "成本明细", "趋势"],
+                ["汇总", "任务明细", "人员绩效", "成本明细", "趋势"],
             )
             self.assertEqual(workbook["汇总"]["B2"].value, 1)
             workbook.close()

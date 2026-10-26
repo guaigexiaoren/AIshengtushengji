@@ -4,15 +4,17 @@ import ctypes
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QLibraryInfo, QTimer, QTranslator
+from PySide6.QtCore import QLibraryInfo, QLocale, Qt, QTimer, QTranslator
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .api import NanoBananaClient
 from .collaboration.cleanup import cleanup_expired_candidates
+from .collaboration.api_keys import DatabaseApiKeyStore
 from .collaboration.repository import (
     MySQLCentralRepository,
     MySQLConfig,
+    SCHEMA_VERSION,
     SchemaNotInitializedError,
 )
 from .collaboration.shared_paths import SharedPathResolver
@@ -22,15 +24,15 @@ from .database import Database
 from .library import LibraryService
 from .logging_utils import register_sensitive_value, setup_logging
 from .paths import AppPaths, resource_path
-from .security import EncryptedJsonStore, SecretStore
+from .private_config import DATABASE, SHARED_ROOT
 from .storage import FileStore
 from .ui.main_window import MainWindow
 from .ui.collaboration_login import (
-    DatabaseConfigDialog,
     InitialAdminDialog,
     LoginDialog,
 )
 from .ui.theme import APP_STYLESHEET
+from .ui.localization import install_chinese_dialog_filter
 from .worker import TaskWorker
 
 
@@ -46,7 +48,17 @@ def run() -> int:
             )
         except Exception:
             pass
+    QApplication.setAttribute(
+        Qt.ApplicationAttribute.AA_DontUseNativeDialogs,
+        True,
+    )
     app = QApplication.instance() or QApplication([])
+    QLocale.setDefault(
+        QLocale(
+            QLocale.Language.Chinese,
+            QLocale.Territory.China,
+        )
+    )
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(APP_ORGANIZATION)
     app.setStyle("Fusion")
@@ -58,10 +70,13 @@ def run() -> int:
     if translator.load("qt_zh_CN", translations_path):
         app.installTranslator(translator)
         app.translator = translator
+    install_chinese_dialog_filter(app)
 
     paths = AppPaths.default()
     try:
         paths.ensure()
+        paths.api_key_file.unlink(missing_ok=True)
+        (paths.config / "database.bin").unlink(missing_ok=True)
         prepare_legacy_data(paths)
         logger = setup_logging(paths.log_file)
         logger.info("应用启动，数据目录：%s", paths.root)
@@ -75,28 +90,24 @@ def run() -> int:
             database.active_temp_paths(),
             days=TEMP_RETENTION_DAYS,
         )
-        secret_store = SecretStore(paths.api_key_file)
-        register_sensitive_value(secret_store.load())
-        client = NanoBananaClient(lambda: secret_store.load())
-        database_config_store = EncryptedJsonStore(paths.database_config_file)
-        database_config = _load_database_config(database_config_store)
+        database_config = MySQLConfig(**DATABASE)
         repository = MySQLCentralRepository(database_config)
         _ensure_central_schema(repository)
         _ensure_initial_admin(repository)
-        login = LoginDialog(repository, database_config_store)
+        login = LoginDialog(repository)
         if login.exec() != login.DialogCode.Accepted or login.user is None:
             return 0
         actor = login.user
         repository = login.repository
+        repository.recover_stale_generation_attempts()
         shared_root = repository.get_shared_setting("share_root")
-        if not shared_root:
-            QMessageBox.warning(
-                None,
-                "尚未配置共享盘",
-                "管理员需要先在“管理控制台 → 价格与共享设置”中"
-                "填写统一 UNC 共享盘根目录。",
-            )
-        resolver = SharedPathResolver(Path(shared_root or Path.cwd()))
+        resolver = SharedPathResolver(Path(shared_root or SHARED_ROOT))
+        secret_store = DatabaseApiKeyStore(repository, actor)
+        try:
+            register_sensitive_value(secret_store.load())
+        except Exception:
+            pass
+        client = NanoBananaClient(lambda: secret_store.load())
         worker = TaskWorker(database, client, file_store)
         library_service = LibraryService(database, file_store, paths)
         window = MainWindow(
@@ -147,27 +158,12 @@ def run() -> int:
     return exit_code
 
 
-def _load_database_config(store: EncryptedJsonStore) -> MySQLConfig:
-    raw = store.load()
-    if raw is None:
-        dialog = DatabaseConfigDialog(store)
-        if dialog.exec() != dialog.DialogCode.Accepted or dialog.saved_config is None:
-            raise StartupCancelled()
-        return dialog.saved_config
-    return MySQLConfig(
-        host=str(raw["host"]),
-        port=int(raw["port"]),
-        database=str(raw["database"]),
-        user=str(raw["user"]),
-        password=str(raw["password"]),
-        charset=str(raw.get("charset", "utf8mb4")),
-    )
-
-
 def _ensure_central_schema(repository: MySQLCentralRepository) -> None:
     try:
-        repository.schema_version()
+        version = repository.schema_version()
     except SchemaNotInitializedError:
+        version = 0
+    if version < SCHEMA_VERSION:
         repository.ensure_schema()
 
 

@@ -53,10 +53,6 @@ class AppPaths:
         return self.config / "api_key.bin"
 
     @property
-    def database_config_file(self) -> Path:
-        return self.config / "database.bin"
-
-    @property
     def collaboration_marker(self) -> Path:
         return self.config / "collaboration_upgrade_v1"
 

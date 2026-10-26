@@ -11,7 +11,7 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
 
 from ..time_utils import utc_naive_to_local
-from .types import PRIORITY_LABELS, PROJECT_COMPLETED, TASK_APPROVED
+from .types import PROJECT_COMPLETED, TASK_APPROVED
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,7 @@ class ReportTaskRow:
     submitted_at: datetime | None
     approved_at: datetime | None
     returned_at: datetime | None
+    manual_image_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class SummaryMetrics:
     rework_count: int
     rework_rate: float
     generated_image_count: int
+    manual_image_count: int
     total_cost: Decimal
     cost_per_approved_task: Decimal
     cost_per_final_image: Decimal
@@ -78,6 +80,7 @@ class GroupMetrics:
     final_image_count: int
     rework_count: int
     generated_image_count: int
+    manual_image_count: int
     total_cost: Decimal
 
 
@@ -166,6 +169,7 @@ def aggregate_report(rows: list[ReportTaskRow]) -> ReportData:
         rework_count=rework_count,
         rework_rate=rework_count / len(rows) if rows else 0.0,
         generated_image_count=sum(row.generated_image_count for row in rows),
+        manual_image_count=sum(row.manual_image_count for row in rows),
         total_cost=total_cost,
         cost_per_approved_task=(
             total_cost / len(approved) if approved else Decimal("0")
@@ -217,6 +221,9 @@ def _group(rows: list[ReportTaskRow], key) -> tuple[GroupMetrics, ...]:
                 generated_image_count=sum(
                     row.generated_image_count for row in items
                 ),
+                manual_image_count=sum(
+                    row.manual_image_count for row in items
+                ),
                 total_cost=sum(
                     (row.generation_cost for row in items),
                     Decimal("0"),
@@ -233,15 +240,16 @@ def export_report_excel(report: ReportData, path: Path) -> Path:
     summary_sheet.append(["指标", "数值"])
     summary = report.summary
     summary_rows = (
-        ("项目数", summary.project_count),
+        ("总任务数", summary.project_count),
         ("子任务数", summary.task_count),
         ("已通过任务", summary.approved_task_count),
-        ("项目完成率", summary.project_completion_rate),
-        ("任务通过率", summary.task_completion_rate),
+        ("总任务完成率", summary.project_completion_rate),
+        ("子任务通过率", summary.task_completion_rate),
         ("最终图片数", summary.final_image_count),
         ("返工次数", summary.rework_count),
         ("返工率", summary.rework_rate),
         ("生成图片数", summary.generated_image_count),
+        ("PS成品数", summary.manual_image_count),
         ("总成本", float(summary.total_cost)),
         ("每个通过任务成本", float(summary.cost_per_approved_task)),
         ("每张最终图成本", float(summary.cost_per_final_image)),
@@ -253,15 +261,14 @@ def export_report_excel(report: ReportData, path: Path) -> Path:
     for row in summary_rows:
         summary_sheet.append(list(row))
 
-    project_sheet = workbook.create_sheet("项目明细")
+    project_sheet = workbook.create_sheet("任务明细")
     project_sheet.append(
         [
-            "项目编号",
-            "项目名称",
-            "项目状态",
-            "优先级",
-            "任务编号",
-            "任务状态",
+            "任务编码",
+            "货号",
+            "总任务状态",
+            "子任务编码",
+            "子任务状态",
             "运营",
             "制作人员",
             "模型",
@@ -270,8 +277,9 @@ def export_report_excel(report: ReportData, path: Path) -> Path:
             "最终图片数",
             "返工次数",
             "生成图片数",
+            "PS成品数",
             "生成成本",
-            "项目创建时间",
+            "任务创建时间",
             "领取时间",
             "提交验收时间",
             "验收通过时间",
@@ -283,7 +291,6 @@ def export_report_excel(report: ReportData, path: Path) -> Path:
                 row.project_code,
                 row.project_name,
                 row.project_status,
-                PRIORITY_LABELS.get(row.priority, row.priority),
                 row.task_code,
                 row.task_status,
                 row.owner_name,
@@ -294,6 +301,7 @@ def export_report_excel(report: ReportData, path: Path) -> Path:
                 row.final_quantity,
                 row.rework_count,
                 row.generated_image_count,
+                row.manual_image_count,
                 float(row.generation_cost),
                 _local_datetime(row.project_created_at),
                 _local_datetime(row.claimed_at),
@@ -334,6 +342,7 @@ def _append_group_sheet(workbook: Workbook, title: str, rows: tuple[GroupMetrics
             "最终图片数",
             "返工次数",
             "生成图片数",
+            "PS成品数",
             "总成本",
         ]
     )
@@ -346,6 +355,7 @@ def _append_group_sheet(workbook: Workbook, title: str, rows: tuple[GroupMetrics
                 row.final_image_count,
                 row.rework_count,
                 row.generated_image_count,
+                row.manual_image_count,
                 float(row.total_cost),
             ]
         )

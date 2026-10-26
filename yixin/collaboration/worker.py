@@ -16,7 +16,12 @@ from ..storage import (
 )
 from .repository import MySQLCentralRepository
 from .shared_paths import SharedPathResolver
-from .types import AuthUser, GeneratedResultInput, ProjectTask
+from .types import (
+    AuthUser,
+    GeneratedResultInput,
+    GenerationAttempt,
+    ProjectTask,
+)
 
 
 class GenerationWorkerSignals(QObject):
@@ -39,6 +44,7 @@ class ProjectGenerationWorker:
         aspect_ratio: str,
         resolution: str | None,
         n: int,
+        reserved_attempt: GenerationAttempt | None = None,
     ) -> None:
         self.repository = repository
         self.client = client
@@ -51,6 +57,7 @@ class ProjectGenerationWorker:
         self.aspect_ratio = aspect_ratio
         self.resolution = resolution
         self.n = n
+        self.reserved_attempt = reserved_attempt
         self.signals = GenerationWorkerSignals()
         self._thread: threading.Thread | None = None
 
@@ -70,27 +77,43 @@ class ProjectGenerationWorker:
     def _run(self) -> None:
         attempt_id = 0
         try:
+            current_task = self.repository.get_task(self.task.id)
+            if current_task is None:
+                raise ValueError("子任务不存在")
+            self.task = current_task
             unit_price = self.repository.current_model_price(self.model)
-            attempt = self.repository.create_generation_attempt(
-                self.task.id,
-                self.actor,
-                prompt=self.prompt,
-                model=self.model,
-                aspect_ratio=self.aspect_ratio,
-                resolution=self.resolution,
-                n=self.n,
-                unit_price=unit_price,
-            )
+            if self.reserved_attempt is not None:
+                attempt_id = self.reserved_attempt.id
+                attempt = self.repository.start_queued_generation_attempt(
+                    attempt_id,
+                    self.actor,
+                )
+            else:
+                attempt = self.repository.create_generation_attempt(
+                    self.task.id,
+                    self.actor,
+                    prompt=self.prompt,
+                    model=self.model,
+                    aspect_ratio=self.aspect_ratio,
+                    resolution=self.resolution,
+                    n=self.n,
+                    unit_price=unit_price,
+                )
             attempt_id = attempt.id
             project_root = self.resolver.project_root(
                 self.task.project_relative_root
             )
-            references = (
+            garment_assets = self.task.garment_assets
+            if len(garment_assets) > 13:
+                raise ValueError("每个子任务最多支持 13 张衣服图和 1 张模特图")
+            references = tuple(
                 self._stored_reference(
-                    self.task.garment_path,
-                    self.task.garment_name,
-                    self.task.garment_hash,
-                ),
+                    asset.relative_path,
+                    asset.original_name,
+                    asset.content_hash,
+                )
+                for asset in garment_assets
+            ) + (
                 self._stored_reference(
                     self.task.model_path,
                     self.task.model_name,

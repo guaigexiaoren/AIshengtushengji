@@ -75,12 +75,26 @@ class CollaborationGuiTests(unittest.TestCase):
                 height=120,
                 is_final=True,
             )
+            stale_result = GenerationResult(
+                id=11,
+                attempt_id=2,
+                result_index=0,
+                relative_path=image_path.relative_to(project).as_posix(),
+                thumbnail_relative_path=image_path.relative_to(project).as_posix(),
+                content_hash="b" * 64,
+                mime="image/png",
+                width=100,
+                height=120,
+                is_final=True,
+                source_type="manual_ps",
+                source_revision=2,
+            )
             gallery = ResultGallery(
                 SharedPathResolver(root),
                 checkable=True,
             )
-            gallery.set_task(task, [result])
-            self.assertEqual(gallery.list_widget.count(), 1)
+            gallery.set_task(task, [result, stale_result])
+            self.assertEqual(gallery.list_widget.count(), 2)
             self.assertEqual(gallery.selected_result_ids(), [10])
             gallery.deleteLater()
 

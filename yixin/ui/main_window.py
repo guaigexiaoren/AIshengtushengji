@@ -23,25 +23,24 @@ from ..collaboration.types import (
     ROLE_ADMIN,
     ROLE_AI,
     ROLE_LABELS,
-    ROLE_OPERATIONS,
     AuthUser,
 )
 from ..constants import APP_NAME, MODE_DRESS_UP, MODE_FREE_COMPOSE, STATUS_LABELS
 from ..database import Database
 from ..library import LibraryService
-from ..logging_utils import register_sensitive_value
 from ..paths import AppPaths
 from ..security import SecretStore
 from ..storage import FileStore
 from ..worker import TaskWorker
 from .batch_dress_page import BatchDressPage
 from .admin_page import AdminPage
-from .ai_projects_page import AiProjectsPage
 from .create_page import CreatePage
 from .dialogs import SettingsDialog
 from .history_page import HistoryPage
 from .library_page import LibraryPage
-from .operations_page import OperationsPage
+from .submission_list_page import SubmissionListPage
+from .task_center_page import TaskCenterPage
+from .task_create_page import TaskCreatePage
 
 
 class NavItem:
@@ -55,7 +54,13 @@ class NavItem:
 class SidebarNav(QWidget):
     currentRowChanged = Signal(int)
 
-    def __init__(self, labels: list[str], parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        labels: list[str],
+        parent: QWidget | None = None,
+        *,
+        group_before: dict[int, str] | None = None,
+    ) -> None:
         super().__init__(parent)
         self._current_row = -1
         self._buttons: list[QPushButton] = []
@@ -64,12 +69,17 @@ class SidebarNav(QWidget):
         self._button_group.setExclusive(True)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
+        layout.setSpacing(4)
+        groups = group_before or {}
         for index, text in enumerate(labels):
+            if index in groups:
+                group_label = QLabel(groups[index])
+                group_label.setObjectName("NavGroup")
+                layout.addWidget(group_label)
             button = QPushButton(text)
             button.setObjectName("NavButton")
             button.setCheckable(True)
-            button.setFixedHeight(44)
+            button.setFixedHeight(38)
             button.clicked.connect(
                 lambda _checked=False, row=index: self.setCurrentRow(row)
             )
@@ -130,23 +140,47 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.page_specs: list[tuple[str, QWidget]] = []
-        if self.actor.role in (ROLE_OPERATIONS, ROLE_ADMIN):
-            self.operations_page = OperationsPage(
-                repository,
-                resolver,
-                actor,
-            )
-            self.page_specs.append(("运营项目", self.operations_page))
+        self.new_task_page = TaskCreatePage(
+            repository,
+            resolver,
+            actor,
+        )
+        self.page_specs.append(("新建任务", self.new_task_page))
+        self.submitted_page = SubmissionListPage(
+            repository,
+            resolver,
+            actor,
+            "submitted",
+        )
+        self.pending_page = SubmissionListPage(
+            repository,
+            resolver,
+            actor,
+            "pending",
+        )
+        self.completed_page = SubmissionListPage(
+            repository,
+            resolver,
+            actor,
+            "completed",
+        )
+        self.page_specs.extend(
+            [
+                ("已提交", self.submitted_page),
+                ("待审核", self.pending_page),
+                ("已完成", self.completed_page),
+            ]
+        )
+        self.task_center_page = TaskCenterPage(
+            repository,
+            resolver,
+            actor,
+            client,
+            secret_store,
+            file_store,
+        )
+        self.page_specs.append(("任务中心", self.task_center_page))
         if self.actor.role in (ROLE_AI, ROLE_ADMIN):
-            self.project_work_page = AiProjectsPage(
-                repository,
-                resolver,
-                actor,
-                client,
-                secret_store,
-                file_store,
-            )
-            self.page_specs.append(("项目制作", self.project_work_page))
             self.create_page = CreatePage(
                 database,
                 file_store,
@@ -213,7 +247,15 @@ class MainWindow(QMainWindow):
             self.history_page.library_changed.connect(self.library_page.refresh)
             self.history_page.retry_requested.connect(self._open_retry)
         self.worker.signals.task_changed.connect(self._on_task_changed)
-        self.nav_list.setCurrentRow(0)
+        if self.actor.role in (ROLE_AI, ROLE_ADMIN):
+            initial_page = (
+                self.task_center_page
+                if self.actor.role == ROLE_AI
+                else self.new_task_page
+            )
+        else:
+            initial_page = self.new_task_page
+        self._select_page(initial_page)
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QFrame()
@@ -232,11 +274,15 @@ class MainWindow(QMainWindow):
         layout.addWidget(subtitle)
         layout.addSpacing(20)
         labels = [text for text, _ in self.page_specs]
-        self.nav_list = SidebarNav(labels)
+        group_index = 0
+        self.nav_list = SidebarNav(
+            labels,
+            group_before={group_index: "AI图提交"},
+        )
         self.nav_list.setObjectName("NavList")
         layout.addWidget(self.nav_list)
         layout.addStretch(1)
-        note = QLabel("项目候选图保留 30 天")
+        note = QLabel("任务候选图保留 30 天")
         note.setStyleSheet("color:#91a3bf;font-size:11px;")
         note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(note)
@@ -257,9 +303,8 @@ class MainWindow(QMainWindow):
             refresh()
 
     def open_settings(self) -> None:
-        dialog = SettingsDialog(self.secret_store, self.database, self)
+        dialog = SettingsDialog(self.database, self)
         dialog.exec()
-        register_sensitive_value(self.secret_store.load())
 
     def _on_task_changed(self, task_id: int, status: str) -> None:
         label = STATUS_LABELS.get(status, status)
@@ -300,8 +345,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         project_running = bool(
-            hasattr(self, "project_work_page")
-            and self.project_work_page.is_generating()
+            hasattr(self, "task_center_page")
+            and self.task_center_page.is_generating()
         )
         if self.database.has_running_tasks() or project_running:
             answer = QMessageBox.warning(

@@ -26,6 +26,7 @@ from yixin.constants import (
     MODE_FREE_COMPOSE,
     TASK_SUCCESS,
 )
+from yixin.collaboration.shared_paths import SharedPathResolver
 from yixin.database import Database
 from yixin.library import LibraryService
 from yixin.models import ImageRequest
@@ -45,6 +46,7 @@ from yixin.ui.batch_dress_page import (
 from yixin.ui.main_window import MainWindow
 from yixin.ui.theme import APP_STYLESHEET
 from yixin.worker import TaskWorker
+from tests.collaboration_fakes import EmptyCentralRepository, fake_ai_user
 
 
 class BatchDressTests(unittest.TestCase):
@@ -71,9 +73,14 @@ class BatchDressTests(unittest.TestCase):
             library_service=self.library,
             secret_store=self.secret_store,
             worker=self.worker,
+            client=object(),
+            repository=EmptyCentralRepository(),
+            resolver=SharedPathResolver(Path(self.temp.name) / "shared"),
+            actor=fake_ai_user(),
         )
         self.window.show()
         self.page = self.window.batch_dress_page
+        self.window._select_page(self.page)
         self.app.processEvents()
 
     def tearDown(self) -> None:
@@ -94,8 +101,23 @@ class BatchDressTests(unittest.TestCase):
             self.window.nav_list.item(index).text()
             for index in range(self.window.nav_list.count())
         ]
-        self.assertEqual(labels, ["创作", "批量换装", "历史记录", "作品库"])
-        self.assertIs(self.window.stack.widget(1), self.page)
+        self.assertEqual(
+            labels,
+            [
+                "新建任务",
+                "已提交",
+                "待审核",
+                "已完成",
+                "任务中心",
+                "普通创作",
+                "批量换装",
+                "历史记录",
+                "作品库",
+            ],
+        )
+        self.assertTrue(
+            any(page is self.page for _, page in self.window.page_specs)
+        )
         self.assertEqual(self.page.model_combo.currentData(), "auto")
 
     def test_folder_scan_uses_nested_paths_and_natural_order(self) -> None:
@@ -161,7 +183,7 @@ class BatchDressTests(unittest.TestCase):
     def test_external_folder_drop_works_on_list_viewport_and_asset_group(
         self,
     ) -> None:
-        self.window.nav_list.setCurrentRow(1)
+        self.window._select_page(self.page)
         self.window.show()
         self.app.processEvents()
         garment_root = Path(self.temp.name) / "viewport服装"
@@ -632,7 +654,7 @@ class BatchDressTests(unittest.TestCase):
         history._retry_current()
         self.app.processEvents()
 
-        self.assertEqual(self.window.nav_list.currentRow(), 1)
+        self.assertIs(self.window.stack.currentWidget(), self.page)
         self.assertEqual(len(self.page.pairs), 1)
         group = self.page.pairs[0]
         self.assertEqual(group.kind, "free")
@@ -851,7 +873,7 @@ class BatchDressTests(unittest.TestCase):
         self.assertGreaterEqual(thumbnail.width(), 64)
         self.assertGreaterEqual(thumbnail.height(), 64)
 
-        self.window.nav_list.setCurrentRow(1)
+        self.window._select_page(self.page)
         self.window.resize(1900, 1000)
         self.app.processEvents()
         self.assertGreaterEqual(self.page.pair_scroll.height(), 200)
@@ -902,7 +924,7 @@ class BatchDressTests(unittest.TestCase):
         ]
         self.page._append_assets("garment", garments)
         self.page._append_assets("person", people)
-        self.window.nav_list.setCurrentRow(1)
+        self.window._select_page(self.page)
         self.window.resize(1480, 920)
         self.window.show()
         self.app.processEvents()
@@ -1122,7 +1144,7 @@ class BatchDressTests(unittest.TestCase):
             for person in self.page.person_assets:
                 self.page._add_pair(garment, person)
 
-        self.window.nav_list.setCurrentRow(1)
+        self.window._select_page(self.page)
         self.window.resize(1180, 720)
         self.window.show()
         self.app.processEvents()
@@ -1277,7 +1299,7 @@ class BatchDressTests(unittest.TestCase):
         history._retry_current()
         self.app.processEvents()
 
-        self.assertEqual(self.window.nav_list.currentRow(), 1)
+        self.assertIs(self.window.stack.currentWidget(), self.page)
         self.assertEqual(len(self.database.list_tasks()), 1)
         self.assertEqual(len(self.page.pairs), 1)
         self.assertEqual(self.page.prompt_edit.toPlainText(), "历史批量换装")

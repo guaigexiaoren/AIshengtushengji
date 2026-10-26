@@ -15,6 +15,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDialog, QPushButton
 
 from yixin.constants import TASK_FAILED, TASK_SUCCESS
+from yixin.collaboration.shared_paths import SharedPathResolver
 from yixin.database import Database
 from yixin.library import LibraryService
 from yixin.models import ImageApiResult, ImageRequest, RemoteImage
@@ -39,6 +40,7 @@ from yixin.ui.widgets import (
     local_image_paths,
 )
 from yixin.worker import TaskWorker
+from tests.collaboration_fakes import EmptyCentralRepository, fake_ai_user
 from tests.helpers import make_image, png_bytes
 
 
@@ -89,8 +91,13 @@ class GuiFlowTests(unittest.TestCase):
             library_service=self.library,
             secret_store=self.secret_store,
             worker=self.worker,
+            client=fake_client,
+            repository=EmptyCentralRepository(),
+            resolver=SharedPathResolver(Path(self.temp.name) / "shared"),
+            actor=fake_ai_user(),
         )
         self.window.show()
+        self.window._select_page(self.window.create_page)
         self.app.processEvents()
 
     def tearDown(self) -> None:
@@ -142,7 +149,7 @@ class GuiFlowTests(unittest.TestCase):
         self.assertEqual(self.database.list_tasks()[1]["model"], "gemini-3-pro-image")
 
     def test_settings_dialog_saves_auto_strategy(self) -> None:
-        dialog = SettingsDialog(self.secret_store, self.database)
+        dialog = SettingsDialog(self.database)
         dialog.auto_strategy_combo.setCurrentIndex(
             dialog.auto_strategy_combo.findData("value")
         )
@@ -530,7 +537,7 @@ class GuiFlowTests(unittest.TestCase):
         self.assertTrue(history.retry_button.isEnabled())
         history._retry_current()
         self.app.processEvents()
-        self.assertEqual(self.window.nav_list.currentRow(), 0)
+        self.assertIs(self.window.stack.currentWidget(), self.window.create_page)
         self.assertEqual(len(self.database.list_tasks()), 1)
         page = self.window.create_page
         self.assertEqual(page.current_task_id, task_id)

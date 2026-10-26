@@ -9,145 +9,12 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from ..collaboration.repository import MySQLCentralRepository, MySQLConfig
+from ..collaboration.repository import MySQLCentralRepository
 from ..collaboration.types import AuthUser
-from ..security import EncryptedJsonStore
-
-
-class DatabaseConfigDialog(QDialog):
-    def __init__(
-        self,
-        store: EncryptedJsonStore,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.store = store
-        self.saved_config: MySQLConfig | None = None
-        existing = store.load() or {}
-        self.setWindowTitle("内网数据库设置")
-        self.resize(520, 360)
-        layout = QVBoxLayout(self)
-        note = QLabel(
-            "每台电脑只需配置一次。密码使用当前 Windows 账号的 DPAPI 加密，"
-            "不会写入日志或项目代码。"
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet("color:#60708a;")
-        layout.addWidget(note)
-        form = QFormLayout()
-        self.host = QLineEdit(str(existing.get("host", "")))
-        self.port = QSpinBox()
-        self.port.setRange(1, 65535)
-        self.port.setValue(int(existing.get("port", 3306)))
-        self.database = QLineEdit(str(existing.get("database", "")))
-        self.user = QLineEdit(str(existing.get("user", "")))
-        self.password = QLineEdit()
-        self.password.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password.setPlaceholderText(
-            "留空表示继续使用已经加密保存的密码"
-            if existing.get("password")
-            else "数据库密码"
-        )
-        form.addRow("服务器", self.host)
-        form.addRow("端口", self.port)
-        form.addRow("数据库", self.database)
-        form.addRow("账号", self.user)
-        form.addRow("密码", self.password)
-        layout.addLayout(form)
-        actions = QHBoxLayout()
-        test_button = QPushButton("测试连接")
-        init_button = QPushButton("初始化/升级表结构")
-        test_button.clicked.connect(self._test)
-        init_button.clicked.connect(self._initialize)
-        actions.addWidget(test_button)
-        actions.addWidget(init_button)
-        actions.addStretch(1)
-        layout.addLayout(actions)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save
-            | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self._save)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-
-    def _config(self) -> MySQLConfig:
-        password = self.password.text()
-        if not password:
-            existing = self.store.load() or {}
-            password = str(existing.get("password", ""))
-        return MySQLConfig(
-            host=self.host.text().strip(),
-            port=self.port.value(),
-            database=self.database.text().strip(),
-            user=self.user.text().strip(),
-            password=password,
-        )
-
-    def _validate_fields(self) -> bool:
-        fields = (self.host, self.database, self.user)
-        if any(not field.text().strip() for field in fields):
-            QMessageBox.warning(self, "信息不完整", "服务器、数据库和账号不能为空。")
-            return False
-        if not self.password.text() and not (self.store.load() or {}).get("password"):
-            QMessageBox.warning(self, "缺少密码", "请输入数据库密码。")
-            return False
-        return True
-
-    def _test(self) -> None:
-        if not self._validate_fields():
-            return
-        try:
-            result = MySQLCentralRepository(self._config()).test_connection()
-        except Exception as exc:
-            QMessageBox.warning(self, "连接失败", str(exc))
-            return
-        QMessageBox.information(
-            self,
-            "连接成功",
-            f"数据库：{result['db']}\nMySQL：{result['version']}",
-        )
-
-    def _initialize(self) -> None:
-        if not self._validate_fields():
-            return
-        try:
-            version = MySQLCentralRepository(self._config()).ensure_schema()
-        except Exception as exc:
-            QMessageBox.warning(self, "初始化失败", str(exc))
-            return
-        QMessageBox.information(
-            self,
-            "初始化完成",
-            f"协同表结构版本：{version}\n"
-            "如数据库中还没有管理员，请运行 tools/init_mysql.py。",
-        )
-
-    def _save(self) -> None:
-        if not self._validate_fields():
-            return
-        config = self._config()
-        try:
-            self.store.save(
-                {
-                    "host": config.host,
-                    "port": config.port,
-                    "database": config.database,
-                    "user": config.user,
-                    "password": config.password,
-                    "charset": config.charset,
-                }
-            )
-        except Exception as exc:
-            QMessageBox.warning(self, "保存失败", str(exc))
-            return
-        self.saved_config = config
-        self.accept()
 
 
 class ChangePasswordDialog(QDialog):
@@ -257,12 +124,10 @@ class LoginDialog(QDialog):
     def __init__(
         self,
         repository: MySQLCentralRepository,
-        config_store: EncryptedJsonStore,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.repository = repository
-        self.config_store = config_store
         self.user: AuthUser | None = None
         self.setWindowTitle("登录亦欣 AI 生图工作台")
         self.resize(440, 300)
@@ -281,26 +146,16 @@ class LoginDialog(QDialog):
         form.addRow("密码", self.password)
         layout.addLayout(form)
         actions = QHBoxLayout()
-        db_button = QPushButton("数据库设置")
-        db_button.clicked.connect(self._open_database_settings)
         login_button = QPushButton("登录")
         login_button.setObjectName("PrimaryButton")
         login_button.clicked.connect(self._login)
         cancel_button = QPushButton("退出")
         cancel_button.clicked.connect(self.reject)
-        actions.addWidget(db_button)
         actions.addStretch(1)
         actions.addWidget(cancel_button)
         actions.addWidget(login_button)
         layout.addLayout(actions)
         self.password.returnPressed.connect(self._login)
-
-    def _open_database_settings(self) -> None:
-        dialog = DatabaseConfigDialog(self.config_store, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        if dialog.saved_config:
-            self.repository = MySQLCentralRepository(dialog.saved_config)
 
     def _login(self) -> None:
         username = self.username.text().strip()
@@ -330,6 +185,8 @@ class LoginDialog(QDialog):
                 role=user.role,
                 must_change_password=False,
                 is_active=True,
+                urgent_quota_per_day=user.urgent_quota_per_day,
+                max_generation_concurrency=user.max_generation_concurrency,
             )
         self.user = user
         self.accept()

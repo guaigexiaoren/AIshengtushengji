@@ -12,6 +12,13 @@ from .types import (
     ProjectRecord,
     ProjectTask,
     ReviewDecision,
+    AccountPolicy,
+    CandidateImage,
+    GenerationJob,
+    SourceAsset,
+    SubmissionDraft,
+    SubmissionSubtask,
+    SubmissionTask,
 )
 
 __all__ = [
@@ -28,4 +35,11 @@ __all__ = [
     "ProjectRecord",
     "ProjectTask",
     "ReviewDecision",
+    "AccountPolicy",
+    "CandidateImage",
+    "GenerationJob",
+    "SourceAsset",
+    "SubmissionDraft",
+    "SubmissionSubtask",
+    "SubmissionTask",
 ]

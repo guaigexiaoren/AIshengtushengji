@@ -1,7 +1,7 @@
 import os
 import threading
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 from yixin.collaboration.repository import MySQLCentralRepository, MySQLConfig
@@ -74,6 +74,21 @@ class MySQLIntegrationTests(unittest.TestCase):
                 "TempAi2123",
             )
             users.extend((operator.id, ai_one.id, ai_two.id))
+            repository.set_user_policies(
+                admin,
+                operator.id,
+                urgent_quota_per_day=2,
+                max_generation_concurrency=2,
+            )
+            repository.save_api_key(
+                admin,
+                ai_one.id,
+                "sk-integration-key-123",
+            )
+            self.assertEqual(
+                repository.load_actor_api_key(ai_one),
+                "sk-integration-key-123",
+            )
             repository.set_model_price(
                 admin,
                 "gemini-3.1-flash-image",
@@ -82,7 +97,7 @@ class MySQLIntegrationTests(unittest.TestCase):
             project_id = repository.create_project(
                 operator,
                 ProjectDraft(
-                    project_code="_INTEGRATION_PROJECT",
+                    project_code="",
                     name="集成测试",
                     deadline=datetime.now() + timedelta(days=1),
                     priority="normal",
@@ -99,6 +114,24 @@ class MySQLIntegrationTests(unittest.TestCase):
                             10,
                         ),
                         ProjectAssetInput(
+                            "garment",
+                            "衣服图/G002.png",
+                            "G002.png",
+                            "d" * 64,
+                            "image/png",
+                            10,
+                            10,
+                        ),
+                        ProjectAssetInput(
+                            "garment",
+                            "衣服图/G003.png",
+                            "G003.png",
+                            "e" * 64,
+                            "image/png",
+                            10,
+                            10,
+                        ),
+                        ProjectAssetInput(
                             "model",
                             "模特图/M001.png",
                             "M001.png",
@@ -107,11 +140,39 @@ class MySQLIntegrationTests(unittest.TestCase):
                             10,
                             10,
                         ),
+                        ProjectAssetInput(
+                            "model",
+                            "模特图/M002.png",
+                            "M002.png",
+                            "f" * 64,
+                            "image/png",
+                            10,
+                            10,
+                        ),
                     ),
-                    pairs=(PairingInput(0, 0),),
+                    pairs=(
+                        PairingInput(0, 0),
+                        PairingInput(1, 0),
+                        PairingInput(2, 0),
+                        PairingInput(0, 1),
+                        PairingInput(1, 1),
+                        PairingInput(2, 1),
+                    ),
+                    source_date=date.today(),
+                    product_code="集成货号",
                 ),
             )
-            task = repository.list_project_tasks(project_id)[0]
+            project = repository.get_project(project_id)
+            self.assertRegex(
+                project.project_code,
+                r"^集成运营-集成货号-\d{3,}$",
+            )
+            project_tasks = repository.list_project_tasks(project_id)
+            self.assertEqual(len(project_tasks), 2)
+            self.assertTrue(
+                all(len(task.garment_assets) == 3 for task in project_tasks)
+            )
+            task = project_tasks[0]
             outcomes = []
 
             def claim(actor):
@@ -193,6 +254,12 @@ class MySQLIntegrationTests(unittest.TestCase):
                         )
                     if users:
                         placeholders = ", ".join(["%s"] * len(users))
+                        cursor.execute(
+                            f"DELETE FROM user_api_keys "
+                            f"WHERE user_id IN ({placeholders}) "
+                            f"OR updated_by IN ({placeholders})",
+                            tuple(users) + tuple(users),
+                        )
                         cursor.execute(
                             f"DELETE FROM model_prices WHERE created_by IN ({placeholders})",
                             tuple(users),

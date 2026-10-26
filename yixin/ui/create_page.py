@@ -706,13 +706,11 @@ class CreatePage(QWidget):
 
     def _enqueue_generation(self) -> None:
         if not self.secret_store.load():
-            answer = QMessageBox.question(
+            QMessageBox.warning(
                 self,
-                "尚未设置 API Key",
-                "请先在设置中填写 API Key。现在打开设置吗？",
+                "API Key 不可用",
+                "当前账号尚未配置 API Key，请联系管理员。",
             )
-            if answer == QMessageBox.StandardButton.Yes:
-                self.settings_requested.emit()
             return
         prompt = self.prompt_edit.toPlainText().strip()
         if not prompt:

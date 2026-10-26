@@ -24,7 +24,6 @@ from PySide6.QtWidgets import (
 )
 
 from ..database import Database
-from ..security import SecretStore, mask_secret, validate_api_key
 from ..settings import (
     AUTO_STRATEGIES,
     AUTO_STRATEGY_LABELS,
@@ -38,31 +37,14 @@ from .widgets import CompareWidget, load_scaled_pixmap
 class SettingsDialog(QDialog):
     def __init__(
         self,
-        secret_store: SecretStore,
         database: Database,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.secret_store = secret_store
         self.settings = AppSettings(database)
         self.setWindowTitle("设置")
         self.setMinimumWidth(650)
         layout = QVBoxLayout(self)
-        intro = QLabel(
-            "API Key 仅保存在本机，并使用 Windows 当前用户加密。软件不会调用未确认的验证接口。"
-        )
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-
-        self.current_label = QLabel()
-        self.key_edit = QLineEdit()
-        self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.key_edit.setPlaceholderText("粘贴新的 API Key；留空不会覆盖现有密钥")
-        form = QFormLayout()
-        form.addRow("当前密钥", self.current_label)
-        form.addRow("新密钥", self.key_edit)
-        layout.addLayout(form)
-
         auto_group = QGroupBox("自动模型策略")
         auto_form = QFormLayout(auto_group)
         self.auto_strategy_combo = QComboBox()
@@ -112,26 +94,21 @@ class SettingsDialog(QDialog):
         layout.addWidget(warning)
 
         buttons = QHBoxLayout()
-        self.clear_button = QPushButton("清除已保存密钥")
-        self.clear_button.setObjectName("DangerButton")
         self.save_button = QPushButton("保存")
         self.save_button.setObjectName("PrimaryButton")
         close_button = QPushButton("关闭")
-        buttons.addWidget(self.clear_button)
         buttons.addStretch(1)
         buttons.addWidget(close_button)
         buttons.addWidget(self.save_button)
         layout.addLayout(buttons)
 
         self.save_button.clicked.connect(self._save)
-        self.clear_button.clicked.connect(self._clear)
         self.fixed_folder_button.clicked.connect(self._choose_fixed_folder)
         self.local_mode_combo.currentIndexChanged.connect(self._update_folder_controls)
         close_button.clicked.connect(self.accept)
         self._refresh()
 
     def _refresh(self) -> None:
-        self.current_label.setText(mask_secret(self.secret_store.load()))
         mode = self.settings.local_save_mode()
         index = self.local_mode_combo.findData(mode)
         self.local_mode_combo.setCurrentIndex(index if index >= 0 else 0)
@@ -166,15 +143,6 @@ class SettingsDialog(QDialog):
         if mode == "fixed" and not Path(folder_text).is_dir():
             QMessageBox.warning(self, "目录不可用", "固定保存目录不存在或不可访问。")
             return
-        value = self.key_edit.text()
-        if value.strip():
-            try:
-                validate_api_key(value)
-                self.secret_store.save(value)
-            except Exception as exc:
-                QMessageBox.warning(self, "无法保存", str(exc))
-                return
-            self.key_edit.clear()
         self.settings.set_local_save_mode(mode)
         self.settings.set_auto_strategy(self.auto_strategy_combo.currentData())
         self.settings.set_fixed_folder(Path(folder_text) if folder_text else None)
@@ -182,17 +150,8 @@ class SettingsDialog(QDialog):
         QMessageBox.information(
             self,
             "已保存",
-            "设置已保存。API Key 仍使用 Windows DPAPI 加密。"
-            if value.strip()
-            else "本地保存设置已保存。",
+            "本地保存设置已保存。",
         )
-
-    def _clear(self) -> None:
-        answer = QMessageBox.question(self, "确认清除", "确定清除本机保存的 API Key 吗？")
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        self.secret_store.clear()
-        self._refresh()
 
 
 class CompareDialog(QDialog):

@@ -11,6 +11,8 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash VARCHAR(255) NOT NULL,
     must_change_password TINYINT(1) NOT NULL DEFAULT 1,
     is_active TINYINT(1) NOT NULL DEFAULT 1,
+    urgent_quota_per_day INT NOT NULL DEFAULT 3,
+    max_generation_concurrency INT NOT NULL DEFAULT 2,
     last_login_at DATETIME(6) NULL,
     created_at DATETIME(6) NOT NULL,
     updated_at DATETIME(6) NOT NULL,
@@ -30,6 +32,9 @@ CREATE TABLE IF NOT EXISTS projects (
     owner_id BIGINT UNSIGNED NOT NULL,
     project_relative_root VARCHAR(1024) NOT NULL,
     pairing_mode VARCHAR(24) NOT NULL,
+    source_date DATE NOT NULL,
+    product_code VARCHAR(200) NOT NULL,
+    source_revision INT NOT NULL DEFAULT 1,
     created_at DATETIME(6) NOT NULL,
     updated_at DATETIME(6) NOT NULL,
     completed_at DATETIME(6) NULL,
@@ -71,6 +76,10 @@ CREATE TABLE IF NOT EXISTS project_tasks (
     resolution VARCHAR(24) NULL,
     n INT NOT NULL DEFAULT 1,
     final_quantity INT NOT NULL DEFAULT 0,
+    source_revision INT NOT NULL DEFAULT 1,
+    is_urgent TINYINT(1) NOT NULL DEFAULT 0,
+    urgent_date DATE NULL,
+    urgent_by BIGINT UNSIGNED NULL,
     claimed_at DATETIME(6) NULL,
     work_started_at DATETIME(6) NULL,
     submitted_at DATETIME(6) NULL,
@@ -85,6 +94,8 @@ CREATE TABLE IF NOT EXISTS project_tasks (
     CONSTRAINT fk_project_tasks_model FOREIGN KEY (model_asset_id)
         REFERENCES project_assets(id),
     CONSTRAINT fk_project_tasks_assignee FOREIGN KEY (assignee_id)
+        REFERENCES users(id),
+    CONSTRAINT fk_project_tasks_urgent_by FOREIGN KEY (urgent_by)
         REFERENCES users(id),
     UNIQUE KEY uk_project_task_no (project_id, task_no),
     INDEX idx_project_tasks_status_created (status, created_at),
@@ -102,6 +113,7 @@ CREATE TABLE IF NOT EXISTS generation_attempts (
     resolution VARCHAR(24) NULL,
     n INT NOT NULL,
     status VARCHAR(24) NOT NULL,
+    source_revision INT NOT NULL DEFAULT 1,
     unit_price DECIMAL(12, 4) NOT NULL DEFAULT 0,
     generated_image_count INT NOT NULL DEFAULT 0,
     request_id VARCHAR(255) NOT NULL DEFAULT '',
@@ -134,6 +146,8 @@ CREATE TABLE IF NOT EXISTS generation_results (
     width INT NOT NULL,
     height INT NOT NULL,
     is_final TINYINT(1) NOT NULL DEFAULT 0,
+    source_type VARCHAR(24) NOT NULL DEFAULT 'generated',
+    source_revision INT NOT NULL DEFAULT 1,
     created_at DATETIME(6) NOT NULL,
     expire_at DATETIME(6) NULL,
     CONSTRAINT fk_generation_results_attempt FOREIGN KEY (attempt_id)
@@ -209,6 +223,41 @@ CREATE TABLE IF NOT EXISTS shared_settings (
     updated_by BIGINT UNSIGNED NULL,
     updated_at DATETIME(6) NOT NULL,
     CONSTRAINT fk_shared_settings_user FOREIGN KEY (updated_by)
+        REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS task_garments (
+    task_id BIGINT UNSIGNED NOT NULL,
+    garment_asset_id BIGINT UNSIGNED NOT NULL,
+    position INT NOT NULL,
+    PRIMARY KEY (task_id, garment_asset_id),
+    CONSTRAINT fk_task_garments_task FOREIGN KEY (task_id)
+        REFERENCES project_tasks(id) ON DELETE CASCADE,
+    CONSTRAINT fk_task_garments_asset FOREIGN KEY (garment_asset_id)
+        REFERENCES project_assets(id),
+    INDEX idx_task_garments_position (task_id, position)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS task_code_sequences (
+    owner_id BIGINT UNSIGNED NOT NULL,
+    sequence_date DATE NOT NULL,
+    current_value INT NOT NULL,
+    PRIMARY KEY (owner_id, sequence_date),
+    CONSTRAINT fk_task_code_sequences_owner FOREIGN KEY (owner_id)
+        REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS user_api_keys (
+    user_id BIGINT UNSIGNED NOT NULL PRIMARY KEY,
+    encrypted_key LONGTEXT NOT NULL,
+    key_suffix VARCHAR(8) NOT NULL,
+    updated_by BIGINT UNSIGNED NOT NULL,
+    updated_at DATETIME(6) NOT NULL,
+    last_test_status VARCHAR(24) NOT NULL DEFAULT '',
+    last_test_at DATETIME(6) NULL,
+    CONSTRAINT fk_user_api_keys_user FOREIGN KEY (user_id)
+        REFERENCES users(id) ON DELETE CASCADE,
+    CONSTRAINT fk_user_api_keys_admin FOREIGN KEY (updated_by)
         REFERENCES users(id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 

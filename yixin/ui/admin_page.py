@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QTableWidget,
@@ -36,7 +37,6 @@ from ..collaboration.reports import ReportData, ReportFilter, export_report_exce
 from ..collaboration.reports import GroupMetrics
 from ..collaboration.repository import MySQLCentralRepository
 from ..collaboration.types import (
-    PRIORITY_LABELS,
     PROJECT_STATUS_LABELS,
     ROLE_ADMIN,
     ROLE_AI,
@@ -48,6 +48,7 @@ from ..collaboration.types import (
     ProjectTask,
 )
 from ..constants import MODEL_OPTIONS
+from ..security import validate_api_key
 from ..time_utils import utc_naive_to_local
 
 
@@ -65,10 +66,18 @@ class AddUserDialog(QDialog):
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
         self.password.setPlaceholderText("至少 8 个字符，首次登录后强制修改")
+        self.urgent_quota = QSpinBox()
+        self.urgent_quota.setRange(0, 99)
+        self.urgent_quota.setValue(3)
+        self.max_concurrency = QSpinBox()
+        self.max_concurrency.setRange(1, 10)
+        self.max_concurrency.setValue(2)
         form.addRow("登录账号", self.username)
-        form.addRow("姓名", self.display_name)
+        form.addRow("显示名称/项目名", self.display_name)
         form.addRow("角色", self.role)
         form.addRow("临时密码", self.password)
+        form.addRow("每日加急额度", self.urgent_quota)
+        form.addRow("最大生成并发", self.max_concurrency)
         layout.addLayout(form)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -77,6 +86,124 @@ class AddUserDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+
+class ApiKeyDialog(QDialog):
+    def __init__(
+        self,
+        repository: MySQLCentralRepository,
+        actor: AuthUser,
+        target: AuthUser,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.repository = repository
+        self.actor = actor
+        self.target = target
+        self.setWindowTitle(f"配置 API Key · {target.display_name}")
+        self.setMinimumWidth(480)
+        layout = QVBoxLayout(self)
+        tip = QLabel(
+            "密钥将以加密形式保存到数据库，界面只显示尾号。"
+            "任何人员都不能通过程序界面查看完整密钥。"
+        )
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+        form = QFormLayout()
+        self.key_edit = QLineEdit()
+        self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_edit.setPlaceholderText("粘贴新的 API Key")
+        form.addRow("API Key", self.key_edit)
+        layout.addLayout(form)
+        actions = QHBoxLayout()
+        check = QPushButton("检查格式")
+        cancel = QPushButton("取消")
+        save = QPushButton("保存")
+        save.setObjectName("PrimaryButton")
+        cancel.clicked.connect(self.reject)
+        check.clicked.connect(self._check_format)
+        save.clicked.connect(self._save)
+        actions.addStretch(1)
+        actions.addWidget(check)
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+        layout.addLayout(actions)
+
+    def _check_format(self) -> None:
+        try:
+            validate_api_key(self.key_edit.text())
+        except Exception as exc:
+            QMessageBox.warning(self, "格式不正确", str(exc))
+            return
+        QMessageBox.information(self, "格式正确", "API Key 格式检查通过。")
+
+    def _save(self) -> None:
+        try:
+            self.repository.save_api_key(
+                self.actor,
+                self.target.id,
+                self.key_edit.text(),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
+        self.accept()
+
+
+class AccountPolicyDialog(QDialog):
+    def __init__(
+        self,
+        repository: MySQLCentralRepository,
+        actor: AuthUser,
+        target: AuthUser,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.repository = repository
+        self.actor = actor
+        self.target = target
+        self.setWindowTitle(f"账号策略 · {target.display_name}")
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.display_name = QLineEdit(target.display_name)
+        form.addRow("显示名称/项目名", self.display_name)
+        self.urgent_quota = QSpinBox()
+        self.urgent_quota.setRange(0, 99)
+        self.urgent_quota.setValue(target.urgent_quota_per_day)
+        self.max_concurrency = QSpinBox()
+        self.max_concurrency.setRange(1, 10)
+        self.max_concurrency.setValue(target.max_generation_concurrency)
+        form.addRow("每日加急额度", self.urgent_quota)
+        form.addRow("最大生成并发", self.max_concurrency)
+        layout.addLayout(form)
+        actions = QHBoxLayout()
+        cancel = QPushButton("取消")
+        save = QPushButton("保存")
+        save.setObjectName("PrimaryButton")
+        cancel.clicked.connect(self.reject)
+        save.clicked.connect(self._save)
+        actions.addStretch(1)
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+        layout.addLayout(actions)
+
+    def _save(self) -> None:
+        try:
+            self.repository.set_user_display_name(
+                self.actor,
+                self.target.id,
+                self.display_name.text(),
+            )
+            self.repository.set_user_policies(
+                self.actor,
+                self.target.id,
+                urgent_quota_per_day=self.urgent_quota.value(),
+                max_generation_concurrency=self.max_concurrency.value(),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
+        self.accept()
 
 
 class AdminTrendChart(QWidget):
@@ -162,6 +289,7 @@ class AdminPage(QWidget):
         self.projects: list[ProjectRecord] = []
         self.tasks: list[ProjectTask] = []
         self.users: list[AuthUser] = []
+        self.api_key_statuses: dict[int, dict] = {}
         self.report_data: ReportData | None = None
         self._build()
         self.refresh_all()
@@ -177,7 +305,7 @@ class AdminPage(QWidget):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_users_tab(), "用户与权限")
         self.tabs.addTab(self._build_settings_tab(), "价格与共享设置")
-        self.tabs.addTab(self._build_exceptions_tab(), "项目异常")
+        self.tabs.addTab(self._build_exceptions_tab(), "任务异常")
         self.tabs.addTab(self._build_reports_tab(), "经营报表")
         layout.addWidget(self.tabs, 1)
 
@@ -201,17 +329,36 @@ class AdminPage(QWidget):
         self.toggle_user_button.clicked.connect(self._toggle_user)
         reset_button = QPushButton("重置密码")
         reset_button.clicked.connect(self._reset_password)
+        self.api_key_button = QPushButton("配置 API Key")
+        self.api_key_button.clicked.connect(self._configure_api_key)
+        self.clear_api_key_button = QPushButton("清除 API Key")
+        self.clear_api_key_button.clicked.connect(self._clear_api_key)
+        policy_button = QPushButton("账号策略")
+        policy_button.clicked.connect(self._edit_policy)
         refresh_button = QPushButton("刷新")
         refresh_button.clicked.connect(self._refresh_users)
         toolbar.addWidget(add_button)
         toolbar.addWidget(self.toggle_user_button)
         toolbar.addWidget(reset_button)
+        toolbar.addWidget(self.api_key_button)
+        toolbar.addWidget(self.clear_api_key_button)
+        toolbar.addWidget(policy_button)
         toolbar.addStretch(1)
         toolbar.addWidget(refresh_button)
         layout.addLayout(toolbar)
-        self.user_table = QTableWidget(0, 5)
+        self.user_table = QTableWidget(0, 9)
         self.user_table.setHorizontalHeaderLabels(
-            ["账号", "姓名", "角色", "状态", "首次改密"]
+            [
+                "账号",
+                "姓名",
+                "角色",
+                "状态",
+                "首次改密",
+                "API Key",
+                "密钥更新时间",
+                "每日加急",
+                "并发上限",
+            ]
         )
         self.user_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -287,7 +434,7 @@ class AdminPage(QWidget):
         splitter = QSplitter(Qt.Orientation.Vertical)
         self.project_table = QTableWidget(0, 7)
         self.project_table.setHorizontalHeaderLabels(
-            ["项目编号", "名称", "运营", "状态", "任务进度", "优先级", "截止时间"]
+            ["任务编码", "货号", "运营", "状态", "子任务进度", "加急数", "日期"]
         )
         self.project_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -313,8 +460,8 @@ class AdminPage(QWidget):
         layout.addWidget(splitter, 1)
         actions = QHBoxLayout()
         reassign = QPushButton("改派所选任务")
-        cancel = QPushButton("取消所选项目")
-        reopen = QPushButton("重开所选项目")
+        cancel = QPushButton("取消所选任务")
+        reopen = QPushButton("重开所选任务")
         refresh = QPushButton("刷新")
         reassign.clicked.connect(self._reassign_task)
         cancel.clicked.connect(self._admin_cancel_project)
@@ -369,8 +516,8 @@ class AdminPage(QWidget):
         self.report_table = QTableWidget(0, 9)
         self.report_table.setHorizontalHeaderLabels(
             [
-                "项目",
-                "任务",
+                "任务编码",
+                "子任务",
                 "制作人员",
                 "模型",
                 "服装",
@@ -390,6 +537,7 @@ class AdminPage(QWidget):
     def _refresh_users(self) -> None:
         try:
             self.users = self.repository.list_users()
+            self.api_key_statuses = self.repository.api_key_statuses()
         except Exception as exc:
             QMessageBox.warning(self, "读取账号失败", str(exc))
             return
@@ -403,6 +551,20 @@ class AdminPage(QWidget):
                 ROLE_LABELS.get(user.role, user.role),
                 "启用" if user.is_active else "停用",
                 "是" if user.must_change_password else "否",
+                (
+                    f"已配置 · {key_info['key_suffix']}"
+                    if (key_info := self.api_key_statuses.get(user.id))
+                    else "未配置"
+                ),
+                (
+                    utc_naive_to_local(key_info["updated_at"]).strftime(
+                        "%Y-%m-%d %H:%M"
+                    )
+                    if (key_info := self.api_key_statuses.get(user.id))
+                    else ""
+                ),
+                str(user.urgent_quota_per_day),
+                str(user.max_generation_concurrency),
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -422,16 +584,63 @@ class AdminPage(QWidget):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            self.repository.create_user(
+            user = self.repository.create_user(
                 dialog.username.text(),
                 dialog.display_name.text(),
                 dialog.role.currentData(),
                 dialog.password.text(),
             )
+            self.repository.set_user_policies(
+                self.actor,
+                user.id,
+                urgent_quota_per_day=dialog.urgent_quota.value(),
+                max_generation_concurrency=dialog.max_concurrency.value(),
+            )
         except Exception as exc:
             QMessageBox.warning(self, "新增失败", str(exc))
             return
         self._refresh_users()
+
+    def _configure_api_key(self) -> None:
+        user = self._current_user()
+        if user is None:
+            return
+        if user.role not in (ROLE_AI, ROLE_ADMIN):
+            QMessageBox.warning(
+                self,
+                "无需配置",
+                "只有 AI 制作或管理员账号需要配置 API Key。",
+            )
+            return
+        dialog = ApiKeyDialog(self.repository, self.actor, user, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._refresh_users()
+
+    def _clear_api_key(self) -> None:
+        user = self._current_user()
+        if user is None or user.id not in self.api_key_statuses:
+            return
+        answer = QMessageBox.question(
+            self,
+            "清除 API Key",
+            f"确定清除 {user.display_name} 的 API Key 吗？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.repository.clear_api_key(self.actor, user.id)
+        except Exception as exc:
+            QMessageBox.warning(self, "清除失败", str(exc))
+            return
+        self._refresh_users()
+
+    def _edit_policy(self) -> None:
+        user = self._current_user()
+        if user is None:
+            return
+        dialog = AccountPolicyDialog(self.repository, self.actor, user, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._refresh_users()
 
     def _toggle_user(self) -> None:
         user = self._current_user()
@@ -630,28 +839,28 @@ class AdminPage(QWidget):
         try:
             self.projects = self.repository.list_projects()
         except Exception as exc:
-            QMessageBox.warning(self, "读取项目失败", str(exc))
+            QMessageBox.warning(self, "读取任务失败", str(exc))
             return
         self.project_table.setRowCount(0)
         self.project_filter.blockSignals(True)
         self.project_filter.clear()
-        self.project_filter.addItem("全部项目", None)
+        self.project_filter.addItem("全部任务", None)
         for project in self.projects:
             row = self.project_table.rowCount()
             self.project_table.insertRow(row)
             values = (
                 project.project_code,
-                project.name,
+                project.product_code or project.name,
                 project.owner_name,
                 PROJECT_STATUS_LABELS.get(project.status, project.status),
                 f"{project.approved_count}/{project.task_count}",
-                PRIORITY_LABELS.get(project.priority, project.priority),
-                utc_naive_to_local(project.deadline).strftime("%Y-%m-%d %H:%M"),
+                str(project.urgent_count),
+                project.source_date.isoformat() if project.source_date else "",
             )
             for column, value in enumerate(values):
                 self.project_table.setItem(row, column, QTableWidgetItem(value))
             self.project_filter.addItem(
-                f"{project.project_code} · {project.name}",
+                f"{project.project_code} · {project.product_code or project.name}",
                 project.id,
             )
         self.project_filter.blockSignals(False)
@@ -731,8 +940,8 @@ class AdminPage(QWidget):
             return
         answer = QMessageBox.question(
             self,
-            "取消项目",
-            f"确定取消“{project.project_code}”吗？",
+            "取消任务",
+            f"确定取消任务“{project.project_code}”吗？",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
@@ -749,7 +958,7 @@ class AdminPage(QWidget):
             return
         reason, ok = QInputDialog.getMultiLineText(
             self,
-            "重开项目",
+            "重开任务",
             "重开原因",
         )
         if not ok or not reason.strip():
@@ -793,13 +1002,14 @@ class AdminPage(QWidget):
             return
         summary = self.report_data.summary
         self.summary_label.setText(
-            f"项目 {summary.project_count} 个　任务 {summary.task_count} 个　"
+            f"总任务 {summary.project_count} 个　子任务 {summary.task_count} 个　"
             f"已通过 {summary.approved_task_count} 个　"
-            f"项目完成率 {summary.project_completion_rate:.1%}　"
-            f"任务通过率 {summary.task_completion_rate:.1%}　"
+            f"总任务完成率 {summary.project_completion_rate:.1%}　"
+            f"子任务通过率 {summary.task_completion_rate:.1%}　"
             f"最终图片 {summary.final_image_count} 张　"
             f"返工 {summary.rework_count} 次（{summary.rework_rate:.1%}）\n"
             f"生成图片 {summary.generated_image_count} 张　"
+            f"PS成品 {summary.manual_image_count} 张　"
             f"成本 ¥{summary.total_cost:.2f}　"
             f"每通过任务 ¥{summary.cost_per_approved_task:.2f}　"
             f"每最终图 ¥{summary.cost_per_final_image:.2f}　"

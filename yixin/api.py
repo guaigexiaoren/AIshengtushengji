@@ -139,7 +139,7 @@ class NanoBananaClient:
     def generate(self, request: ImageRequest) -> ImageApiResult:
         key = self.key_provider()
         if not key:
-            raise ConfigurationError("请先在设置中填写 API Key")
+            raise ConfigurationError("尚未配置 API Key，请联系管理员")
         register_sensitive_value(key)
         payload = self.build_payload(request)
         headers = {
@@ -200,7 +200,7 @@ class NanoBananaClient:
         if not response.is_success:
             message = _error_message(raw_payload, f"HTTP {response.status_code}")
             if response.status_code == 401:
-                message = "API Key 无效或已失效，请在设置中重新填写"
+                message = "API Key 无效或不可用，请联系管理员"
             elif response.status_code == 429:
                 message = "请求过于频繁或额度不足，请稍后手动重试"
             raise ApiError(

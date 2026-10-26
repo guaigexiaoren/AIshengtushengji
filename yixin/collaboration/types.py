@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 
 
@@ -23,7 +23,7 @@ PROJECT_CANCELLED = "cancelled"
 PROJECT_STATUS_LABELS = {
     PROJECT_SUBMITTED: "已提交",
     PROJECT_IN_PROGRESS: "制作中",
-    PROJECT_AWAITING_ACCEPTANCE: "待验收",
+    PROJECT_AWAITING_ACCEPTANCE: "待审核",
     PROJECT_COMPLETED: "已完成",
     PROJECT_CANCELLED: "已取消",
 }
@@ -36,12 +36,12 @@ TASK_RETURNED = "returned"
 TASK_APPROVED = "approved"
 TASK_CANCELLED = "cancelled"
 TASK_STATUS_LABELS = {
-    TASK_AVAILABLE: "可领取",
-    TASK_CLAIMED: "已领取",
-    TASK_WORKING: "生成中",
-    TASK_AWAITING_ACCEPTANCE: "待运营验收",
+    TASK_AVAILABLE: "已提交",
+    TASK_CLAIMED: "制作中",
+    TASK_WORKING: "制作中",
+    TASK_AWAITING_ACCEPTANCE: "待审核",
     TASK_RETURNED: "已退回",
-    TASK_APPROVED: "已通过",
+    TASK_APPROVED: "已完成",
     TASK_CANCELLED: "已取消",
 }
 
@@ -76,6 +76,8 @@ class AuthUser:
     role: str
     must_change_password: bool = False
     is_active: bool = True
+    urgent_quota_per_day: int = 3
+    max_generation_concurrency: int = 2
 
 
 @dataclass(frozen=True)
@@ -108,6 +110,8 @@ class ProjectDraft:
     brand_platform: str = ""
     category: str = ""
     note: str = ""
+    source_date: date | None = None
+    product_code: str = ""
 
 
 @dataclass(frozen=True)
@@ -130,6 +134,9 @@ class ProjectRecord:
     task_count: int = 0
     approved_count: int = 0
     awaiting_count: int = 0
+    product_code: str = ""
+    source_date: date | None = None
+    urgent_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -166,6 +173,13 @@ class ProjectTask:
     returned_at: datetime | None = None
     project_deadline: datetime | None = None
     project_priority: str = "normal"
+    source_date: date | None = None
+    product_code: str = ""
+    source_revision: int = 1
+    garment_assets: tuple[ProjectAssetInput, ...] = ()
+    is_urgent: bool = False
+    urgent_date: date | None = None
+    urgent_by: int | None = None
 
 
 @dataclass(frozen=True)
@@ -180,6 +194,7 @@ class GenerationAttempt:
     resolution: str | None
     n: int
     status: str
+    source_revision: int
     unit_price: Decimal
     generated_image_count: int
     request_id: str = ""
@@ -187,6 +202,7 @@ class GenerationAttempt:
     input_tokens: int | None = None
     output_tokens: int | None = None
     error_message: str = ""
+    operator_name: str = ""
     created_at: datetime | None = None
     finished_at: datetime | None = None
 
@@ -203,6 +219,8 @@ class GenerationResult:
     width: int
     height: int
     is_final: bool
+    source_type: str = "generated"
+    source_revision: int = 1
 
 
 @dataclass(frozen=True)
@@ -220,3 +238,13 @@ class GeneratedResultInput:
 class ReviewDecision:
     approved: bool
     reason: str = ""
+
+
+# User-facing names used by the v2 submission workflow.
+SubmissionTask = ProjectRecord
+SubmissionSubtask = ProjectTask
+SubmissionDraft = ProjectDraft
+SourceAsset = ProjectAssetInput
+GenerationJob = GenerationAttempt
+CandidateImage = GenerationResult
+AccountPolicy = AuthUser

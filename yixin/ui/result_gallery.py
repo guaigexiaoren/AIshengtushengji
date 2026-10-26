@@ -80,9 +80,16 @@ class ResultGallery(QWidget):
                 task.project_relative_root,
                 result.relative_path,
             )
+            source_label = (
+                "PS成品"
+                if result.source_type == "manual_ps"
+                else "AI生成"
+            )
+            stale = result.source_revision != task.source_revision
             item = QListWidgetItem(
-                f"第 {result.result_index + 1} 张"
+                f"{source_label} · 第 {result.result_index + 1} 张"
                 + (" · 最终" if result.is_final else "")
+                + (" · 素材已变更" if stale else "")
             )
             pixmap = load_scaled_pixmap(preview_path, QSize(140, 140))
             if not pixmap.isNull():
@@ -93,11 +100,18 @@ class ResultGallery(QWidget):
                     item.flags()
                     | Qt.ItemFlag.ItemIsUserCheckable
                 )
+                if stale:
+                    item.setFlags(
+                        item.flags()
+                        & ~Qt.ItemFlag.ItemIsUserCheckable
+                    )
                 item.setCheckState(
                     Qt.CheckState.Checked
-                    if result.is_final
+                    if result.is_final and not stale
                     else Qt.CheckState.Unchecked
                 )
+            if stale:
+                item.setToolTip("素材已变更，此图仅保留为历史，不能提交验收。")
             self.paths[result.id] = image_path
             self.list_widget.addItem(item)
         if self.list_widget.count():

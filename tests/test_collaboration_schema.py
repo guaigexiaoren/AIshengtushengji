@@ -23,6 +23,9 @@ class CollaborationSchemaTests(unittest.TestCase):
             "model_prices",
             "shared_settings",
             "schema_migrations",
+            "task_garments",
+            "task_code_sequences",
+            "user_api_keys",
         ):
             self.assertIn(f"CREATE TABLE IF NOT EXISTS {table}", schema)
         self.assertIn("utf8mb4", schema)
