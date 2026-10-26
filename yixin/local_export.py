@@ -12,6 +12,30 @@ from .settings import (
 from .storage import atomic_copy_file
 
 
+def export_original_image(
+    source: Path,
+    directory: Path,
+    *,
+    task_code: str,
+    result_index: int,
+) -> Path:
+    source = Path(source).expanduser().resolve()
+    if not source.is_file():
+        raise ValueError("生成结果原文件已不存在")
+    directory = Path(directory).expanduser().resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    stem = f"AI图_{timestamp}_{task_code}_{result_index + 1}"
+    suffix = source.suffix or ".png"
+    destination = directory / f"{stem}{suffix}"
+    sequence = 2
+    while destination.exists():
+        destination = directory / f"{stem}_{sequence}{suffix}"
+        sequence += 1
+    atomic_copy_file(source, destination)
+    return destination
+
+
 class LocalImageExporter:
     def __init__(self, database: Database, settings: AppSettings) -> None:
         self.database = database

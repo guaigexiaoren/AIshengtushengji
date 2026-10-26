@@ -20,7 +20,6 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -57,10 +56,18 @@ from ..constants import (
     RESOLUTIONS,
 )
 from ..model_router import choose_model
-from ..settings import AUTO_STRATEGY_QUALITY
+from ..local_export import export_original_image
+from ..settings import (
+    AUTO_STRATEGY_QUALITY,
+    LOCAL_SAVE_FIXED,
+    LOCAL_SAVE_REFERENCE,
+    AppSettings,
+)
 from ..storage import FileStore
 from ..time_utils import utc_naive_to_local
+from .dialogs import CompareDialog
 from .result_gallery import ResultGallery
+from .save_helpers import show_saved_toast
 from .widgets import load_scaled_pixmap
 
 
@@ -82,6 +89,7 @@ class TaskCenterPage(QWidget):
         client: NanoBananaClient,
         key_store,
         file_store: FileStore,
+        app_settings: AppSettings,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -91,6 +99,7 @@ class TaskCenterPage(QWidget):
         self.client = client
         self.key_store = key_store
         self.file_store = file_store
+        self.app_settings = app_settings
         self.tasks: list[ProjectTask] = []
         self.current_task: ProjectTask | None = None
         self.active_workers: set[ProjectGenerationWorker] = set()
@@ -108,7 +117,7 @@ class TaskCenterPage(QWidget):
         title_box = QVBoxLayout()
         title = QLabel("任务中心")
         title.setStyleSheet("font-size:22px;font-weight:700;color:#1f2d43;")
-        subtitle = QLabel("左侧选任务，中间写提示词和查看队列，右侧管理候选图。")
+        subtitle = QLabel("左侧选任务并查看队列，中间写提示词，右侧管理候选图。")
         subtitle.setStyleSheet("color:#6d7a91;")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
@@ -125,14 +134,14 @@ class TaskCenterPage(QWidget):
         splitter.addWidget(self._build_task_panel())
         splitter.addWidget(self._build_generation_panel())
         splitter.addWidget(self._build_candidate_panel())
-        splitter.setSizes([310, 400, 500])
+        splitter.setSizes([330, 520, 500])
         outer.addWidget(splitter, 1)
 
     def _build_task_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 8, 0)
-        title = QLabel("任务列表与参考图")
+        title = QLabel("任务列表")
         title.setStyleSheet("font-size:16px;font-weight:700;")
         layout.addWidget(title)
         self.task_table = QTableWidget(0, 4)
@@ -150,29 +159,72 @@ class TaskCenterPage(QWidget):
             QHeaderView.ResizeMode.Stretch
         )
         self.task_table.itemSelectionChanged.connect(self._task_selected)
-        layout.addWidget(self.task_table, 2)
-        self.task_detail = QLabel("选择一个子任务")
-        self.task_detail.setWordWrap(True)
-        self.task_detail.setStyleSheet("color:#60708a;")
-        layout.addWidget(self.task_detail)
-        self.reference_list = QListWidget()
-        self.reference_list.setViewMode(QListWidget.ViewMode.IconMode)
-        self.reference_list.setIconSize(QSize(92, 92))
-        self.reference_list.setGridSize(QSize(118, 125))
-        self.reference_list.setResizeMode(QListWidget.ResizeMode.Adjust)
-        layout.addWidget(self.reference_list, 1)
+        vertical = QSplitter(Qt.Orientation.Vertical)
+        task_host = QWidget()
+        task_layout = QVBoxLayout(task_host)
+        task_layout.setContentsMargins(0, 0, 0, 0)
+        task_layout.addWidget(self.task_table, 1)
+        vertical.addWidget(task_host)
+        queue_card = QGroupBox("生成任务队列")
+        queue_layout = QVBoxLayout(queue_card)
+        self.queue_table = QTableWidget(0, 4)
+        self.queue_table.setHorizontalHeaderLabels(
+            ["轮次", "操作人员", "状态", "时间"]
+        )
+        self.queue_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.queue_table.horizontalHeader().setStretchLastSection(True)
+        queue_layout.addWidget(self.queue_table)
+        self.queue_hint = QLabel()
+        self.queue_hint.setStyleSheet("color:#60708a;")
+        queue_layout.addWidget(self.queue_hint)
+        vertical.addWidget(queue_card)
+        vertical.setSizes([360, 260])
+        layout.addWidget(vertical, 1)
         return panel
 
     def _build_generation_panel(self) -> QWidget:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        panel = QWidget()
-        layout = QVBoxLayout(panel)
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        top = QWidget()
+        top_layout = QVBoxLayout(top)
+        top_layout.setContentsMargins(8, 0, 8, 0)
+        info_title = QLabel("子任务信息与参考图")
+        info_title.setStyleSheet("font-size:16px;font-weight:700;")
+        top_layout.addWidget(info_title)
+        self.task_detail = QLabel("选择一个子任务")
+        self.task_detail.setWordWrap(True)
+        self.task_detail.setStyleSheet("color:#60708a;")
+        top_layout.addWidget(self.task_detail)
+        images_row = QHBoxLayout()
+        garment_box = QGroupBox("衣服图")
+        garment_layout = QVBoxLayout(garment_box)
+        self.garment_list = QListWidget()
+        self.garment_list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.garment_list.setIconSize(QSize(104, 104))
+        self.garment_list.setGridSize(QSize(130, 136))
+        self.garment_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        garment_layout.addWidget(self.garment_list)
+        model_box = QGroupBox("模特图")
+        model_layout = QVBoxLayout(model_box)
+        self.model_preview = QLabel("尚未选择任务")
+        self.model_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.model_preview.setMinimumSize(220, 240)
+        self.model_preview.setStyleSheet(
+            "background:#f3f6fb;border:1px solid #dbe3ef;border-radius:6px;"
+        )
+        self.model_name = QLabel()
+        self.model_name.setWordWrap(True)
+        model_layout.addWidget(self.model_preview, 1)
+        model_layout.addWidget(self.model_name)
+        images_row.addWidget(garment_box, 3)
+        images_row.addWidget(model_box, 2)
+        top_layout.addLayout(images_row, 1)
+        splitter.addWidget(top)
+
+        bottom = QWidget()
+        layout = QVBoxLayout(bottom)
         layout.setContentsMargins(8, 0, 8, 0)
-        title = QLabel("提示词与生成队列")
-        title.setStyleSheet("font-size:16px;font-weight:700;")
-        layout.addWidget(title)
         prompt_card = QGroupBox("提示词与参数")
         prompt_layout = QVBoxLayout(prompt_card)
         template_row = QHBoxLayout()
@@ -214,32 +266,16 @@ class TaskCenterPage(QWidget):
         form.addRow("每次数量", self.count_spin)
         prompt_layout.addLayout(form)
         action_row = QHBoxLayout()
-        self.claim_button = QPushButton("领取任务")
         self.generate_button = QPushButton("加入生成队列")
         self.generate_button.setObjectName("PrimaryButton")
-        self.claim_button.clicked.connect(self._claim)
         self.generate_button.clicked.connect(self._enqueue_generation)
-        action_row.addWidget(self.claim_button)
+        action_row.addStretch(1)
         action_row.addWidget(self.generate_button)
         prompt_layout.addLayout(action_row)
         layout.addWidget(prompt_card)
-        queue_card = QGroupBox("生成任务队列")
-        queue_layout = QVBoxLayout(queue_card)
-        self.queue_table = QTableWidget(0, 4)
-        self.queue_table.setHorizontalHeaderLabels(
-            ["轮次", "操作人员", "状态", "时间"]
-        )
-        self.queue_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        self.queue_table.horizontalHeader().setStretchLastSection(True)
-        queue_layout.addWidget(self.queue_table)
-        self.queue_hint = QLabel()
-        self.queue_hint.setStyleSheet("color:#60708a;")
-        queue_layout.addWidget(self.queue_hint)
-        layout.addWidget(queue_card, 1)
-        scroll.setWidget(panel)
-        return scroll
+        splitter.addWidget(bottom)
+        splitter.setSizes([520, 300])
+        return splitter
 
     def _build_candidate_panel(self) -> QWidget:
         panel = QWidget()
@@ -250,22 +286,33 @@ class TaskCenterPage(QWidget):
         layout.addWidget(title)
         toolbar = QHBoxLayout()
         self.selection_label = QLabel("已选择 0 张最终图")
-        refresh = QPushButton("刷新")
-        self.upload_button = QPushButton("上传 PS 成品")
-        refresh.clicked.connect(self._load_results)
-        self.upload_button.clicked.connect(self._upload_manual)
         toolbar.addWidget(self.selection_label, 1)
-        toolbar.addWidget(refresh)
-        toolbar.addWidget(self.upload_button)
         layout.addLayout(toolbar)
         self.gallery = ResultGallery(self.resolver, checkable=True)
         self.gallery.list_widget.itemChanged.connect(self._selection_changed)
         layout.addWidget(self.gallery, 1)
-        self.submit_button = QPushButton("提交运营验收")
+        button_row = QHBoxLayout()
+        self.retry_button = QPushButton("重试任务")
+        self.save_button = QPushButton("保存图片")
+        self.upload_button = QPushButton("上传修后图")
+        self.compare_button = QPushButton("查看/对比成品")
+        self.submit_button = QPushButton("提交验收")
         self.submit_button.setObjectName("PrimaryButton")
-        self.submit_button.setMinimumHeight(42)
+        self.retry_button.clicked.connect(self._retry_task)
+        self.save_button.clicked.connect(self._save_result)
+        self.upload_button.clicked.connect(self._upload_manual)
+        self.compare_button.clicked.connect(self._compare_result)
         self.submit_button.clicked.connect(self._submit)
-        layout.addWidget(self.submit_button)
+        for button in (
+            self.retry_button,
+            self.save_button,
+            self.upload_button,
+            self.compare_button,
+            self.submit_button,
+        ):
+            button.setMinimumHeight(36)
+            button_row.addWidget(button)
+        layout.addLayout(button_row)
         return panel
 
     def refresh(self) -> None:
@@ -309,7 +356,10 @@ class TaskCenterPage(QWidget):
         else:
             self.current_task = None
             self.task_detail.setText("当前没有可查看的任务")
-            self.reference_list.clear()
+            self.garment_list.clear()
+            self.model_preview.clear()
+            self.model_name.clear()
+            self.gallery.clear()
         self._resume_queued_jobs()
         self._pump_queue()
         self._update_controls()
@@ -320,8 +370,11 @@ class TaskCenterPage(QWidget):
             self.tasks[row] if 0 <= row < len(self.tasks) else None
         )
         task = self.current_task
-        self.reference_list.clear()
+        self.garment_list.clear()
+        self.model_preview.clear()
+        self.model_name.clear()
         if task is None:
+            self.gallery.clear()
             self._update_controls()
             return
         self.task_detail.setText(
@@ -330,8 +383,12 @@ class TaskCenterPage(QWidget):
             f"参考顺序：衣服图 {len(task.garment_assets)} 张，最后一张模特图。"
         )
         for asset in task.garment_assets:
-            self._add_reference(task, asset.relative_path, asset.original_name)
-        self._add_reference(task, task.model_path, task.model_name)
+            self._add_garment_reference(
+                task,
+                asset.relative_path,
+                asset.original_name,
+            )
+        self._show_model_reference(task)
         self.prompt_edit.setPlainText(task.prompt_text)
         if task.model in MODEL_LABELS:
             self.model_combo.setCurrentIndex(self.model_combo.findData(task.model))
@@ -346,7 +403,7 @@ class TaskCenterPage(QWidget):
         self._refresh_queue()
         self._update_controls()
 
-    def _add_reference(
+    def _add_garment_reference(
         self,
         task: ProjectTask,
         relative_path: str,
@@ -360,7 +417,19 @@ class TaskCenterPage(QWidget):
         pixmap = load_scaled_pixmap(path, QSize(92, 92))
         if not pixmap.isNull():
             item.setIcon(QIcon(pixmap))
-        self.reference_list.addItem(item)
+        self.garment_list.addItem(item)
+
+    def _show_model_reference(self, task: ProjectTask) -> None:
+        path = self.resolver.resolve_project_path(
+            task.project_relative_root,
+            task.model_path,
+        )
+        pixmap = load_scaled_pixmap(path, QSize(320, 360))
+        if pixmap.isNull():
+            self.model_preview.setText("模特图不存在")
+        else:
+            self.model_preview.setPixmap(pixmap)
+        self.model_name.setText(task.model_name)
 
     def _is_assignee(self, task: ProjectTask | None) -> bool:
         return bool(task and task.assignee_id == self.actor.id)
@@ -377,10 +446,15 @@ class TaskCenterPage(QWidget):
         can_claim = bool(
             task
             and self.actor.role in (ROLE_AI, ROLE_ADMIN)
-            and task.status in (TASK_AVAILABLE, TASK_RETURNED)
             and (
                 task.status == TASK_AVAILABLE
-                or self._is_assignee(task)
+                or (
+                    task.status == TASK_RETURNED
+                    and (
+                        self._is_assignee(task)
+                        or self.actor.role == ROLE_ADMIN
+                    )
+                )
             )
         )
         can_work = bool(
@@ -393,26 +467,17 @@ class TaskCenterPage(QWidget):
                 TASK_RETURNED,
             )
         )
-        self.claim_button.setEnabled(can_claim)
-        self.generate_button.setEnabled(can_work)
+        self.generate_button.setEnabled(can_claim or can_work)
         self.upload_button.setEnabled(can_work and not task_busy)
         self.submit_button.setEnabled(
             can_work and not task_busy and bool(self.gallery.selected_result_ids())
         )
+        self.retry_button.setEnabled(can_work)
+        self.save_button.setEnabled(self.gallery.current_path() is not None)
+        self.compare_button.setEnabled(self.gallery.current_path() is not None)
         self.queue_hint.setText(
             f"正在执行 {len(self.active_workers)} 个，等待 {len(self.waiting_jobs)} 个"
         )
-
-    def _claim(self) -> None:
-        task = self.current_task
-        if task is None:
-            return
-        try:
-            self.repository.claim_task(task.id, self.actor)
-        except Exception as exc:
-            QMessageBox.warning(self, "领取失败", str(exc))
-            return
-        self.refresh()
 
     def _enqueue_generation(self) -> None:
         task = self.current_task
@@ -438,7 +503,7 @@ class TaskCenterPage(QWidget):
             ).model
         resolution = self.resolution_combo.currentData()
         try:
-            attempt = self.repository.queue_generation_attempt(
+            attempt = self.repository.claim_and_queue_generation(
                 task.id,
                 self.actor,
                 prompt=prompt,
@@ -452,7 +517,7 @@ class TaskCenterPage(QWidget):
             QMessageBox.warning(self, "加入队列失败", str(exc))
             return
         self.waiting_jobs.append({"task": task, "attempt": attempt})
-        self._pump_queue()
+        self.refresh()
 
     def _resume_queued_jobs(self) -> None:
         try:
@@ -605,6 +670,109 @@ class TaskCenterPage(QWidget):
             return
         QMessageBox.information(self, "上传完成", f"已添加 {count} 张 PS 成品。")
         self.refresh()
+
+    def _retry_task(self) -> None:
+        task = self.current_task
+        if task is None:
+            return
+        self.prompt_edit.setPlainText(task.prompt_text)
+        model_index = self.model_combo.findData(task.model)
+        if model_index >= 0:
+            self.model_combo.setCurrentIndex(model_index)
+        if task.aspect_ratio:
+            self.aspect_combo.setCurrentText(task.aspect_ratio)
+        resolution_index = self.resolution_combo.findData(task.resolution)
+        if resolution_index >= 0:
+            self.resolution_combo.setCurrentIndex(resolution_index)
+        self.count_spin.setValue(max(1, task.n))
+        self.prompt_edit.setFocus()
+
+    def _save_result(self) -> None:
+        task = self.current_task
+        result = self.gallery.current_result()
+        source = self.gallery.current_path()
+        if task is None or result is None or source is None:
+            QMessageBox.information(self, "尚未选择图片", "请先选择一张成品图。")
+            return
+        directory = self._save_directory(task)
+        if directory is None:
+            return
+        try:
+            destination = export_original_image(
+                source,
+                directory,
+                task_code=task.task_code,
+                result_index=result.result_index,
+            )
+            self.app_settings.set_last_folder(directory)
+        except Exception as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
+        show_saved_toast(self, destination)
+
+    def _save_directory(self, task: ProjectTask) -> Path | None:
+        mode = self.app_settings.local_save_mode()
+        directory: Path | None = None
+        if mode == LOCAL_SAVE_FIXED:
+            candidate = self.app_settings.fixed_folder()
+            if candidate and candidate.is_dir():
+                directory = candidate
+            else:
+                QMessageBox.information(
+                    self,
+                    "固定文件夹不可用",
+                    "设置的固定文件夹不存在或不可访问，请重新选择。",
+                )
+        elif mode == LOCAL_SAVE_REFERENCE:
+            product_root = self.resolver.project_root(
+                task.project_relative_root
+            )
+            candidate = product_root.parent / "AI图"
+            try:
+                candidate.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                candidate = None
+            if candidate and candidate.is_dir():
+                directory = candidate
+            else:
+                QMessageBox.information(
+                    self,
+                    "需要选择保存位置",
+                    "无法在当前任务目录旁创建“AI图”文件夹，请选择本次保存文件夹。",
+                )
+        if directory is not None:
+            return directory
+        initial = self.app_settings.last_folder()
+        initial_text = str(initial) if initial and initial.is_dir() else ""
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择本地保存文件夹",
+            initial_text,
+        )
+        if not selected:
+            return None
+        directory = Path(selected).resolve()
+        if mode == LOCAL_SAVE_FIXED:
+            self.app_settings.set_fixed_folder(directory)
+        return directory
+
+    def _compare_result(self) -> None:
+        task = self.current_task
+        result_path = self.gallery.current_path()
+        if task is None or result_path is None:
+            QMessageBox.information(self, "尚未选择图片", "请先选择一张成品图。")
+            return
+        model_path = self.resolver.resolve_project_path(
+            task.project_relative_root,
+            task.model_path,
+        )
+        CompareDialog(
+            model_path,
+            result_path,
+            left_label="原模特图",
+            right_label="生成成品",
+            parent=self,
+        ).exec()
 
     def _submit(self) -> None:
         task = self.current_task

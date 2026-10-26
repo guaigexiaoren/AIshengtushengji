@@ -43,6 +43,10 @@ QPushButton#NavButton:checked {
     color: #ffffff;
     font-weight: 600;
 }
+QPushButton#NavButton[submenu="true"] {
+    padding-left: 30px;
+    font-size: 13px;
+}
 QFrame#Card, QGroupBox#Card {
     background: #ffffff;
     border: 1px solid #e3e9f2;

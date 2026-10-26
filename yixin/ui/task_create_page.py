@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QFileDialog,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -25,11 +27,11 @@ from PySide6.QtWidgets import (
 )
 
 from ..collaboration.folders import (
-    DateFolder,
-    current_date_folder,
-    list_date_folders,
+    AccountDirectory,
+    default_account_directory,
     natural_sort_key,
     project_assets,
+    resolve_account_directory,
     scan_product_folders,
 )
 from ..collaboration.matching import MatchAsset, build_pairs
@@ -59,6 +61,67 @@ class ProductDraftState:
     existing_tasks: list = field(default_factory=list)
 
 
+class PairPreviewCard(QFrame):
+    def __init__(
+        self,
+        model_path: Path,
+        garment_paths: list[Path],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("PairPreviewCard")
+        self.setStyleSheet(
+            "QFrame#PairPreviewCard {"
+            "background:#f8faff;border:1px solid #dce5f2;"
+            "border-radius:8px;padding:8px;}"
+        )
+        layout = QHBoxLayout(self)
+        model = QLabel()
+        model.setFixedSize(92, 112)
+        model.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = load_scaled_pixmap(model_path, QSize(88, 108))
+        if not pixmap.isNull():
+            model.setPixmap(pixmap)
+        layout.addWidget(model)
+        info = QVBoxLayout()
+        title = QLabel(model_path.name)
+        title.setStyleSheet("font-weight:700;color:#2d3e58;")
+        summary = QLabel(
+            f"衣服 {len(garment_paths)} 张 · 1 个子任务"
+        )
+        summary.setStyleSheet("color:#60708a;")
+        thumb_host = QWidget()
+        thumbs = QHBoxLayout(thumb_host)
+        thumbs.setContentsMargins(0, 0, 0, 0)
+        thumbs.setSpacing(6)
+        self.garment_thumbnails: list[QLabel] = []
+        for path in garment_paths:
+            image = QLabel()
+            image.setObjectName("GarmentThumbnail")
+            image.setFixedSize(58, 70)
+            image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            thumb = load_scaled_pixmap(path, QSize(56, 68))
+            if not thumb.isNull():
+                image.setPixmap(thumb)
+            image.setToolTip(path.name)
+            thumbs.addWidget(image)
+            self.garment_thumbnails.append(image)
+        thumb_scroll = QScrollArea()
+        thumb_scroll.setWidgetResizable(False)
+        thumb_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        thumb_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        thumb_scroll.setWidget(thumb_host)
+        thumb_host.adjustSize()
+        info.addWidget(title)
+        info.addWidget(summary)
+        info.addWidget(thumb_scroll)
+        layout.addLayout(info, 1)
+
+
 class TaskCreatePage(QWidget):
     def __init__(
         self,
@@ -73,6 +136,7 @@ class TaskCreatePage(QWidget):
         self.actor = actor
         self.states: dict[str, ProductDraftState] = {}
         self.current_state: ProductDraftState | None = None
+        self.account_directory: AccountDirectory | None = None
         self._build()
         self.refresh()
 
@@ -92,21 +156,20 @@ class TaskCreatePage(QWidget):
         header.addWidget(self.refresh_button)
         outer.addLayout(header)
 
-        path_card = QGroupBox("共享盘与日期")
+        path_card = QGroupBox("账号目录")
         path_layout = QVBoxLayout(path_card)
         self.account_path = QLineEdit()
-        self.account_path.setReadOnly(True)
-        self.date_combo = QComboBox()
-        self.date_combo.currentIndexChanged.connect(self._date_changed)
-        date_row = QHBoxLayout()
-        date_row.addWidget(QLabel("账号目录"))
-        date_row.addWidget(self.account_path, 1)
-        date_row.addWidget(QLabel("任务日期"))
-        date_row.addWidget(self.date_combo)
-        path_layout.addLayout(date_row)
-        self.note_edit = QLineEdit()
-        self.note_edit.setPlaceholderText("备注（选填，会应用到本次创建的任务）")
-        path_layout.addWidget(self.note_edit)
+        self.account_path.returnPressed.connect(self.refresh)
+        choose_directory = QPushButton("选择目录")
+        choose_directory.clicked.connect(self._choose_directory)
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("账号目录"))
+        path_row.addWidget(self.account_path, 1)
+        path_row.addWidget(choose_directory)
+        path_layout.addLayout(path_row)
+        self.date_hint = QLabel()
+        self.date_hint.setStyleSheet("color:#60708a;")
+        path_layout.addWidget(self.date_hint)
         outer.addWidget(path_card)
 
         scan_card = QGroupBox("待创建货号")
@@ -183,19 +246,28 @@ class TaskCreatePage(QWidget):
         manual_layout.addWidget(self.manual_table)
         detail_layout.addWidget(self.manual_box)
 
-        self.pair_preview = QListWidget()
-        self.pair_preview.setViewMode(QListWidget.ViewMode.IconMode)
-        self.pair_preview.setIconSize(QSize(96, 96))
-        self.pair_preview.setGridSize(QSize(150, 130))
-        self.pair_preview.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.pair_preview.setMinimumHeight(150)
-        detail_layout.addWidget(self.pair_preview)
+        self.pair_preview = QScrollArea()
+        self.pair_preview.setWidgetResizable(True)
+        self.pair_preview.setMinimumHeight(180)
+        self.pair_preview_content = QWidget()
+        self.pair_preview_layout = QVBoxLayout(self.pair_preview_content)
+        self.pair_preview_layout.setContentsMargins(0, 0, 0, 0)
+        self.pair_preview_layout.setSpacing(6)
+        self.pair_preview_layout.addStretch(1)
+        self.pair_preview.setWidget(self.pair_preview_content)
+        detail_layout.addWidget(self.pair_preview, 1)
         self.pair_summary = QLabel()
         self.pair_summary.setWordWrap(True)
         detail_layout.addWidget(self.pair_summary)
         outer.addWidget(detail_card, 1)
 
         footer = QHBoxLayout()
+        footer.addWidget(QLabel("备注"))
+        self.note_edit = QLineEdit()
+        self.note_edit.setPlaceholderText(
+            "选填，会应用到本次创建的任务"
+        )
+        footer.addWidget(self.note_edit, 1)
         footer.addStretch(1)
         self.create_button = QPushButton("创建所选任务")
         self.create_button.setObjectName("PrimaryButton")
@@ -239,39 +311,52 @@ class TaskCreatePage(QWidget):
         shared_root = self.repository.get_shared_setting("share_root")
         if shared_root:
             self.resolver = SharedPathResolver(shared_root)
-        account_root = self.resolver.root / self.actor.display_name
+        raw_path = self.account_path.text().strip()
+        if not raw_path:
+            raw_path = str(
+                default_account_directory(
+                    self.resolver.root,
+                    self.actor.display_name,
+                )
+            )
         try:
-            account_root.mkdir(parents=True, exist_ok=True)
+            account_directory = resolve_account_directory(
+                raw_path,
+                self.resolver.root,
+            )
+            account_directory.path.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             QMessageBox.warning(self, "无法访问共享盘", str(exc))
             return
-        self.account_path.setText(str(account_root))
-        folders = list_date_folders(account_root)
-        today_folder = current_date_folder(account_root)
-        if not any(folder.source_date == today_folder.source_date for folder in folders):
-            folders.insert(0, today_folder)
-        self.date_combo.blockSignals(True)
-        self.date_combo.clear()
-        for folder in folders:
-            self.date_combo.addItem(
-                folder.label,
-                folder,
+        self.account_path.setText(str(account_directory.path))
+        self.account_directory = account_directory
+        if account_directory.date_recognized:
+            self.date_hint.setText(
+                f"已识别任务日期：{account_directory.source_date.isoformat()}"
             )
-        self.date_combo.blockSignals(False)
-        if self.date_combo.count():
-            self.date_combo.setCurrentIndex(0)
-        self._date_changed()
+            self.date_hint.setStyleSheet("color:#2a7a50;")
+        else:
+            self.date_hint.setText(
+                "目录末尾不是日期格式，将按今天生成任务编码。"
+            )
+            self.date_hint.setStyleSheet("color:#b25a24;")
+        self._scan_directory()
 
-    def _current_date_folder(self) -> DateFolder | None:
-        return self.date_combo.currentData()
+    def _choose_directory(self) -> None:
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "选择账号日期目录",
+            self.account_path.text(),
+        )
+        if selected:
+            self.account_path.setText(selected)
+            self.refresh()
 
-    def _date_changed(self, _index: int | None = None) -> None:
-        folder = self._current_date_folder()
-        if folder is None:
+    def _scan_directory(self) -> None:
+        if self.account_directory is None:
             return
         try:
-            folder.path.mkdir(parents=True, exist_ok=True)
-            products = scan_product_folders(folder.path)
+            products = scan_product_folders(self.account_directory.path)
         except Exception as exc:
             QMessageBox.warning(self, "扫描失败", str(exc))
             return
@@ -279,7 +364,7 @@ class TaskCreatePage(QWidget):
         for product in products:
             existing = self.repository.find_tasks_by_product(
                 self.actor.id,
-                folder.source_date,
+                self.account_directory.source_date,
                 product.product_code,
             )
             self.states[product.product_code] = ProductDraftState(
@@ -298,7 +383,7 @@ class TaskCreatePage(QWidget):
             self.detail_title.setText("当前日期没有符合结构的货号目录")
             self.garment_list.clear()
             self.model_list.clear()
-            self.pair_preview.clear()
+            self._clear_pair_preview()
 
     def _refresh_product_table(self) -> None:
         self.product_table.setRowCount(0)
@@ -365,7 +450,7 @@ class TaskCreatePage(QWidget):
         self.garment_list.clear()
         self.model_list.clear()
         self.manual_table.setRowCount(0)
-        self.pair_preview.clear()
+        self._clear_pair_preview()
         if state is None:
             return
         self.detail_title.setText(
@@ -386,6 +471,13 @@ class TaskCreatePage(QWidget):
                 item.setIcon(QIcon(pixmap))
             item.setData(Qt.ItemDataRole.UserRole, str(path))
             widget.addItem(item)
+
+    def _clear_pair_preview(self) -> None:
+        while self.pair_preview_layout.count():
+            item = self.pair_preview_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
 
     def _selected_paths(self, role: str) -> list[Path]:
         widget = self.garment_list if role == "garment" else self.model_list
@@ -529,25 +621,32 @@ class TaskCreatePage(QWidget):
         if state is None:
             return
         result = self._current_pairs()
-        self.pair_preview.clear()
+        while self.pair_preview_layout.count():
+            item = self.pair_preview_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
         if result is None:
             return
         if result.errors:
             self.pair_summary.setText("暂不能创建：" + "；".join(result.errors[:5]))
             self.pair_summary.setStyleSheet("color:#b23a48;")
             return
-        grouped: dict[int, int] = {}
+        grouped: dict[int, list[int]] = {}
         for pair in result.pairs:
-            grouped[pair.model_index] = grouped.get(pair.model_index, 0) + 1
+            grouped.setdefault(pair.model_index, []).append(
+                pair.garment_index
+            )
         for model_index in sorted(grouped):
             model_path = state.models[model_index]
-            item = QListWidgetItem(
-                f"{model_path.name}\n{grouped[model_index]} 张衣服"
+            garment_paths = [
+                state.garments[index]
+                for index in dict.fromkeys(grouped[model_index])
+            ]
+            self.pair_preview_layout.addWidget(
+                PairPreviewCard(model_path, garment_paths)
             )
-            pixmap = load_scaled_pixmap(model_path, QSize(96, 96))
-            if not pixmap.isNull():
-                item.setIcon(QIcon(pixmap))
-            self.pair_preview.addItem(item)
+        self.pair_preview_layout.addStretch(1)
         self.pair_summary.setText(
             f"将创建 {len(grouped)} 个子任务，共引用 {len(result.pairs)} 组衣服。"
         )
@@ -636,8 +735,8 @@ class TaskCreatePage(QWidget):
         if not codes:
             QMessageBox.warning(self, "未选择货号", "请至少勾选一个货号。")
             return
-        date_folder = self._current_date_folder()
-        if date_folder is None:
+        account_directory = self.account_directory
+        if account_directory is None:
             return
         answer = QMessageBox.question(
             self,
@@ -680,7 +779,7 @@ class TaskCreatePage(QWidget):
                     assets=assets,
                     pairs=result.pairs,
                     note=self.note_edit.text().strip(),
-                    source_date=date_folder.source_date,
+                    source_date=account_directory.source_date,
                     product_code=state.product_code,
                 )
                 existing = state.existing_tasks[0] if state.existing_tasks else None
@@ -704,14 +803,14 @@ class TaskCreatePage(QWidget):
                 created += 1
         except Exception as exc:
             QMessageBox.warning(self, "创建失败", str(exc))
-            self._date_changed()
+            self._scan_directory()
             return
         QMessageBox.information(
             self,
             "创建完成",
             f"已处理 {created} 个总任务。",
         )
-        self._date_changed()
+        self._scan_directory()
 
     def _row_for_code(self, code: str) -> int:
         for row in range(self.product_table.rowCount()):

@@ -32,6 +32,47 @@ class ProductFolder:
     errors: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class AccountDirectory:
+    path: Path
+    source_date: date
+    date_recognized: bool
+
+
+def default_account_directory(
+    shared_root: Path,
+    display_name: str,
+    *,
+    today: date | None = None,
+) -> Path:
+    current = today or date.today()
+    return (
+        Path(shared_root).expanduser()
+        / display_name
+        / f"{current.month}.{current.day}"
+    )
+
+
+def resolve_account_directory(
+    raw_path: str | Path,
+    shared_root: Path,
+    *,
+    today: date | None = None,
+) -> AccountDirectory:
+    root = Path(shared_root).expanduser().resolve()
+    path = Path(raw_path).expanduser().resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError("账号目录必须位于固定共享盘根目录内") from exc
+    parsed = parse_date_folder(path.name, today=today)
+    return AccountDirectory(
+        path=path,
+        source_date=parsed or (today or date.today()),
+        date_recognized=parsed is not None,
+    )
+
+
 def parse_date_folder(label: str, *, today: date | None = None) -> date | None:
     matched = DATE_PATTERN.fullmatch(label.strip())
     if matched is None:

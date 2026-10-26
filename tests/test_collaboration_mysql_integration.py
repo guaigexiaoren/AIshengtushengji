@@ -11,7 +11,9 @@ from yixin.collaboration.types import (
     PairingInput,
     ProjectAssetInput,
     ProjectDraft,
+    ATTEMPT_QUEUED,
     TASK_APPROVED,
+    TASK_CLAIMED,
 )
 
 
@@ -173,6 +175,7 @@ class MySQLIntegrationTests(unittest.TestCase):
                 all(len(task.garment_assets) == 3 for task in project_tasks)
             )
             task = project_tasks[0]
+            queued_task = project_tasks[1]
             outcomes = []
 
             def claim(actor):
@@ -236,6 +239,42 @@ class MySQLIntegrationTests(unittest.TestCase):
                 repository.report(ReportFilter()).summary.total_cost,
                 Decimal("1.2500"),
             )
+            queue_outcomes = []
+
+            def claim_and_queue(actor):
+                try:
+                    attempt = repository.claim_and_queue_generation(
+                        queued_task.id,
+                        actor,
+                        prompt="自动领取并排队",
+                        model="gemini-3.1-flash-image",
+                        aspect_ratio="3:4",
+                        resolution="2K",
+                        n=1,
+                        unit_price=Decimal("1.25"),
+                    )
+                    queue_outcomes.append((actor, attempt))
+                except Exception:
+                    queue_outcomes.append((actor, None))
+
+            queue_threads = [
+                threading.Thread(target=claim_and_queue, args=(ai_one,)),
+                threading.Thread(target=claim_and_queue, args=(ai_two,)),
+            ]
+            for thread in queue_threads:
+                thread.start()
+            for thread in queue_threads:
+                thread.join()
+            successful = [
+                item for item in queue_outcomes if item[1] is not None
+            ]
+            self.assertEqual(len(successful), 1)
+            queue_winner, queued_attempt = successful[0]
+            claimed_task = repository.get_task(queued_task.id)
+            self.assertEqual(claimed_task.status, TASK_CLAIMED)
+            self.assertEqual(claimed_task.assignee_id, queue_winner.id)
+            self.assertEqual(queued_attempt.status, ATTEMPT_QUEUED)
+            self.assertEqual(queued_attempt.operator_id, queue_winner.id)
         finally:
             with repository.connection() as connection:
                 with connection.cursor() as cursor:

@@ -30,6 +30,7 @@ from ..database import Database
 from ..library import LibraryService
 from ..paths import AppPaths
 from ..security import SecretStore
+from ..settings import AppSettings
 from ..storage import FileStore
 from ..worker import TaskWorker
 from .batch_dress_page import BatchDressPage
@@ -60,6 +61,7 @@ class SidebarNav(QWidget):
         parent: QWidget | None = None,
         *,
         group_before: dict[int, str] | None = None,
+        submenu_indices: set[int] | None = None,
     ) -> None:
         super().__init__(parent)
         self._current_row = -1
@@ -71,6 +73,7 @@ class SidebarNav(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
         groups = group_before or {}
+        submenu_rows = submenu_indices or set()
         for index, text in enumerate(labels):
             if index in groups:
                 group_label = QLabel(groups[index])
@@ -78,6 +81,7 @@ class SidebarNav(QWidget):
                 layout.addWidget(group_label)
             button = QPushButton(text)
             button.setObjectName("NavButton")
+            button.setProperty("submenu", index in submenu_rows)
             button.setCheckable(True)
             button.setFixedHeight(38)
             button.clicked.connect(
@@ -178,6 +182,7 @@ class MainWindow(QMainWindow):
             client,
             secret_store,
             file_store,
+            AppSettings(database),
         )
         self.page_specs.append(("任务中心", self.task_center_page))
         if self.actor.role in (ROLE_AI, ROLE_ADMIN):
@@ -278,6 +283,7 @@ class MainWindow(QMainWindow):
         self.nav_list = SidebarNav(
             labels,
             group_before={group_index: "AI图提交"},
+            submenu_indices={0, 1, 2, 3},
         )
         self.nav_list.setObjectName("NavList")
         layout.addWidget(self.nav_list)

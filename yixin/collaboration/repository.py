@@ -1377,6 +1377,159 @@ class MySQLCentralRepository:
             created_at=now,
         )
 
+    def claim_and_queue_generation(
+        self,
+        task_id: int,
+        actor: AuthUser,
+        *,
+        prompt: str,
+        model: str,
+        aspect_ratio: str,
+        resolution: str | None,
+        n: int,
+        unit_price: Decimal,
+    ) -> GenerationAttempt:
+        prompt = prompt.strip()
+        if not prompt:
+            raise ValueError("提示词不能为空")
+        if model not in MODEL_IDS:
+            raise ValueError("不支持的模型")
+        if not 1 <= n <= 4:
+            raise ValueError("每次生成数量必须在 1 到 4 之间")
+        if actor.role not in (ROLE_AI, ROLE_ADMIN):
+            raise PermissionDeniedError("当前角色不能领取并生成任务")
+        now = utc_now()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                task = self._task_row_for_update(cursor, task_id)
+                if task["status"] in (
+                    TASK_AWAITING_ACCEPTANCE,
+                    TASK_APPROVED,
+                    TASK_CANCELLED,
+                ):
+                    raise StateConflictError("任务已进入审核或已经结束")
+                assignee_id = task["assignee_id"]
+                claimed_here = False
+                if task["status"] == TASK_AVAILABLE:
+                    claimed_here = True
+                elif task["status"] == TASK_RETURNED and (
+                    int(assignee_id or 0) == actor.id or actor.role == ROLE_ADMIN
+                ):
+                    claimed_here = int(assignee_id or 0) != actor.id
+                elif int(assignee_id or 0) == actor.id and task["status"] in (
+                    TASK_CLAIMED,
+                    TASK_WORKING,
+                    TASK_RETURNED,
+                ):
+                    claimed_here = False
+                else:
+                    raise StateConflictError("任务已被其他人员领取")
+                if claimed_here:
+                    cursor.execute(
+                        """
+                        UPDATE project_tasks
+                        SET assignee_id = %s, status = %s,
+                            claimed_at = %s, updated_at = %s
+                        WHERE id = %s
+                        """,
+                        (actor.id, TASK_CLAIMED, now, now, task_id),
+                    )
+                    self._event(
+                        cursor,
+                        int(task["project_id"]),
+                        task_id,
+                        actor.id,
+                        "task_claimed",
+                        task["status"],
+                        TASK_CLAIMED,
+                        {},
+                    )
+                cursor.execute(
+                    "SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_no "
+                    "FROM generation_attempts WHERE task_id = %s",
+                    (task_id,),
+                )
+                attempt_no = int(cursor.fetchone()["next_no"])
+                cursor.execute(
+                    """
+                    INSERT INTO generation_attempts(
+                        task_id, attempt_no, operator_id, model, prompt_text,
+                        aspect_ratio, resolution, n, status, source_revision,
+                        unit_price, created_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        task_id,
+                        attempt_no,
+                        actor.id,
+                        model,
+                        prompt,
+                        aspect_ratio,
+                        resolution,
+                        n,
+                        ATTEMPT_QUEUED,
+                        int(task["source_revision"] or 1),
+                        unit_price,
+                        now,
+                    ),
+                )
+                attempt_id = int(cursor.lastrowid)
+                cursor.execute(
+                    """
+                    UPDATE project_tasks
+                    SET prompt_text = %s, model = %s, aspect_ratio = %s,
+                        resolution = %s, n = %s, updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        prompt,
+                        model,
+                        aspect_ratio,
+                        resolution,
+                        n,
+                        now,
+                        task_id,
+                    ),
+                )
+                self._update_project_status(
+                    cursor,
+                    int(task["project_id"]),
+                )
+                event_status = TASK_CLAIMED if claimed_here else task["status"]
+                self._event(
+                    cursor,
+                    int(task["project_id"]),
+                    task_id,
+                    actor.id,
+                    "generation_queued",
+                    event_status,
+                    event_status,
+                    {
+                        "attempt_id": attempt_id,
+                        "attempt_no": attempt_no,
+                        "claimed_here": claimed_here,
+                    },
+                )
+        return GenerationAttempt(
+            id=attempt_id,
+            task_id=task_id,
+            attempt_no=attempt_no,
+            operator_id=actor.id,
+            model=model,
+            prompt_text=prompt,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+            n=n,
+            status=ATTEMPT_QUEUED,
+            source_revision=int(task["source_revision"] or 1),
+            unit_price=unit_price,
+            generated_image_count=0,
+            operator_name=actor.display_name,
+            created_at=now,
+        )
+
     def start_queued_generation_attempt(
         self,
         attempt_id: int,

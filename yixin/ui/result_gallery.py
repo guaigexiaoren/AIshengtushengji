@@ -120,6 +120,14 @@ class ResultGallery(QWidget):
             self.preview.setText("当前任务还没有生成图片")
             self.meta.clear()
 
+    def clear(self) -> None:
+        self.task = None
+        self.results = []
+        self.paths.clear()
+        self.list_widget.clear()
+        self.preview.setText("选择图片查看大图")
+        self.meta.clear()
+
     def selected_result_ids(self) -> list[int]:
         selected: list[int] = []
         for index in range(self.list_widget.count()):
@@ -136,6 +144,16 @@ class ResultGallery(QWidget):
         if current is None:
             return None
         return self.paths.get(int(current.data(Qt.ItemDataRole.UserRole)))
+
+    def current_result(self) -> GenerationResult | None:
+        current = self.list_widget.currentItem()
+        if current is None:
+            return None
+        result_id = int(current.data(Qt.ItemDataRole.UserRole))
+        return next(
+            (result for result in self.results if result.id == result_id),
+            None,
+        )
 
     def _show_current(
         self,

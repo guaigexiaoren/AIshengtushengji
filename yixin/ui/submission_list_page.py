@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from functools import partial
+
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -14,13 +17,15 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from ..collaboration.repository import MySQLCentralRepository
+from ..collaboration.repository import MySQLCentralRepository, utc_now
 from ..collaboration.shared_paths import SharedPathResolver
 from ..collaboration.types import (
+    PROJECT_COMPLETED,
     PROJECT_STATUS_LABELS,
     ROLE_ADMIN,
     TASK_APPROVED,
@@ -35,7 +40,7 @@ from ..collaboration.types import (
     ProjectTask,
 )
 from ..time_utils import utc_naive_to_local
-from .result_gallery import ResultGalleryDialog
+from .result_gallery import ResultGallery, ResultGalleryDialog
 from .subtask_source_dialog import SubtaskSourceDialog
 from .widgets import load_scaled_pixmap
 
@@ -46,7 +51,7 @@ VIEW_STATUSES = {
     "completed": (TASK_APPROVED,),
 }
 VIEW_TITLES = {
-    "submitted": ("已提交", "包含可领取、制作中和已退回的子任务。"),
+    "submitted": ("已提交", "查看可领取、制作中和已退回的子任务。"),
     "pending": ("待审核", "查看参考图与成品，通过或填写修改点退回。"),
     "completed": ("已完成", "查看已经通过验收的子任务与成品。"),
 }
@@ -84,12 +89,15 @@ class SubmissionListPage(QWidget):
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         header.addLayout(title_box, 1)
+        self.urgent_button = QPushButton("设置加急")
+        self.urgent_button.clicked.connect(self._toggle_urgent)
+        self.urgent_button.setVisible(self.view_mode == "submitted")
         refresh = QPushButton("刷新")
         refresh.clicked.connect(self.refresh)
+        header.addWidget(self.urgent_button)
         header.addWidget(refresh)
         outer.addLayout(header)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
         self.project_table = QTableWidget(0, 7)
         self.project_table.setHorizontalHeaderLabels(
             ["任务编码", "货号", "运营", "日期", "任务状态", "子任务进度", "加急"]
@@ -101,18 +109,25 @@ class SubmissionListPage(QWidget):
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
         self.project_table.horizontalHeader().setStretchLastSection(True)
+        self.project_table.setMaximumHeight(220)
         self.project_table.itemSelectionChanged.connect(self._project_selected)
-        splitter.addWidget(self.project_table)
+        outer.addWidget(self.project_table)
 
-        detail = QWidget()
-        detail_layout = QVBoxLayout(detail)
-        detail_layout.setContentsMargins(0, 8, 0, 0)
-        self.detail_label = QLabel("选择一个任务查看子任务")
-        self.detail_label.setWordWrap(True)
-        detail_layout.addWidget(self.detail_label)
+        body = QSplitter(Qt.Orientation.Horizontal)
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 8, 8, 0)
         self.task_table = QTableWidget(0, 7)
         self.task_table.setHorizontalHeaderLabels(
-            ["子任务编码", "模特图", "衣服数", "制作人员", "状态", "加急", "修改时间"]
+            [
+                "子任务编码",
+                "衣服数",
+                "制作人员",
+                "状态",
+                "加急",
+                "更新时间",
+                "操作",
+            ]
         )
         self.task_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -122,37 +137,69 @@ class SubmissionListPage(QWidget):
         )
         self.task_table.horizontalHeader().setStretchLastSection(True)
         self.task_table.itemSelectionChanged.connect(self._task_selected)
-        detail_layout.addWidget(self.task_table, 1)
-        self.reference_list = QListWidget()
-        self.reference_list.setViewMode(QListWidget.ViewMode.IconMode)
-        self.reference_list.setIconSize(QSize(82, 82))
-        self.reference_list.setGridSize(QSize(112, 108))
-        self.reference_list.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.reference_list.setMinimumHeight(120)
-        detail_layout.addWidget(self.reference_list)
+        left_layout.addWidget(self.task_table, 1)
+        self.info_line = QLabel("选择一个子任务查看详情")
+        self.info_line.setWordWrap(False)
+        self.info_line.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.info_line.setStyleSheet("color:#60708a;padding:4px 0;")
+        left_layout.addWidget(self.info_line)
         actions = QHBoxLayout()
-        self.edit_sources = QPushButton("修改素材与配对")
-        self.urgent_button = QPushButton("设置加急")
+        actions.addStretch(1)
         self.view_results = QPushButton("查看/对比成品")
         self.return_button = QPushButton("退回返工")
         self.approve_button = QPushButton("验收通过")
         self.approve_button.setObjectName("PrimaryButton")
-        self.edit_sources.clicked.connect(self._edit_sources)
-        self.urgent_button.clicked.connect(self._toggle_urgent)
         self.view_results.clicked.connect(self._show_results)
         self.return_button.clicked.connect(self._return_task)
         self.approve_button.clicked.connect(self._approve_task)
-        actions.addWidget(self.edit_sources)
-        actions.addWidget(self.urgent_button)
-        actions.addStretch(1)
-        actions.addWidget(self.view_results)
-        actions.addWidget(self.return_button)
-        actions.addWidget(self.approve_button)
-        detail_layout.addLayout(actions)
-        splitter.addWidget(detail)
-        splitter.setSizes([350, 380])
-        outer.addWidget(splitter, 1)
-        self._update_actions()
+        for button in (
+            self.view_results,
+            self.return_button,
+            self.approve_button,
+        ):
+            button.setVisible(self.view_mode == "pending")
+            actions.addWidget(button)
+        left_layout.addLayout(actions)
+        body.addWidget(left)
+
+        self.preview_tabs = QTabWidget()
+        self.preview_tabs.addTab(self._build_reference_preview(), "参考图")
+        self.result_gallery = ResultGallery(self.resolver)
+        self.preview_tabs.addTab(self.result_gallery, "结果图")
+        if self.view_mode == "submitted":
+            self.preview_tabs.setTabVisible(1, False)
+        body.addWidget(self.preview_tabs)
+        body.setSizes([760, 440])
+        outer.addWidget(body, 1)
+
+    def _build_reference_preview(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        model_box = QGroupBox("模特图")
+        model_layout = QVBoxLayout(model_box)
+        self.model_preview = QLabel("尚未选择任务")
+        self.model_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.model_preview.setMinimumHeight(210)
+        self.model_preview.setStyleSheet(
+            "background:#f3f6fb;border:1px solid #dbe3ef;border-radius:6px;"
+        )
+        self.model_name = QLabel()
+        self.model_name.setWordWrap(True)
+        model_layout.addWidget(self.model_preview, 1)
+        model_layout.addWidget(self.model_name)
+        layout.addWidget(model_box, 1)
+        garment_box = QGroupBox("衣服图")
+        garment_layout = QVBoxLayout(garment_box)
+        self.reference_list = QListWidget()
+        self.reference_list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.reference_list.setIconSize(QSize(92, 92))
+        self.reference_list.setGridSize(QSize(120, 125))
+        self.reference_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        garment_layout.addWidget(self.reference_list)
+        layout.addWidget(garment_box, 1)
+        return widget
 
     def refresh(self) -> None:
         try:
@@ -168,13 +215,22 @@ class SubmissionListPage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "读取任务失败", str(exc))
             return
-        statuses = set(VIEW_STATUSES[self.view_mode])
-        visible_ids = {
-            task.project_id for task in self._all_tasks if task.status in statuses
-        }
-        self.projects = [
-            project for project in projects if project.id in visible_ids
-        ]
+        if self.view_mode == "completed":
+            self.projects = [
+                project
+                for project in projects
+                if project.status == PROJECT_COMPLETED
+            ]
+        else:
+            statuses = set(VIEW_STATUSES[self.view_mode])
+            visible_ids = {
+                task.project_id
+                for task in self._all_tasks
+                if task.status in statuses
+            }
+            self.projects = [
+                project for project in projects if project.id in visible_ids
+            ]
         self.project_table.setRowCount(0)
         for project in self.projects:
             row = self.project_table.rowCount()
@@ -198,8 +254,15 @@ class SubmissionListPage(QWidget):
         else:
             self.tasks = []
             self.task_table.setRowCount(0)
+            self.info_line.setText("当前状态下没有任务")
+            self.model_preview.setText("尚无参考图")
+            self.model_preview.setPixmap(QPixmap())
+            self.model_name.clear()
             self.reference_list.clear()
-            self.detail_label.setText("当前状态下没有任务")
+            self.result_gallery.set_task(
+                self._empty_task(),
+                [],
+            )
         self._update_actions()
 
     def _current_project(self) -> ProjectRecord | None:
@@ -212,12 +275,6 @@ class SubmissionListPage(QWidget):
         project = self._current_project()
         if project is None:
             return
-        self.detail_label.setText(
-            f"{project.project_code} · 货号 {project.product_code or project.name}　"
-            f"日期：{project.source_date or '未设置'}\n"
-            f"共享目录：{project.project_relative_root}\n"
-            f"备注：{project.note or '无'}"
-        )
         statuses = set(VIEW_STATUSES[self.view_mode])
         self.tasks = [
             task
@@ -230,7 +287,6 @@ class SubmissionListPage(QWidget):
             self.task_table.insertRow(row)
             values = (
                 task.task_code,
-                task.model_name,
                 str(len(task.garment_assets)),
                 task.assignee_name or "未分配",
                 TASK_STATUS_LABELS.get(task.status, task.status),
@@ -244,34 +300,25 @@ class SubmissionListPage(QWidget):
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, task.id)
                 self.task_table.setItem(row, column, item)
+            if self.view_mode == "submitted":
+                edit = QPushButton("修改素材与配对")
+                edit.setEnabled(self._can_edit_task(task))
+                edit.clicked.connect(partial(self._edit_task, task))
+                self.task_table.setCellWidget(row, 6, edit)
+            else:
+                self.task_table.setItem(
+                    row, 6, QTableWidgetItem("")
+                )
         if self.tasks:
             self.task_table.selectRow(0)
-        self._task_selected()
-
-    def _task_selected(self) -> None:
-        task = self._current_task()
-        self.reference_list.clear()
-        if task is not None:
-            for asset in task.garment_assets:
-                self._add_reference(task, asset.relative_path, asset.original_name)
-            self._add_reference(task, task.model_path, task.model_name)
+            self._task_selected()
+        else:
+            self.info_line.setText(
+                f"{project.product_code or project.name} · "
+                f"{project.source_date or ''} · {project.owner_name} · "
+                f"{project.note or '无备注'}"
+            )
         self._update_actions()
-
-    def _add_reference(
-        self,
-        task: ProjectTask,
-        relative_path: str,
-        name: str,
-    ) -> None:
-        path = self.resolver.resolve_project_path(
-            task.project_relative_root,
-            relative_path,
-        )
-        item = QListWidgetItem(name)
-        pixmap = load_scaled_pixmap(path, QSize(82, 82))
-        if not pixmap.isNull():
-            item.setIcon(QIcon(pixmap))
-        self.reference_list.addItem(item)
 
     def _current_task(self) -> ProjectTask | None:
         row = self.task_table.currentRow()
@@ -288,9 +335,59 @@ class SubmissionListPage(QWidget):
             )
         )
 
-    def _update_actions(self) -> None:
-        project = self._current_project()
+    def _can_edit_task(self, task: ProjectTask) -> bool:
+        return self._can_manage(self._current_project()) and task.status not in (
+            TASK_AWAITING_ACCEPTANCE,
+            TASK_APPROVED,
+            "cancelled",
+        )
+
+    def _task_selected(self) -> None:
         task = self._current_task()
+        project = self._current_project()
+        if task is None or project is None:
+            self._update_actions()
+            return
+        self.info_line.setText(
+            f"{project.product_code or project.name} · "
+            f"{project.source_date or ''} · {project.owner_name} · "
+            f"{project.note or '无备注'}"
+        )
+        self.info_line.setToolTip(project.project_relative_root)
+        self._set_reference_preview(task)
+        if self.view_mode != "submitted":
+            self.result_gallery.set_task(
+                task,
+                self.repository.list_results(task.id),
+            )
+        self._update_actions()
+
+    def _set_reference_preview(self, task: ProjectTask) -> None:
+        model_path = self.resolver.resolve_project_path(
+            task.project_relative_root,
+            task.model_path,
+        )
+        pixmap = load_scaled_pixmap(model_path, QSize(420, 300))
+        if pixmap.isNull():
+            self.model_preview.setText("模特图不存在")
+        else:
+            self.model_preview.setPixmap(pixmap)
+        self.model_name.setText(task.model_name)
+        self.reference_list.clear()
+        for asset in task.garment_assets:
+            path = self.resolver.resolve_project_path(
+                task.project_relative_root,
+                asset.relative_path,
+            )
+            item = QListWidgetItem(asset.original_name)
+            thumb = load_scaled_pixmap(path, QSize(92, 92))
+            if not thumb.isNull():
+                item.setIcon(QIcon(thumb))
+            self.reference_list.addItem(item)
+
+    def _update_actions(self) -> None:
+        task = self._current_task()
+        project = self._current_project()
         can_manage = self._can_manage(project)
         editable = bool(
             task
@@ -301,26 +398,22 @@ class SubmissionListPage(QWidget):
                 "cancelled",
             )
         )
-        self.edit_sources.setEnabled(editable)
         self.urgent_button.setEnabled(editable)
         self.urgent_button.setText(
             "取消加急" if task and task.is_urgent else "设置加急"
         )
-        self.view_results.setEnabled(bool(task))
         reviewable = bool(
             task
             and can_manage
             and task.status == TASK_AWAITING_ACCEPTANCE
         )
-        self.return_button.setVisible(self.view_mode == "pending")
-        self.approve_button.setVisible(self.view_mode == "pending")
+        self.view_results.setEnabled(bool(task))
         self.return_button.setEnabled(reviewable)
         self.approve_button.setEnabled(reviewable)
 
-    def _edit_sources(self) -> None:
-        task = self._current_task()
+    def _edit_task(self, task: ProjectTask) -> None:
         project = self._current_project()
-        if task is None or project is None:
+        if project is None:
             return
         draft = self.repository.get_project_draft(project.id)
         if draft is None:
@@ -405,3 +498,33 @@ class SubmissionListPage(QWidget):
             QMessageBox.warning(self, "退回失败", str(exc))
             return
         self.refresh()
+
+    @staticmethod
+    def _empty_task() -> ProjectTask:
+        return ProjectTask(
+            id=0,
+            task_code="",
+            project_id=0,
+            project_code="",
+            project_name="",
+            project_relative_root="",
+            garment_asset_id=0,
+            garment_path="",
+            garment_name="",
+            garment_hash="",
+            model_asset_id=0,
+            model_path="",
+            model_name="",
+            model_hash="",
+            status="",
+            assignee_id=None,
+            assignee_name="",
+            prompt_text="",
+            model="",
+            aspect_ratio="3:4",
+            resolution="2K",
+            n=1,
+            final_quantity=0,
+            owner_id=0,
+            created_at=utc_naive_to_local(utc_now()),
+        )
