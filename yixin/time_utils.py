@@ -4,6 +4,18 @@ from datetime import datetime, timezone
 from typing import Mapping
 
 
+def local_to_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.astimezone()
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def utc_naive_to_local(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone().replace(tzinfo=None)
+
+
 def parse_utc_timestamp(value: str | None) -> datetime | None:
     if not value:
         return None

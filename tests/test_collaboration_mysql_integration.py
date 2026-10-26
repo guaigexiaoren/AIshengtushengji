@@ -1,0 +1,207 @@
+import os
+import threading
+import unittest
+from datetime import datetime, timedelta
+from decimal import Decimal
+
+from yixin.collaboration.repository import MySQLCentralRepository, MySQLConfig
+from yixin.collaboration.reports import ReportFilter
+from yixin.collaboration.types import (
+    GeneratedResultInput,
+    PairingInput,
+    ProjectAssetInput,
+    ProjectDraft,
+    TASK_APPROVED,
+)
+
+
+MYSQL_ENV = {
+    key: os.environ.get(key)
+    for key in (
+        "YIXIN_TEST_MYSQL_HOST",
+        "YIXIN_TEST_MYSQL_PORT",
+        "YIXIN_TEST_MYSQL_DATABASE",
+        "YIXIN_TEST_MYSQL_USER",
+        "YIXIN_TEST_MYSQL_PASSWORD",
+    )
+}
+RUN_MYSQL = all(MYSQL_ENV.values()) and str(
+    MYSQL_ENV["YIXIN_TEST_MYSQL_DATABASE"]
+).endswith("_test")
+
+
+@unittest.skipUnless(
+    RUN_MYSQL,
+    "需要 YIXIN_TEST_MYSQL_* 环境变量，且测试库名必须以 _test 结尾",
+)
+class MySQLIntegrationTests(unittest.TestCase):
+    def test_concurrent_claim_and_complete_review_loop(self) -> None:
+        repository = MySQLCentralRepository(
+            MySQLConfig(
+                host=str(MYSQL_ENV["YIXIN_TEST_MYSQL_HOST"]),
+                port=int(MYSQL_ENV["YIXIN_TEST_MYSQL_PORT"]),
+                database=str(MYSQL_ENV["YIXIN_TEST_MYSQL_DATABASE"]),
+                user=str(MYSQL_ENV["YIXIN_TEST_MYSQL_USER"]),
+                password=str(MYSQL_ENV["YIXIN_TEST_MYSQL_PASSWORD"]),
+            )
+        )
+        repository.ensure_schema()
+        users = []
+        project_id = None
+        try:
+            admin = repository.create_initial_admin(
+                "_integration_admin",
+                "集成管理员",
+                "TempAdmin123",
+            )
+            users.append(admin.id)
+            operator = repository.create_user(
+                "_integration_ops",
+                "集成运营",
+                "operations",
+                "TempOps123",
+            )
+            ai_one = repository.create_user(
+                "_integration_ai1",
+                "集成制作1",
+                "ai",
+                "TempAi1123",
+            )
+            ai_two = repository.create_user(
+                "_integration_ai2",
+                "集成制作2",
+                "ai",
+                "TempAi2123",
+            )
+            users.extend((operator.id, ai_one.id, ai_two.id))
+            repository.set_model_price(
+                admin,
+                "gemini-3.1-flash-image",
+                Decimal("1.25"),
+            )
+            project_id = repository.create_project(
+                operator,
+                ProjectDraft(
+                    project_code="_INTEGRATION_PROJECT",
+                    name="集成测试",
+                    deadline=datetime.now() + timedelta(days=1),
+                    priority="normal",
+                    project_relative_root="_integration_project",
+                    pairing_mode="filename",
+                    assets=(
+                        ProjectAssetInput(
+                            "garment",
+                            "衣服图/G001.png",
+                            "G001.png",
+                            "a" * 64,
+                            "image/png",
+                            10,
+                            10,
+                        ),
+                        ProjectAssetInput(
+                            "model",
+                            "模特图/M001.png",
+                            "M001.png",
+                            "b" * 64,
+                            "image/png",
+                            10,
+                            10,
+                        ),
+                    ),
+                    pairs=(PairingInput(0, 0),),
+                ),
+            )
+            task = repository.list_project_tasks(project_id)[0]
+            outcomes = []
+
+            def claim(actor):
+                try:
+                    repository.claim_task(task.id, actor)
+                    outcomes.append(actor.username)
+                except Exception:
+                    outcomes.append("conflict")
+
+            threads = [
+                threading.Thread(target=claim, args=(ai_one,)),
+                threading.Thread(target=claim, args=(ai_two,)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(outcomes.count("conflict"), 1)
+            winner = ai_one if ai_one.username in outcomes else ai_two
+
+            attempt = repository.create_generation_attempt(
+                task.id,
+                winner,
+                prompt="集成测试提示词",
+                model="gemini-3.1-flash-image",
+                aspect_ratio="3:4",
+                resolution="2K",
+                n=1,
+                unit_price=Decimal("1.25"),
+            )
+            repository.complete_generation_attempt(
+                attempt.id,
+                winner,
+                request_id="integration",
+                remote_task_id="integration",
+                raw_response={"ok": True},
+                input_tokens=1,
+                output_tokens=2,
+                results=(
+                    GeneratedResultInput(
+                        0,
+                        "AI成品/integration/result.png",
+                        "",
+                        "c" * 64,
+                        "image/png",
+                        10,
+                        10,
+                    ),
+                ),
+            )
+            result_id = repository.list_results(task.id)[0].id
+            repository.submit_for_acceptance(
+                task.id,
+                winner,
+                final_result_ids=(result_id,),
+                final_quantity=1,
+            )
+            repository.review_task(task.id, operator, approved=True)
+            self.assertEqual(repository.get_task(task.id).status, TASK_APPROVED)
+            self.assertEqual(
+                repository.report(ReportFilter()).summary.total_cost,
+                Decimal("1.2500"),
+            )
+        finally:
+            with repository.connection() as connection:
+                with connection.cursor() as cursor:
+                    if project_id:
+                        cursor.execute(
+                            "DELETE FROM project_tasks WHERE project_id = %s",
+                            (project_id,),
+                        )
+                        cursor.execute(
+                            "DELETE FROM project_assets WHERE project_id = %s",
+                            (project_id,),
+                        )
+                        cursor.execute(
+                            "DELETE FROM projects WHERE id = %s",
+                            (project_id,),
+                        )
+                    if users:
+                        placeholders = ", ".join(["%s"] * len(users))
+                        cursor.execute(
+                            f"DELETE FROM model_prices WHERE created_by IN ({placeholders})",
+                            tuple(users),
+                        )
+                        cursor.execute(
+                            f"DELETE FROM users WHERE id IN ({placeholders})",
+                            tuple(users),
+                        )
+
+
+if __name__ == "__main__":
+    unittest.main()

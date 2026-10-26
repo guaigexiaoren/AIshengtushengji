@@ -3,10 +3,20 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timezone
 
-from yixin.time_utils import format_elapsed, format_task_elapsed
+from yixin.time_utils import (
+    format_elapsed,
+    format_task_elapsed,
+    local_to_utc_naive,
+    utc_naive_to_local,
+)
 
 
 class TimeUtilsTests(unittest.TestCase):
+    def test_local_utc_round_trip(self) -> None:
+        local_value = datetime(2026, 1, 2, 12, 30, 0)
+        utc_value = local_to_utc_naive(local_value)
+        self.assertEqual(utc_naive_to_local(utc_value), local_value)
+
     def test_duration_formats(self) -> None:
         self.assertEqual(format_elapsed(35), "35秒")
         self.assertEqual(format_elapsed(312), "5分12秒")

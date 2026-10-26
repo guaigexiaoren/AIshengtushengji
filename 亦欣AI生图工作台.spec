@@ -8,8 +8,9 @@ a = Analysis(
     datas=[
         ("assets/app_icon.ico", "assets"),
         ("assets/app_icon.png", "assets"),
+        ("yixin/collaboration/schema.sql", "yixin/collaboration"),
     ],
-    hiddenimports=[],
+    hiddenimports=["pymysql", "openpyxl"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

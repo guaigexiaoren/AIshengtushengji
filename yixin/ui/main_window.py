@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QFrame,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -17,6 +16,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..api import NanoBananaClient
+from ..collaboration.repository import MySQLCentralRepository
+from ..collaboration.shared_paths import SharedPathResolver
+from ..collaboration.types import (
+    ROLE_ADMIN,
+    ROLE_AI,
+    ROLE_LABELS,
+    ROLE_OPERATIONS,
+    AuthUser,
+)
 from ..constants import APP_NAME, MODE_DRESS_UP, MODE_FREE_COMPOSE, STATUS_LABELS
 from ..database import Database
 from ..library import LibraryService
@@ -26,10 +35,68 @@ from ..security import SecretStore
 from ..storage import FileStore
 from ..worker import TaskWorker
 from .batch_dress_page import BatchDressPage
+from .admin_page import AdminPage
+from .ai_projects_page import AiProjectsPage
 from .create_page import CreatePage
 from .dialogs import SettingsDialog
 from .history_page import HistoryPage
 from .library_page import LibraryPage
+from .operations_page import OperationsPage
+
+
+class NavItem:
+    def __init__(self, text: str) -> None:
+        self._text = text
+
+    def text(self) -> str:
+        return self._text
+
+
+class SidebarNav(QWidget):
+    currentRowChanged = Signal(int)
+
+    def __init__(self, labels: list[str], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._current_row = -1
+        self._buttons: list[QPushButton] = []
+        self._items = [NavItem(text) for text in labels]
+        self._button_group = QButtonGroup(self)
+        self._button_group.setExclusive(True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        for index, text in enumerate(labels):
+            button = QPushButton(text)
+            button.setObjectName("NavButton")
+            button.setCheckable(True)
+            button.setFixedHeight(44)
+            button.clicked.connect(
+                lambda _checked=False, row=index: self.setCurrentRow(row)
+            )
+            self._button_group.addButton(button, index)
+            self._buttons.append(button)
+            layout.addWidget(button)
+        layout.addStretch(1)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def item(self, index: int) -> NavItem | None:
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def currentRow(self) -> int:
+        return self._current_row
+
+    def setCurrentRow(self, index: int) -> None:
+        if not 0 <= index < len(self._buttons):
+            return
+        changed = index != self._current_row
+        self._current_row = index
+        self._buttons[index].setChecked(True)
+        if changed:
+            self.currentRowChanged.emit(index)
 
 
 class MainWindow(QMainWindow):
@@ -42,44 +109,79 @@ class MainWindow(QMainWindow):
         library_service: LibraryService,
         secret_store: SecretStore,
         worker: TaskWorker,
+        client: NanoBananaClient,
+        repository: MySQLCentralRepository,
+        resolver: SharedPathResolver,
+        actor: AuthUser,
     ) -> None:
         super().__init__()
         self.paths = paths
         self.database = database
         self.secret_store = secret_store
         self.worker = worker
+        self.client = client
+        self.repository = repository
+        self.resolver = resolver
+        self.actor = actor
         self.setWindowIcon(QApplication.instance().windowIcon())
         self.setWindowTitle(APP_NAME)
         self.resize(1480, 920)
         self.setMinimumSize(1180, 720)
+
+        self.stack = QStackedWidget()
+        self.page_specs: list[tuple[str, QWidget]] = []
+        if self.actor.role in (ROLE_OPERATIONS, ROLE_ADMIN):
+            self.operations_page = OperationsPage(
+                repository,
+                resolver,
+                actor,
+            )
+            self.page_specs.append(("运营项目", self.operations_page))
+        if self.actor.role in (ROLE_AI, ROLE_ADMIN):
+            self.project_work_page = AiProjectsPage(
+                repository,
+                resolver,
+                actor,
+                client,
+                secret_store,
+                file_store,
+            )
+            self.page_specs.append(("项目制作", self.project_work_page))
+            self.create_page = CreatePage(
+                database,
+                file_store,
+                library_service,
+                worker,
+                secret_store,
+            )
+            self.batch_dress_page = BatchDressPage(
+                database,
+                file_store,
+                library_service,
+                worker,
+                secret_store,
+            )
+            self.history_page = HistoryPage(database, library_service, worker)
+            self.library_page = LibraryPage(database, library_service)
+            self.page_specs.extend(
+                [
+                    ("普通创作", self.create_page),
+                    ("批量换装", self.batch_dress_page),
+                    ("历史记录", self.history_page),
+                    ("作品库", self.library_page),
+                ]
+            )
+        if self.actor.role == ROLE_ADMIN:
+            self.admin_page = AdminPage(repository, actor)
+            self.page_specs.append(("管理控制台", self.admin_page))
+        for _, page in self.page_specs:
+            self.stack.addWidget(page)
 
         central = QWidget()
         root = QHBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
         root.addWidget(self._build_sidebar())
-
-        self.stack = QStackedWidget()
-        self.create_page = CreatePage(
-            database,
-            file_store,
-            library_service,
-            worker,
-            secret_store,
-        )
-        self.batch_dress_page = BatchDressPage(
-            database,
-            file_store,
-            library_service,
-            worker,
-            secret_store,
-        )
-        self.history_page = HistoryPage(database, library_service, worker)
-        self.library_page = LibraryPage(database, library_service)
-        self.stack.addWidget(self.create_page)
-        self.stack.addWidget(self.batch_dress_page)
-        self.stack.addWidget(self.history_page)
-        self.stack.addWidget(self.library_page)
         root.addWidget(self.stack, 1)
 
         content = QWidget()
@@ -92,22 +194,24 @@ class MainWindow(QMainWindow):
 
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage(
-            f"数据目录：{self.paths.root} · 任务串行执行，生成请求不会自动重试"
+            f"{self.actor.display_name} · {ROLE_LABELS.get(self.actor.role, self.actor.role)} · "
+            f"数据目录：{self.paths.root} · 生图请求不会自动重试"
         )
 
-        self.nav_list.currentRowChanged.connect(self.stack.setCurrentIndex)
-        self.create_page.settings_requested.connect(self.open_settings)
-        self.batch_dress_page.settings_requested.connect(self.open_settings)
-        self.batch_dress_page.tasks_enqueued.connect(self._on_batch_enqueued)
-        self.create_page.templates_changed.connect(
-            self.batch_dress_page.refresh_templates
-        )
-        self.batch_dress_page.templates_changed.connect(
-            self.create_page.refresh_templates
-        )
-        self.create_page.library_changed.connect(self.library_page.refresh)
-        self.history_page.library_changed.connect(self.library_page.refresh)
-        self.history_page.retry_requested.connect(self._open_retry)
+        self.nav_list.currentRowChanged.connect(self._nav_changed)
+        if hasattr(self, "create_page"):
+            self.create_page.settings_requested.connect(self.open_settings)
+            self.batch_dress_page.settings_requested.connect(self.open_settings)
+            self.batch_dress_page.tasks_enqueued.connect(self._on_batch_enqueued)
+            self.create_page.templates_changed.connect(
+                self.batch_dress_page.refresh_templates
+            )
+            self.batch_dress_page.templates_changed.connect(
+                self.create_page.refresh_templates
+            )
+            self.create_page.library_changed.connect(self.library_page.refresh)
+            self.history_page.library_changed.connect(self.library_page.refresh)
+            self.history_page.retry_requested.connect(self._open_retry)
         self.worker.signals.task_changed.connect(self._on_task_changed)
         self.nav_list.setCurrentRow(0)
 
@@ -120,28 +224,37 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
         title = QLabel("亦欣 AI")
         title.setObjectName("BrandTitle")
-        subtitle = QLabel("生图工作台 · Nano Banana")
+        subtitle = QLabel(
+            f"{self.actor.display_name} · {ROLE_LABELS.get(self.actor.role, self.actor.role)}"
+        )
         subtitle.setObjectName("BrandSubtitle")
         layout.addWidget(title)
         layout.addWidget(subtitle)
         layout.addSpacing(20)
-        self.nav_list = QListWidget()
+        labels = [text for text, _ in self.page_specs]
+        self.nav_list = SidebarNav(labels)
         self.nav_list.setObjectName("NavList")
-        for text in ("创作", "批量换装", "历史记录", "作品库"):
-            item = QListWidgetItem(text)
-            item.setSizeHint(item.sizeHint().expandedTo(item.sizeHint()))
-            self.nav_list.addItem(item)
         layout.addWidget(self.nav_list)
         layout.addStretch(1)
-        note = QLabel("未保存结果保留 7 天")
+        note = QLabel("项目候选图保留 30 天")
         note.setStyleSheet("color:#91a3bf;font-size:11px;")
         note.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(note)
-        settings = QPushButton("设置")
-        settings.setObjectName("GhostButton")
-        settings.clicked.connect(self.open_settings)
-        layout.addWidget(settings)
+        if self.actor.role in (ROLE_AI, ROLE_ADMIN):
+            settings = QPushButton("设置")
+            settings.setObjectName("GhostButton")
+            settings.clicked.connect(self.open_settings)
+            layout.addWidget(settings)
         return sidebar
+
+    def _nav_changed(self, index: int) -> None:
+        if not 0 <= index < len(self.page_specs):
+            return
+        self.stack.setCurrentIndex(index)
+        page = self.page_specs[index][1]
+        refresh = getattr(page, "refresh", None)
+        if callable(refresh):
+            refresh()
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.secret_store, self.database, self)
@@ -161,28 +274,40 @@ class MainWindow(QMainWindow):
         )
 
     def _open_retry(self, task_id: int) -> None:
+        if not hasattr(self, "create_page"):
+            return
         task = self.database.get_task(task_id)
         if task and task["mode"] in (MODE_DRESS_UP, MODE_FREE_COMPOSE):
-            self.nav_list.setCurrentRow(1)
+            self._select_page(self.batch_dress_page)
             self.batch_dress_page.prepare_retry(task_id)
             self.statusBar().showMessage(
                 f"已载入批量换装任务 #{task_id}，修改后重新生成",
                 8000,
             )
             return
-        self.nav_list.setCurrentRow(0)
+        self._select_page(self.create_page)
         self.create_page.prepare_retry(task_id)
         self.statusBar().showMessage(
             f"已载入任务 #{task_id}，修改参数后点击生成",
             8000,
         )
 
+    def _select_page(self, page: QWidget) -> None:
+        for index, (_, candidate) in enumerate(self.page_specs):
+            if candidate is page:
+                self.nav_list.setCurrentRow(index)
+                return
+
     def closeEvent(self, event) -> None:
-        if self.database.has_running_tasks():
+        project_running = bool(
+            hasattr(self, "project_work_page")
+            and self.project_work_page.is_generating()
+        )
+        if self.database.has_running_tasks() or project_running:
             answer = QMessageBox.warning(
                 self,
                 "仍有任务在执行",
-                "关闭程序不会保证服务端停止当前请求，可能已经产生费用。\n"
+                "关闭程序不会停止正在发送的生图请求，可能已经产生费用。\n"
                 "确定强制退出吗？",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,

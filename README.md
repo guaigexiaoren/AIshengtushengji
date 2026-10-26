@@ -25,14 +25,55 @@ Windows 10/11 x64 桌面生图工具，使用 Nano Banana 三个型号生成和�
 - Windows DPAPI 加密 API Key、日志脱敏、7 天临时文件清理
 - PyInstaller onedir 打包，数据固定保存在 EXE 同级 `data`
 - 自定义深蓝星芒画笔图标，覆盖 EXE、窗口和任务栏
+- 运营、AI 制作、管理员三角色登录，同一安装包按权限显示工作区
+- 内网 MySQL 协同项目、子任务、并发领取、退回返工和完整状态审计
+- 三种服装/模特配对：手动配对、全部组合、按 `G001`/`M001` 编号配对
+- 生成候选图写回共享盘，AI 自审选图后由运营验收通过或退回
+- 管理员维护账号、模型单图成本、共享目录和共享提示词模板
+- 按项目、人员、模型、服装和日期统计成本、耗时、返工与产出，并导出 Excel
 
-## 源码运行
+## 协同业务闭环
 
-```powershell
-& 'C:\Users\YYMY\AppData\Local\Programs\Python\Python313\python.exe' main.py
+1. 运营新建项目，填写项目编号、名称、截止时间等信息。
+2. 从统一共享盘导入“衣服图”和“模特图”，选择配对方式并提交。
+3. AI 人员领取任务、套用共享或个人提示词、生成候选图片。
+4. AI 人员勾选最终图片并提交自审。
+5. 运营查看全部候选图和最终图，点击验收通过或填写原因退回。
+6. 退回任务继续归原 AI 人员，全部子任务通过后项目自动完成。
+
+项目源图片路径按项目相对路径保存，不保存电脑盘符。成品写入：
+
+```text
+<项目目录>\AI成品\<项目编号>\<子任务编号>\attempt_001\
 ```
 
-首次启动后打开左下角“设置”，粘贴流光 API Key。软件只校验格式，不会主动调用验证密钥接口。
+最终图片长期保留；未选中的候选图保留 30 天后自动清理。
+
+## 安装与首次配置
+
+```powershell
+py -3.13 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe main.py
+```
+
+首次启动时：
+
+1. 填写内网 MySQL 的地址、端口、数据库和账号。
+2. 点击“测试连接”，再点击“初始化/升级表结构”。
+3. 数据库没有账号时，程序会要求创建首个管理员。
+4. 管理员创建运营和 AI 制作账号。
+5. 管理员设置统一共享盘 UNC 根目录和模型单图成本。
+6. AI 人员在左下角“设置”中填写自己的生图 API Key。
+
+也可以使用命令行初始化数据库：
+
+```powershell
+.\.venv\Scripts\python.exe tools\init_mysql.py --host 数据库地址 --database ai作图 --user 数据库账号
+```
+
+数据库密码只在当前 Windows 账号下通过 DPAPI 加密保存。正式部署时应使用仅拥有业务表增删改查权限的专用账号，并限制数据库来源 IP。
+数据库管理员可参考 `tools/create_runtime_mysql_user.sql` 创建该账号；不要把建表账号配置到普通员工电脑。
 
 设置页还可以选择本地保存方式：
 
@@ -48,15 +89,17 @@ Windows 10/11 x64 桌面生图工具，使用 Nano Banana 三个型号生成和�
 
 ```powershell
 $env:QT_QPA_PLATFORM='offscreen'
-& 'C:\Users\YYMY\AppData\Local\Programs\Python\Python313\python.exe' -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
 测试使用模拟接口，不会发起真实付费生成。
+如需跑真实 MySQL 事务测试，设置 `YIXIN_TEST_MYSQL_HOST`、`PORT`、`DATABASE`、`USER`、`PASSWORD`；测试库名必须以 `_test` 结尾，普通运行会跳过该测试。
 
 ## 打包
 
 ```powershell
-& 'C:\Users\YYMY\AppData\Local\Programs\Python\Python313\python.exe' -m PyInstaller --noconfirm --clean 亦欣AI生图工作台.spec
+.\.venv\Scripts\python.exe -m pip install pyinstaller
+.\.venv\Scripts\python.exe -m PyInstaller --noconfirm --clean 亦欣AI生图工作台.spec
 ```
 
 输出目录：
@@ -65,10 +108,11 @@ $env:QT_QPA_PLATFORM='offscreen'
 dist\亦欣AI生图工作台\亦欣AI生图工作台.exe
 ```
 
-首次启动后会创建：
+首次启动后会创建本机数据：
 
 ```text
 data\config  加密配置
+data\config\database.bin  DPAPI 加密的 MySQL 配置
 data\temp    临时结果
 data\library 正式作品
 data\logs    脱敏日志
@@ -83,7 +127,7 @@ reference_01.png 等参考图
 thumbnail.jpg 缩略图
 ```
 
-升级时只替换 EXE 和 `_internal`，不要覆盖 `data`。
+首次升级旧版本时，程序会把旧 `data` 自动压缩备份到其同级目录，并停用旧 SQLite 数据库；旧历史不再显示。升级时只替换 EXE 和 `_internal`，不要覆盖新版本生成的 `data`。
 
 图标源文件位于 `assets/app_icon.svg`。修改后运行
 `python tools/build_app_icon.py` 可重新生成 PNG、ICO 和尺寸预览。

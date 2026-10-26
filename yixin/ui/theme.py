@@ -20,23 +20,22 @@ QLabel#BrandSubtitle {
     color: #9fb0ca;
     font-size: 11px;
 }
-QListWidget#NavList {
+QPushButton#NavButton {
     background: transparent;
     border: none;
-    outline: none;
-    color: #d8e2f0;
-}
-QListWidget#NavList::item {
-    padding: 13px 16px;
-    margin: 3px 10px;
     border-radius: 9px;
+    color: #d8e2f0;
+    padding: 0 16px;
+    text-align: left;
+    font-size: 14px;
 }
-QListWidget#NavList::item:selected {
-    background: #2e5fb7;
-    color: white;
-}
-QListWidget#NavList::item:hover:!selected {
+QPushButton#NavButton:hover {
     background: #233552;
+}
+QPushButton#NavButton:checked {
+    background: #2e5fb7;
+    color: #ffffff;
+    font-weight: 600;
 }
 QFrame#Card, QGroupBox#Card {
     background: #ffffff;

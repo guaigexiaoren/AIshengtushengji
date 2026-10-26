@@ -1,0 +1,216 @@
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INT NOT NULL PRIMARY KEY,
+    applied_at DATETIME(6) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS users (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(64) NOT NULL UNIQUE,
+    display_name VARCHAR(100) NOT NULL,
+    role VARCHAR(24) NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    must_change_password TINYINT(1) NOT NULL DEFAULT 1,
+    is_active TINYINT(1) NOT NULL DEFAULT 1,
+    last_login_at DATETIME(6) NULL,
+    created_at DATETIME(6) NOT NULL,
+    updated_at DATETIME(6) NOT NULL,
+    INDEX idx_users_role_active (role, is_active)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS projects (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    project_code VARCHAR(128) NOT NULL UNIQUE,
+    name VARCHAR(200) NOT NULL,
+    deadline DATETIME(6) NOT NULL,
+    priority VARCHAR(16) NOT NULL,
+    brand_platform VARCHAR(200) NOT NULL DEFAULT '',
+    category VARCHAR(200) NOT NULL DEFAULT '',
+    note TEXT NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    owner_id BIGINT UNSIGNED NOT NULL,
+    project_relative_root VARCHAR(1024) NOT NULL,
+    pairing_mode VARCHAR(24) NOT NULL,
+    created_at DATETIME(6) NOT NULL,
+    updated_at DATETIME(6) NOT NULL,
+    completed_at DATETIME(6) NULL,
+    cancelled_at DATETIME(6) NULL,
+    CONSTRAINT fk_projects_owner FOREIGN KEY (owner_id) REFERENCES users(id),
+    INDEX idx_projects_status_deadline (status, deadline),
+    INDEX idx_projects_owner_created (owner_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS project_assets (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    project_id BIGINT UNSIGNED NOT NULL,
+    role VARCHAR(16) NOT NULL,
+    relative_path VARCHAR(1024) NOT NULL,
+    original_name VARCHAR(255) NOT NULL,
+    content_hash CHAR(64) NOT NULL,
+    mime VARCHAR(64) NOT NULL,
+    width INT NOT NULL,
+    height INT NOT NULL,
+    created_at DATETIME(6) NOT NULL,
+    CONSTRAINT fk_project_assets_project FOREIGN KEY (project_id)
+        REFERENCES projects(id) ON DELETE CASCADE,
+    INDEX idx_project_assets_role (project_id, role),
+    INDEX idx_project_assets_hash (project_id, content_hash)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS project_tasks (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    task_code VARCHAR(160) NOT NULL UNIQUE,
+    project_id BIGINT UNSIGNED NOT NULL,
+    task_no INT NOT NULL,
+    garment_asset_id BIGINT UNSIGNED NOT NULL,
+    model_asset_id BIGINT UNSIGNED NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    assignee_id BIGINT UNSIGNED NULL,
+    prompt_text LONGTEXT NOT NULL,
+    model VARCHAR(100) NOT NULL DEFAULT '',
+    aspect_ratio VARCHAR(24) NOT NULL DEFAULT '3:4',
+    resolution VARCHAR(24) NULL,
+    n INT NOT NULL DEFAULT 1,
+    final_quantity INT NOT NULL DEFAULT 0,
+    claimed_at DATETIME(6) NULL,
+    work_started_at DATETIME(6) NULL,
+    submitted_at DATETIME(6) NULL,
+    approved_at DATETIME(6) NULL,
+    returned_at DATETIME(6) NULL,
+    created_at DATETIME(6) NOT NULL,
+    updated_at DATETIME(6) NOT NULL,
+    CONSTRAINT fk_project_tasks_project FOREIGN KEY (project_id)
+        REFERENCES projects(id) ON DELETE CASCADE,
+    CONSTRAINT fk_project_tasks_garment FOREIGN KEY (garment_asset_id)
+        REFERENCES project_assets(id),
+    CONSTRAINT fk_project_tasks_model FOREIGN KEY (model_asset_id)
+        REFERENCES project_assets(id),
+    CONSTRAINT fk_project_tasks_assignee FOREIGN KEY (assignee_id)
+        REFERENCES users(id),
+    UNIQUE KEY uk_project_task_no (project_id, task_no),
+    INDEX idx_project_tasks_status_created (status, created_at),
+    INDEX idx_project_tasks_assignee_status (assignee_id, status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS generation_attempts (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT UNSIGNED NOT NULL,
+    attempt_no INT NOT NULL,
+    operator_id BIGINT UNSIGNED NOT NULL,
+    model VARCHAR(100) NOT NULL,
+    prompt_text LONGTEXT NOT NULL,
+    aspect_ratio VARCHAR(24) NOT NULL,
+    resolution VARCHAR(24) NULL,
+    n INT NOT NULL,
+    status VARCHAR(24) NOT NULL,
+    unit_price DECIMAL(12, 4) NOT NULL DEFAULT 0,
+    generated_image_count INT NOT NULL DEFAULT 0,
+    request_id VARCHAR(255) NOT NULL DEFAULT '',
+    remote_task_id VARCHAR(255) NOT NULL DEFAULT '',
+    raw_response_json LONGTEXT NULL,
+    input_tokens INT NULL,
+    output_tokens INT NULL,
+    error_code VARCHAR(100) NOT NULL DEFAULT '',
+    error_message TEXT NULL,
+    created_at DATETIME(6) NOT NULL,
+    started_at DATETIME(6) NULL,
+    finished_at DATETIME(6) NULL,
+    CONSTRAINT fk_generation_attempts_task FOREIGN KEY (task_id)
+        REFERENCES project_tasks(id) ON DELETE CASCADE,
+    CONSTRAINT fk_generation_attempts_operator FOREIGN KEY (operator_id)
+        REFERENCES users(id),
+    UNIQUE KEY uk_generation_attempt_no (task_id, attempt_no),
+    INDEX idx_generation_attempts_task_created (task_id, created_at),
+    INDEX idx_generation_attempts_operator_created (operator_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS generation_results (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    attempt_id BIGINT UNSIGNED NOT NULL,
+    result_index INT NOT NULL,
+    relative_path VARCHAR(1024) NOT NULL,
+    thumbnail_relative_path VARCHAR(1024) NOT NULL DEFAULT '',
+    content_hash CHAR(64) NOT NULL,
+    mime VARCHAR(64) NOT NULL,
+    width INT NOT NULL,
+    height INT NOT NULL,
+    is_final TINYINT(1) NOT NULL DEFAULT 0,
+    created_at DATETIME(6) NOT NULL,
+    expire_at DATETIME(6) NULL,
+    CONSTRAINT fk_generation_results_attempt FOREIGN KEY (attempt_id)
+        REFERENCES generation_attempts(id) ON DELETE CASCADE,
+    UNIQUE KEY uk_generation_result_index (attempt_id, result_index),
+    INDEX idx_generation_results_final (attempt_id, is_final),
+    INDEX idx_generation_results_expire (is_final, expire_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS task_reviews (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    task_id BIGINT UNSIGNED NOT NULL,
+    reviewer_id BIGINT UNSIGNED NOT NULL,
+    decision VARCHAR(16) NOT NULL,
+    reason TEXT NOT NULL,
+    created_at DATETIME(6) NOT NULL,
+    CONSTRAINT fk_task_reviews_task FOREIGN KEY (task_id)
+        REFERENCES project_tasks(id) ON DELETE CASCADE,
+    CONSTRAINT fk_task_reviews_reviewer FOREIGN KEY (reviewer_id)
+        REFERENCES users(id),
+    INDEX idx_task_reviews_task_created (task_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS workflow_events (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    project_id BIGINT UNSIGNED NOT NULL,
+    task_id BIGINT UNSIGNED NULL,
+    actor_id BIGINT UNSIGNED NULL,
+    event_type VARCHAR(64) NOT NULL,
+    from_status VARCHAR(32) NOT NULL DEFAULT '',
+    to_status VARCHAR(32) NOT NULL DEFAULT '',
+    detail_json LONGTEXT NOT NULL,
+    created_at DATETIME(6) NOT NULL,
+    CONSTRAINT fk_workflow_events_project FOREIGN KEY (project_id)
+        REFERENCES projects(id) ON DELETE CASCADE,
+    CONSTRAINT fk_workflow_events_task FOREIGN KEY (task_id)
+        REFERENCES project_tasks(id) ON DELETE CASCADE,
+    CONSTRAINT fk_workflow_events_actor FOREIGN KEY (actor_id)
+        REFERENCES users(id),
+    INDEX idx_workflow_events_project_created (project_id, created_at),
+    INDEX idx_workflow_events_task_created (task_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS prompt_templates (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    scope VARCHAR(16) NOT NULL,
+    owner_id BIGINT UNSIGNED NULL,
+    name VARCHAR(120) NOT NULL,
+    prompt LONGTEXT NOT NULL,
+    created_at DATETIME(6) NOT NULL,
+    updated_at DATETIME(6) NOT NULL,
+    CONSTRAINT fk_prompt_templates_owner FOREIGN KEY (owner_id)
+        REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_prompt_templates_scope_owner (scope, owner_id),
+    INDEX idx_prompt_templates_name (name)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS model_prices (
+    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    model VARCHAR(100) NOT NULL,
+    unit_price DECIMAL(12, 4) NOT NULL,
+    currency VARCHAR(8) NOT NULL DEFAULT 'CNY',
+    effective_from DATETIME(6) NOT NULL,
+    created_by BIGINT UNSIGNED NOT NULL,
+    CONSTRAINT fk_model_prices_creator FOREIGN KEY (created_by)
+        REFERENCES users(id),
+    INDEX idx_model_prices_model_effective (model, effective_from)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS shared_settings (
+    setting_key VARCHAR(100) NOT NULL PRIMARY KEY,
+    value_json LONGTEXT NOT NULL,
+    updated_by BIGINT UNSIGNED NULL,
+    updated_at DATETIME(6) NOT NULL,
+    CONSTRAINT fk_shared_settings_user FOREIGN KEY (updated_by)
+        REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+INSERT IGNORE INTO schema_migrations(version, applied_at)
+VALUES (1, UTC_TIMESTAMP(6));

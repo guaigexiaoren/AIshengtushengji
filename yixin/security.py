@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import os
 from ctypes import wintypes
 from pathlib import Path
@@ -153,3 +154,31 @@ class SecretStore:
 
     def clear(self) -> None:
         self.path.unlink(missing_ok=True)
+
+
+class EncryptedJsonStore:
+    ENTROPY = b"yixin-ai-image-workbench-database-v1"
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def save(self, value: dict) -> None:
+        data = json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        encrypted = _dpapi_protect(data, self.ENTROPY)
+        atomic_write_bytes(self.path, encrypted)
+
+    def load(self, *, strict: bool = False) -> dict | None:
+        if not self.path.exists():
+            return None
+        try:
+            encrypted = self.path.read_bytes()
+            value = json.loads(
+                _dpapi_unprotect(encrypted, self.ENTROPY).decode("utf-8")
+            )
+            if not isinstance(value, dict):
+                raise ValueError("配置内容不是对象")
+            return value
+        except Exception:
+            if strict:
+                raise SecretStorageError("无法解密已保存的数据库配置")
+            return None
