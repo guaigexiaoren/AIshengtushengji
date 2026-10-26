@@ -11,6 +11,8 @@ HAS_PYSIDE = importlib.util.find_spec("PySide6") is not None
 
 if HAS_PYSIDE:
     from PIL import Image
+    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtTest import QTest
     from PySide6.QtWidgets import (
         QApplication,
         QLabel,
@@ -29,6 +31,7 @@ if HAS_PYSIDE:
         AuthUser,
         GenerationAttempt,
         GenerationResult,
+        PairingInput,
         ProjectAssetInput,
         ProjectRecord,
         ProjectTask,
@@ -45,7 +48,12 @@ if HAS_PYSIDE:
     from yixin.ui.main_window import MainWindow, SidebarNav
     from yixin.ui.submission_list_page import SubmissionListPage
     from yixin.ui.task_center_page import TaskCenterPage
-    from yixin.ui.task_create_page import PairPreviewCard, TaskCreatePage
+    from yixin.ui.task_create_page import (
+        CheckableHeaderView,
+        PairPreviewCard,
+        TaskCreatePage,
+    )
+    from yixin.ui.theme import APP_STYLESHEET
     from yixin.worker import TaskWorker
 
 
@@ -316,6 +324,7 @@ class CollaborationPageTests(unittest.TestCase):
             group_before={0: "AI图提交"},
             submenu_indices={0, 1, 2, 3},
         )
+        nav.setStyleSheet(APP_STYLESHEET)
         nav.resize(210, 650)
         nav.show()
         self.app.processEvents()
@@ -328,6 +337,12 @@ class CollaborationPageTests(unittest.TestCase):
             )
         )
         self.assertFalse(nav._buttons[4].property("submenu"))
+        group_label = nav.findChild(QLabel, "NavGroup")
+        self.assertIsNotNone(group_label)
+        self.assertEqual(
+            group_label.font().pixelSize(),
+            nav._buttons[4].font().pixelSize(),
+        )
         nav.close()
         nav.deleteLater()
 
@@ -370,11 +385,147 @@ class CollaborationPageTests(unittest.TestCase):
         card.show()
         self.app.processEvents()
         labels = [label.text() for label in card.findChildren(QLabel)]
-        self.assertIn("模特1.png", labels)
+        self.assertNotIn("模特1.png", labels)
         self.assertIn("衣服 7 张 · 1 个子任务", labels)
         self.assertEqual(len(card.garment_thumbnails), 7)
         card.close()
         card.deleteLater()
+
+    def test_product_header_selects_only_eligible_rows(self) -> None:
+        date_folder = current_date_folder(
+            self.root / self.actor.display_name
+        )
+        for code in ("123", "456", "重复货号"):
+            product = date_folder.path / code
+            (product / "衣服图").mkdir(parents=True)
+            (product / "模特图").mkdir(parents=True)
+            Image.new("RGB", (20, 20), "red").save(
+                product / "衣服图" / "衣服1.png"
+            )
+            Image.new("RGB", (20, 20), "blue").save(
+                product / "模特图" / "模特1.png"
+            )
+        invalid = date_folder.path / "缺少模特"
+        (invalid / "衣服图").mkdir(parents=True)
+        (invalid / "模特图").mkdir()
+        Image.new("RGB", (20, 20), "red").save(
+            invalid / "衣服图" / "衣服1.png"
+        )
+        self.repository.find_tasks_by_product = (
+            lambda _actor, _date, code: [object()]
+            if code == "重复货号"
+            else []
+        )
+        page = TaskCreatePage(
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        header = page.product_table.horizontalHeader()
+        self.assertIsInstance(header, CheckableHeaderView)
+        self.assertFalse(hasattr(page, "select_new_button"))
+        self.assertEqual(
+            page.product_table.horizontalHeaderItem(0).text(),
+            "选择",
+        )
+        states = {
+            page.product_table.item(row, 1).text():
+            page.product_table.item(row, 0)
+            for row in range(page.product_table.rowCount())
+        }
+        self.assertTrue(
+            states["123"].flags()
+            & Qt.ItemFlag.ItemIsUserCheckable
+        )
+        self.assertFalse(
+            states["重复货号"].flags()
+            & Qt.ItemFlag.ItemIsUserCheckable
+        )
+        self.assertFalse(
+            states["缺少模特"].flags()
+            & Qt.ItemFlag.ItemIsUserCheckable
+        )
+        self.assertEqual(header.check_state(), Qt.CheckState.Checked)
+        states["123"].setCheckState(Qt.CheckState.Unchecked)
+        self.assertEqual(
+            header.check_state(),
+            Qt.CheckState.PartiallyChecked,
+        )
+        page._set_all_eligible(Qt.CheckState.Unchecked)
+        self.assertEqual(
+            header.check_state(),
+            Qt.CheckState.Unchecked,
+        )
+        page._set_all_eligible(Qt.CheckState.Checked)
+        self.assertEqual(header.check_state(), Qt.CheckState.Checked)
+        QTest.mouseClick(
+            header.viewport(),
+            Qt.MouseButton.LeftButton,
+            pos=QPoint(12, header.height() // 2),
+        )
+        self.assertEqual(
+            header.check_state(),
+            Qt.CheckState.Unchecked,
+        )
+        self.assertEqual(page._selected_codes(), [])
+        page.deleteLater()
+
+    def test_pair_preview_uses_four_columns_and_manual_selection(self) -> None:
+        date_folder = current_date_folder(
+            self.root / self.actor.display_name
+        )
+        product = date_folder.path / "123"
+        (product / "衣服图").mkdir(parents=True)
+        (product / "模特图").mkdir(parents=True)
+        garment = product / "衣服图" / "衣服1.png"
+        Image.new("RGB", (20, 20), "red").save(garment)
+        models = []
+        for index in range(5):
+            path = product / "模特图" / f"模特{index + 1}.png"
+            Image.new("RGB", (20, 20), "blue").save(path)
+            models.append(path)
+        page = TaskCreatePage(
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        self.assertEqual(
+            page.pair_preview.minimumHeight(),
+            page.pair_preview.maximumHeight(),
+        )
+        self.assertEqual(len(page.pair_cards), 5)
+        positions = [
+            page.pair_preview_layout.getItemPosition(index)
+            for index in range(page.pair_preview_layout.count())
+        ]
+        self.assertEqual(
+            positions[:4],
+            [
+                (0, 0, 1, 1),
+                (0, 1, 1, 1),
+                (0, 2, 1, 1),
+                (0, 3, 1, 1),
+            ],
+        )
+        self.assertEqual(positions[4][:2], (1, 0))
+        page.mode_combo.setCurrentIndex(
+            page.mode_combo.findData("manual")
+        )
+        state = page.current_state
+        state.manual_pairs.clear()
+        state.manual_pairs.extend(
+            PairingInput(0, index)
+            for index in range(len(models))
+        )
+        page._refresh_pair_preview()
+        self.assertEqual(len(page.pair_cards), 5)
+        page._select_manual_pair(0)
+        self.assertEqual(page.selected_pair_model_index, 0)
+        self.assertTrue(page.pair_cards[0]._selected)
+        page._remove_manual_pair()
+        self.assertEqual(len(state.manual_pairs), 4)
+        self.assertEqual(len(page.pair_cards), 4)
+        page.deleteLater()
 
     def test_admin_user_table_shows_masked_api_key_and_policies(self) -> None:
         ai_user = AuthUser(
@@ -478,10 +629,36 @@ class CollaborationPageTests(unittest.TestCase):
         submitted_task = make_task("claimed")
         pending_task = make_task("awaiting_acceptance")
         completed_task = make_task("approved")
+        product_root = self.root / pending_task.project_relative_root
+        result_path = (
+            product_root
+            / "AI成品"
+            / pending_task.project_code
+            / pending_task.task_code
+            / "attempt_001"
+            / "result_01.png"
+        )
+        result_path.parent.mkdir(parents=True)
+        Image.new("RGB", (40, 50), "purple").save(result_path)
+        result = GenerationResult(
+            id=19,
+            attempt_id=2,
+            result_index=0,
+            relative_path=result_path.relative_to(product_root).as_posix(),
+            thumbnail_relative_path=result_path.relative_to(
+                product_root
+            ).as_posix(),
+            content_hash="f" * 64,
+            mime="image/png",
+            width=40,
+            height=50,
+            is_final=True,
+        )
         self.repository.list_projects = lambda **_: [project]
         self.repository.list_board_tasks = lambda *_args, **_kwargs: [
             submitted_task
         ]
+        self.repository.list_results = lambda _task_id: [result]
         submitted = SubmissionListPage(
             self.repository,
             self.resolver,
@@ -502,6 +679,25 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(edit.text(), "修改素材与配对")
         self.assertTrue(submitted.urgent_button.isVisible())
         self.assertFalse(submitted.preview_tabs.isTabVisible(1))
+        self.assertEqual(submitted.reference_strip.count(), 3)
+        self.assertEqual(submitted.reference_strip.currentRow(), 2)
+        self.assertEqual(submitted.reference_strip.item(2).text(), "模特")
+        self.assertTrue(
+            all(
+                not submitted.reference_strip.item(index).icon().isNull()
+                for index in range(submitted.reference_strip.count())
+            )
+        )
+        self.assertEqual(
+            submitted.reference_preview.current_path,
+            (product_root / "模特图" / "模特1.png").resolve(),
+        )
+        submitted.reference_strip.setCurrentRow(0)
+        self.app.processEvents()
+        self.assertEqual(
+            submitted.reference_preview.current_path,
+            (product_root / "衣服图" / "衣服1.png").resolve(),
+        )
         self.assertEqual(
             submitted.info_line.text(),
             "123 · 2026-01-02 · 运营小林 · 重点检查领口",
@@ -526,6 +722,11 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(pending.approve_button.isVisible())
         self.assertIsNone(pending.task_table.cellWidget(0, 6))
         self.assertTrue(pending.preview_tabs.isTabVisible(1))
+        self.assertEqual(pending.result_gallery.list_widget.count(), 1)
+        self.assertEqual(
+            pending.result_gallery.preview.current_path,
+            result_path.resolve(),
+        )
         pending.close()
         pending.deleteLater()
 
@@ -595,6 +796,81 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(
             self.repository.generation_requests[0][0],
             task.id,
+        )
+        center.deleteLater()
+
+    def test_task_center_uses_source_strip_and_current_results(self) -> None:
+        write_task_images(self.root)
+        task = make_task("working")
+        product_root = self.root / task.project_relative_root
+        result_path = (
+            product_root
+            / "AI成品"
+            / task.project_code
+            / task.task_code
+            / "attempt_001"
+            / "result_01.png"
+        )
+        result_path.parent.mkdir(parents=True)
+        Image.new("RGB", (50, 70), "orange").save(result_path)
+        result = GenerationResult(
+            id=21,
+            attempt_id=4,
+            result_index=0,
+            relative_path=result_path.relative_to(product_root).as_posix(),
+            thumbnail_relative_path=result_path.relative_to(
+                product_root
+            ).as_posix(),
+            content_hash="a" * 64,
+            mime="image/png",
+            width=50,
+            height=70,
+            is_final=False,
+        )
+        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
+            task
+        ]
+        self.repository.list_results = lambda _task_id: [result]
+        center = TaskCenterPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            NanoBananaClient(lambda: "test-key"),
+            type(
+                "KeyStore",
+                (),
+                {"load": staticmethod(lambda: "test-key")},
+            )(),
+            FileStore(AppPaths(self.root / "task-center-data")),
+            AppSettings(Database(self.root / "task-center.db")),
+        )
+        self.assertNotIn("\n", center.task_detail.text())
+        self.assertIn("衣服 2 张", center.task_detail.text())
+        self.assertEqual(center.source_strip.count(), 3)
+        self.assertEqual(center.source_strip.currentRow(), 2)
+        self.assertEqual(center.source_strip.item(0).text(), "衣服 1")
+        self.assertEqual(center.source_strip.item(2).text(), "模特")
+        self.assertTrue(
+            all(
+                not center.source_strip.item(index).icon().isNull()
+                for index in range(center.source_strip.count())
+            )
+        )
+        self.assertEqual(
+            center.source_preview.current_path,
+            (product_root / "模特图" / "模特1.png").resolve(),
+        )
+        center.source_strip.setCurrentRow(0)
+        self.app.processEvents()
+        self.assertEqual(
+            center.source_preview.current_path,
+            (product_root / "衣服图" / "衣服1.png").resolve(),
+        )
+        self.assertEqual(center.result_title.text(), "当前任务生成结果")
+        self.assertEqual(center.gallery.list_widget.count(), 1)
+        self.assertEqual(
+            center.gallery.preview.current_path,
+            result_path.resolve(),
         )
         center.deleteLater()
 

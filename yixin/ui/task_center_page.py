@@ -3,8 +3,7 @@ from __future__ import annotations
 from collections import deque
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -16,8 +15,6 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -68,7 +65,7 @@ from ..time_utils import utc_naive_to_local
 from .dialogs import CompareDialog
 from .result_gallery import ResultGallery
 from .save_helpers import show_saved_toast
-from .widgets import load_scaled_pixmap
+from .widgets import ImageStrip, ImageView
 
 
 ATTEMPT_LABELS = {
@@ -193,33 +190,21 @@ class TaskCenterPage(QWidget):
         info_title.setStyleSheet("font-size:16px;font-weight:700;")
         top_layout.addWidget(info_title)
         self.task_detail = QLabel("选择一个子任务")
-        self.task_detail.setWordWrap(True)
+        self.task_detail.setWordWrap(False)
         self.task_detail.setStyleSheet("color:#60708a;")
-        top_layout.addWidget(self.task_detail)
-        images_row = QHBoxLayout()
-        garment_box = QGroupBox("衣服图")
-        garment_layout = QVBoxLayout(garment_box)
-        self.garment_list = QListWidget()
-        self.garment_list.setViewMode(QListWidget.ViewMode.IconMode)
-        self.garment_list.setIconSize(QSize(104, 104))
-        self.garment_list.setGridSize(QSize(130, 136))
-        self.garment_list.setResizeMode(QListWidget.ResizeMode.Adjust)
-        garment_layout.addWidget(self.garment_list)
-        model_box = QGroupBox("模特图")
-        model_layout = QVBoxLayout(model_box)
-        self.model_preview = QLabel("尚未选择任务")
-        self.model_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.model_preview.setMinimumSize(220, 240)
-        self.model_preview.setStyleSheet(
-            "background:#f3f6fb;border:1px solid #dbe3ef;border-radius:6px;"
+        self.task_detail.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        self.model_name = QLabel()
-        self.model_name.setWordWrap(True)
-        model_layout.addWidget(self.model_preview, 1)
-        model_layout.addWidget(self.model_name)
-        images_row.addWidget(garment_box, 3)
-        images_row.addWidget(model_box, 2)
-        top_layout.addLayout(images_row, 1)
+        top_layout.addWidget(self.task_detail)
+        self.source_strip = ImageStrip(icon_size=96)
+        self.source_strip.currentRowChanged.connect(
+            self._show_source_image
+        )
+        self.source_preview = ImageView()
+        self.source_preview.set_placeholder("选择参考图查看大图")
+        self.source_preview.setMinimumHeight(260)
+        top_layout.addWidget(self.source_strip)
+        top_layout.addWidget(self.source_preview, 1)
         splitter.addWidget(top)
 
         bottom = QWidget()
@@ -281,9 +266,9 @@ class TaskCenterPage(QWidget):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(8, 0, 0, 0)
-        title = QLabel("候选图与 PS 成品")
-        title.setStyleSheet("font-size:16px;font-weight:700;")
-        layout.addWidget(title)
+        self.result_title = QLabel("当前任务生成结果")
+        self.result_title.setStyleSheet("font-size:16px;font-weight:700;")
+        layout.addWidget(self.result_title)
         toolbar = QHBoxLayout()
         self.selection_label = QLabel("已选择 0 张最终图")
         toolbar.addWidget(self.selection_label, 1)
@@ -356,9 +341,9 @@ class TaskCenterPage(QWidget):
         else:
             self.current_task = None
             self.task_detail.setText("当前没有可查看的任务")
-            self.garment_list.clear()
-            self.model_preview.clear()
-            self.model_name.clear()
+            self.source_strip.clear()
+            self.source_preview.set_image(None)
+            self.source_preview.set_placeholder("当前没有参考图")
             self.gallery.clear()
         self._resume_queued_jobs()
         self._pump_queue()
@@ -370,25 +355,20 @@ class TaskCenterPage(QWidget):
             self.tasks[row] if 0 <= row < len(self.tasks) else None
         )
         task = self.current_task
-        self.garment_list.clear()
-        self.model_preview.clear()
-        self.model_name.clear()
+        self.source_strip.clear()
+        self.source_preview.set_image(None)
         if task is None:
             self.gallery.clear()
             self._update_controls()
             return
         self.task_detail.setText(
-            f"{task.task_code}\n货号：{task.product_code or task.project_name}　"
-            f"制作：{task.assignee_name or '未分配'}\n"
-            f"参考顺序：衣服图 {len(task.garment_assets)} 张，最后一张模特图。"
+            f"{task.task_code} · 货号 "
+            f"{task.product_code or task.project_name} · 制作 "
+            f"{task.assignee_name or '未分配'} · "
+            f"{TASK_STATUS_LABELS.get(task.status, task.status)} · "
+            f"衣服 {len(task.garment_assets)} 张"
         )
-        for asset in task.garment_assets:
-            self._add_garment_reference(
-                task,
-                asset.relative_path,
-                asset.original_name,
-            )
-        self._show_model_reference(task)
+        self._load_source_images(task)
         self.prompt_edit.setPlainText(task.prompt_text)
         if task.model in MODEL_LABELS:
             self.model_combo.setCurrentIndex(self.model_combo.findData(task.model))
@@ -403,33 +383,28 @@ class TaskCenterPage(QWidget):
         self._refresh_queue()
         self._update_controls()
 
-    def _add_garment_reference(
-        self,
-        task: ProjectTask,
-        relative_path: str,
-        name: str,
-    ) -> None:
-        path = self.resolver.resolve_project_path(
-            task.project_relative_root,
-            relative_path,
-        )
-        item = QListWidgetItem(name)
-        pixmap = load_scaled_pixmap(path, QSize(92, 92))
-        if not pixmap.isNull():
-            item.setIcon(QIcon(pixmap))
-        self.garment_list.addItem(item)
-
-    def _show_model_reference(self, task: ProjectTask) -> None:
-        path = self.resolver.resolve_project_path(
+    def _load_source_images(self, task: ProjectTask) -> None:
+        items = []
+        for index, asset in enumerate(task.garment_assets, start=1):
+            path = self.resolver.resolve_project_path(
+                task.project_relative_root,
+                asset.relative_path,
+            )
+            items.append((path, f"衣服 {index}", path))
+        model_path = self.resolver.resolve_project_path(
             task.project_relative_root,
             task.model_path,
         )
-        pixmap = load_scaled_pixmap(path, QSize(320, 360))
-        if pixmap.isNull():
-            self.model_preview.setText("模特图不存在")
-        else:
-            self.model_preview.setPixmap(pixmap)
-        self.model_name.setText(task.model_name)
+        items.append((model_path, "模特", model_path))
+        self.source_strip.set_images(items)
+        self.source_strip.setCurrentRow(len(items) - 1)
+
+    def _show_source_image(self, row: int) -> None:
+        if 0 <= row < self.source_strip.count():
+            item = self.source_strip.item(row)
+            self.source_preview.set_image(
+                item.data(Qt.ItemDataRole.UserRole)
+            )
 
     def _is_assignee(self, task: ProjectTask | None) -> bool:
         return bool(task and task.assignee_id == self.actor.id)

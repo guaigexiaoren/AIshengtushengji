@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtGui import QIcon, QImageReader
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 
 from ..collaboration.shared_paths import SharedPathResolver
 from ..collaboration.types import GenerationResult, ProjectTask
-from .widgets import load_scaled_pixmap
+from .widgets import ImageView, load_scaled_pixmap
 
 
 class ResultGallery(QWidget):
@@ -35,28 +35,26 @@ class ResultGallery(QWidget):
         self.results: list[GenerationResult] = []
         self.paths: dict[int, Path] = {}
 
-        layout = QHBoxLayout(self)
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.list_widget = QListWidget()
         self.list_widget.setViewMode(QListWidget.ViewMode.IconMode)
         self.list_widget.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.list_widget.setIconSize(QSize(140, 140))
-        self.list_widget.setGridSize(QSize(170, 190))
-        self.list_widget.setSpacing(8)
-        layout.addWidget(self.list_widget, 1)
-        preview_host = QWidget()
-        preview_layout = QVBoxLayout(preview_host)
-        self.preview = QLabel("选择图片查看大图")
-        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumSize(320, 320)
-        self.preview.setStyleSheet(
-            "background:#f3f6fb;border:1px solid #dbe3ef;border-radius:8px;"
-        )
+        self.list_widget.setWrapping(False)
+        self.list_widget.setFlow(QListWidget.Flow.LeftToRight)
+        self.list_widget.setIconSize(QSize(92, 92))
+        self.list_widget.setGridSize(QSize(122, 140))
+        self.list_widget.setSpacing(4)
+        self.list_widget.setFixedHeight(146)
+        layout.addWidget(self.list_widget)
+        self.preview = ImageView()
+        self.preview.set_placeholder("选择图片查看大图")
+        self.preview.setMinimumSize(320, 300)
         self.meta = QLabel()
         self.meta.setWordWrap(True)
-        preview_layout.addWidget(self.preview, 1)
-        preview_layout.addWidget(self.meta)
-        layout.addWidget(preview_host, 1)
+        self.meta.setStyleSheet("color:#60708a;")
+        layout.addWidget(self.preview, 1)
+        layout.addWidget(self.meta)
         self.list_widget.currentItemChanged.connect(self._show_current)
 
     def set_task(
@@ -117,7 +115,8 @@ class ResultGallery(QWidget):
         if self.list_widget.count():
             self.list_widget.setCurrentRow(0)
         else:
-            self.preview.setText("当前任务还没有生成图片")
+            self.preview.set_placeholder("当前任务还没有生成图片")
+            self.preview.set_image(None)
             self.meta.clear()
 
     def clear(self) -> None:
@@ -125,7 +124,8 @@ class ResultGallery(QWidget):
         self.results = []
         self.paths.clear()
         self.list_widget.clear()
-        self.preview.setText("选择图片查看大图")
+        self.preview.set_placeholder("选择图片查看大图")
+        self.preview.set_image(None)
         self.meta.clear()
 
     def selected_result_ids(self) -> list[int]:
@@ -165,21 +165,19 @@ class ResultGallery(QWidget):
         result_id = int(current.data(Qt.ItemDataRole.UserRole))
         path = self.paths.get(result_id)
         if path is None or not path.is_file():
-            self.preview.setText("图片文件不存在")
+            self.preview.set_placeholder("图片文件不存在")
+            self.preview.set_image(None)
             self.meta.setText(str(path or ""))
             return
-        pixmap = QPixmap(str(path))
-        if pixmap.isNull():
-            self.preview.setText("无法读取图片")
-        else:
-            self.preview.setPixmap(
-                pixmap.scaled(
-                    self.preview.size(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            )
-        self.meta.setText(f"{path}\n{pixmap.width()} × {pixmap.height()}")
+        self.preview.set_image(path)
+        reader = QImageReader(str(path))
+        size = reader.size()
+        dimensions = (
+            f"{size.width()} × {size.height()}"
+            if size.isValid()
+            else "尺寸未知"
+        )
+        self.meta.setText(f"{current.text()} · {dimensions}")
 
 
 class ResultGalleryDialog(QDialog):

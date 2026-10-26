@@ -4,14 +4,16 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QIcon
+from PySide6.QtCore import QRect, QSize, Qt, Signal
+from PySide6.QtGui import QIcon, QMouseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -20,6 +22,10 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QStackedWidget,
+    QStyle,
+    QStyleOptionButton,
+    QStyleOptionHeader,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -61,65 +67,187 @@ class ProductDraftState:
     existing_tasks: list = field(default_factory=list)
 
 
+class CheckableHeaderView(QHeaderView):
+    toggle_requested = Signal(Qt.CheckState)
+
+    def __init__(
+        self,
+        orientation: Qt.Orientation,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(orientation, parent)
+        self._check_state = Qt.CheckState.Unchecked
+        self.setSectionsClickable(True)
+
+    def check_state(self) -> Qt.CheckState:
+        return self._check_state
+
+    def set_check_state(self, state: Qt.CheckState) -> None:
+        if state == self._check_state:
+            return
+        self._check_state = state
+        self.viewport().update()
+
+    def paintSection(
+        self,
+        painter,
+        rect: QRect,
+        logical_index: int,
+    ) -> None:
+        if logical_index != 0:
+            super().paintSection(painter, rect, logical_index)
+            return
+        option = QStyleOptionHeader()
+        self.initStyleOption(option)
+        option.rect = rect
+        option.text = ""
+        self.style().drawControl(
+            QStyle.ControlElement.CE_Header,
+            option,
+            painter,
+            self,
+        )
+        checkbox = QStyleOptionButton()
+        indicator_width = self.style().pixelMetric(
+            QStyle.PixelMetric.PM_IndicatorWidth,
+            checkbox,
+            self,
+        )
+        checkbox.rect = QRect(
+            rect.left() + 8,
+            rect.center().y() - indicator_width // 2,
+            indicator_width,
+            indicator_width,
+        )
+        checkbox.state = QStyle.StateFlag.State_Enabled
+        if self._check_state == Qt.CheckState.Checked:
+            checkbox.state |= QStyle.StateFlag.State_On
+        elif self._check_state == Qt.CheckState.PartiallyChecked:
+            checkbox.state |= QStyle.StateFlag.State_NoChange
+        else:
+            checkbox.state |= QStyle.StateFlag.State_Off
+        self.style().drawPrimitive(
+            QStyle.PrimitiveElement.PE_IndicatorCheckBox,
+            checkbox,
+            painter,
+            self,
+        )
+        painter.drawText(
+            QRect(
+                rect.left() + indicator_width + 14,
+                rect.top(),
+                rect.width() - indicator_width - 18,
+                rect.height(),
+            ),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            "选择",
+        )
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if (
+            event.button() == Qt.MouseButton.LeftButton
+            and self.logicalIndexAt(event.position().toPoint()) == 0
+        ):
+            state = (
+                Qt.CheckState.Unchecked
+                if self._check_state == Qt.CheckState.Checked
+                else Qt.CheckState.Checked
+            )
+            self.set_check_state(state)
+            self.toggle_requested.emit(state)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+
 class PairPreviewCard(QFrame):
+    selected = Signal(int)
+
     def __init__(
         self,
         model_path: Path,
         garment_paths: list[Path],
+        *,
+        index: int = -1,
+        selectable: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self.index = index
+        self.selectable = selectable
+        self._selected = False
         self.setObjectName("PairPreviewCard")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(
             "QFrame#PairPreviewCard {"
             "background:#f8faff;border:1px solid #dce5f2;"
             "border-radius:8px;padding:8px;}"
+            "QFrame#PairPreviewCard[selected=\"true\"] {"
+            "background:#edf4ff;border:2px solid #2e64c4;}"
         )
-        layout = QHBoxLayout(self)
+        if selectable:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.setToolTip("点击选中此配对，可移除所选配对")
+        layout = QVBoxLayout(self)
         model = QLabel()
-        model.setFixedSize(92, 112)
+        model.setFixedSize(78, 94)
         model.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pixmap = load_scaled_pixmap(model_path, QSize(88, 108))
+        pixmap = load_scaled_pixmap(model_path, QSize(74, 90))
         if not pixmap.isNull():
             model.setPixmap(pixmap)
-        layout.addWidget(model)
-        info = QVBoxLayout()
-        title = QLabel(model_path.name)
-        title.setStyleSheet("font-weight:700;color:#2d3e58;")
+        model.setToolTip(model_path.name)
+        layout.addWidget(model, 0, Qt.AlignmentFlag.AlignHCenter)
         summary = QLabel(
             f"衣服 {len(garment_paths)} 张 · 1 个子任务"
         )
         summary.setStyleSheet("color:#60708a;")
         thumb_host = QWidget()
-        thumbs = QHBoxLayout(thumb_host)
+        thumbs = QGridLayout(thumb_host)
         thumbs.setContentsMargins(0, 0, 0, 0)
-        thumbs.setSpacing(6)
+        thumbs.setSpacing(4)
         self.garment_thumbnails: list[QLabel] = []
-        for path in garment_paths:
+        for index, path in enumerate(garment_paths):
             image = QLabel()
             image.setObjectName("GarmentThumbnail")
-            image.setFixedSize(58, 70)
+            image.setFixedSize(42, 52)
             image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            thumb = load_scaled_pixmap(path, QSize(56, 68))
+            thumb = load_scaled_pixmap(path, QSize(40, 50))
             if not thumb.isNull():
                 image.setPixmap(thumb)
             image.setToolTip(path.name)
-            thumbs.addWidget(image)
+            thumbs.addWidget(image, index // 4, index % 4)
             self.garment_thumbnails.append(image)
         thumb_scroll = QScrollArea()
-        thumb_scroll.setWidgetResizable(False)
+        thumb_scroll.setWidgetResizable(True)
         thumb_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        )
-        thumb_scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        thumb_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
         thumb_scroll.setWidget(thumb_host)
-        thumb_host.adjustSize()
-        info.addWidget(title)
-        info.addWidget(summary)
-        info.addWidget(thumb_scroll)
-        layout.addLayout(info, 1)
+        thumb_scroll.setFixedHeight(112)
+        layout.addWidget(summary)
+        layout.addWidget(thumb_scroll)
+
+    def set_selected(self, selected: bool) -> None:
+        if selected == self._selected:
+            return
+        self._selected = selected
+        self.setProperty("selected", selected)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if (
+            self.selectable
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            self.selected.emit(self.index)
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
 
 class TaskCreatePage(QWidget):
@@ -137,6 +265,8 @@ class TaskCreatePage(QWidget):
         self.states: dict[str, ProductDraftState] = {}
         self.current_state: ProductDraftState | None = None
         self.account_directory: AccountDirectory | None = None
+        self.pair_cards: list[PairPreviewCard] = []
+        self.selected_pair_model_index: int | None = None
         self._build()
         self.refresh()
 
@@ -175,17 +305,20 @@ class TaskCreatePage(QWidget):
         scan_card = QGroupBox("待创建货号")
         scan_layout = QVBoxLayout(scan_card)
         scan_actions = QHBoxLayout()
-        self.select_new_button = QPushButton("全选未处理")
-        self.select_new_button.clicked.connect(self._select_new)
-        scan_actions.addWidget(self.select_new_button)
         scan_actions.addStretch(1)
         self.scan_summary = QLabel()
         scan_actions.addWidget(self.scan_summary)
         scan_layout.addLayout(scan_actions)
         self.product_table = QTableWidget(0, 8)
+        self.product_table.setHorizontalHeader(
+            CheckableHeaderView(
+                Qt.Orientation.Horizontal,
+                self.product_table,
+            )
+        )
         self.product_table.setHorizontalHeaderLabels(
             [
-                "创建",
+                "选择",
                 "货号",
                 "衣服图",
                 "模特图",
@@ -203,6 +336,12 @@ class TaskCreatePage(QWidget):
         )
         self.product_table.horizontalHeader().setStretchLastSection(True)
         self.product_table.itemSelectionChanged.connect(self._product_selected)
+        self.product_table.itemChanged.connect(
+            self._product_check_changed
+        )
+        self.product_table.horizontalHeader().toggle_requested.connect(
+            self._set_all_eligible
+        )
         scan_layout.addWidget(self.product_table, 1)
         outer.addWidget(scan_card, 1)
 
@@ -227,9 +366,19 @@ class TaskCreatePage(QWidget):
         assets_row.addWidget(model_box, 1)
         detail_layout.addLayout(assets_row)
 
-        self.manual_box = QGroupBox("手动配对")
-        manual_layout = QVBoxLayout(self.manual_box)
-        manual_actions = QHBoxLayout()
+        self.pairing_tools = QStackedWidget()
+        self.pairing_tools.setFixedHeight(46)
+        auto_page = QWidget()
+        auto_layout = QHBoxLayout(auto_page)
+        auto_layout.setContentsMargins(0, 0, 0, 0)
+        auto_layout.addWidget(
+            QLabel("自动配对：每张模特图关联全部衣服图")
+        )
+        auto_layout.addStretch(1)
+        self.pairing_tools.addWidget(auto_page)
+        manual_page = QWidget()
+        manual_actions = QHBoxLayout(manual_page)
+        manual_actions.setContentsMargins(0, 0, 0, 0)
         garment_hint = QLabel("在左侧衣服图列表按住 Ctrl 可多选")
         add_pair = QPushButton("添加配对")
         remove_pair = QPushButton("移除所选配对")
@@ -238,22 +387,19 @@ class TaskCreatePage(QWidget):
         manual_actions.addWidget(garment_hint, 1)
         manual_actions.addWidget(add_pair)
         manual_actions.addWidget(remove_pair)
-        manual_layout.addLayout(manual_actions)
-        self.manual_table = QTableWidget(0, 2)
-        self.manual_table.setHorizontalHeaderLabels(["模特图", "衣服图"])
-        self.manual_table.horizontalHeader().setStretchLastSection(True)
-        self.manual_table.setMaximumHeight(110)
-        manual_layout.addWidget(self.manual_table)
-        detail_layout.addWidget(self.manual_box)
+        self.pairing_tools.addWidget(manual_page)
+        detail_layout.addWidget(self.pairing_tools)
 
         self.pair_preview = QScrollArea()
         self.pair_preview.setWidgetResizable(True)
-        self.pair_preview.setMinimumHeight(180)
+        self.pair_preview.setMinimumHeight(250)
+        self.pair_preview.setMaximumHeight(250)
         self.pair_preview_content = QWidget()
-        self.pair_preview_layout = QVBoxLayout(self.pair_preview_content)
+        self.pair_preview_layout = QGridLayout(self.pair_preview_content)
         self.pair_preview_layout.setContentsMargins(0, 0, 0, 0)
         self.pair_preview_layout.setSpacing(6)
-        self.pair_preview_layout.addStretch(1)
+        for column in range(4):
+            self.pair_preview_layout.setColumnStretch(column, 1)
         self.pair_preview.setWidget(self.pair_preview_content)
         detail_layout.addWidget(self.pair_preview, 1)
         self.pair_summary = QLabel()
@@ -386,6 +532,7 @@ class TaskCreatePage(QWidget):
             self._clear_pair_preview()
 
     def _refresh_product_table(self) -> None:
+        self.product_table.blockSignals(True)
         self.product_table.setRowCount(0)
         selectable = 0
         for state in sorted(
@@ -395,11 +542,15 @@ class TaskCreatePage(QWidget):
             row = self.product_table.rowCount()
             self.product_table.insertRow(row)
             check = QTableWidgetItem()
+            can_select = not state.errors and not state.existing_tasks
             check.setFlags(
                 Qt.ItemFlag.ItemIsEnabled
-                | Qt.ItemFlag.ItemIsUserCheckable
+                | (
+                    Qt.ItemFlag.ItemIsUserCheckable
+                    if can_select
+                    else Qt.ItemFlag.NoItemFlags
+                )
             )
-            can_select = not state.errors and not state.existing_tasks
             check.setCheckState(
                 Qt.CheckState.Checked if can_select else Qt.CheckState.Unchecked
             )
@@ -432,6 +583,49 @@ class TaskCreatePage(QWidget):
         self.scan_summary.setText(
             f"共 {len(self.states)} 个货号，可直接创建 {selectable} 个"
         )
+        self.product_table.blockSignals(False)
+        self._update_select_header()
+
+    def _product_check_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() == 0:
+            self._update_select_header()
+
+    def _update_select_header(self) -> None:
+        checked = 0
+        eligible = 0
+        for row in range(self.product_table.rowCount()):
+            item = self.product_table.item(row, 0)
+            if item is None or not (
+                item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+            ):
+                continue
+            eligible += 1
+            if item.checkState() == Qt.CheckState.Checked:
+                checked += 1
+        if not eligible or checked == 0:
+            state = Qt.CheckState.Unchecked
+        elif checked == eligible:
+            state = Qt.CheckState.Checked
+        else:
+            state = Qt.CheckState.PartiallyChecked
+        self.product_table.horizontalHeader().set_check_state(state)
+
+    def _set_all_eligible(self, state: Qt.CheckState) -> None:
+        checked = state == Qt.CheckState.Checked
+        self.product_table.blockSignals(True)
+        for row in range(self.product_table.rowCount()):
+            item = self.product_table.item(row, 0)
+            if item is None or not (
+                item.flags() & Qt.ItemFlag.ItemIsUserCheckable
+            ):
+                continue
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if checked
+                else Qt.CheckState.Unchecked
+            )
+        self.product_table.blockSignals(False)
+        self._update_select_header()
 
     def _selected_product_code(self) -> str | None:
         row = self.product_table.currentRow()
@@ -449,7 +643,6 @@ class TaskCreatePage(QWidget):
         state = self.current_state
         self.garment_list.clear()
         self.model_list.clear()
-        self.manual_table.setRowCount(0)
         self._clear_pair_preview()
         if state is None:
             return
@@ -459,7 +652,6 @@ class TaskCreatePage(QWidget):
         )
         self._fill_assets(self.garment_list, state.garments)
         self._fill_assets(self.model_list, state.models)
-        self._refresh_manual_table()
         self._refresh_pair_preview()
 
     @staticmethod
@@ -478,6 +670,10 @@ class TaskCreatePage(QWidget):
             widget = item.widget()
             if widget is not None:
                 widget.deleteLater()
+        for row in range(self.pair_preview_layout.rowCount()):
+            self.pair_preview_layout.setRowStretch(row, 0)
+        self.pair_cards.clear()
+        self.selected_pair_model_index = None
 
     def _selected_paths(self, role: str) -> list[Path]:
         widget = self.garment_list if role == "garment" else self.model_list
@@ -593,8 +789,8 @@ class TaskCreatePage(QWidget):
         self._refresh_pair_preview()
 
     def _update_mode_visibility(self) -> None:
-        self.manual_box.setVisible(
-            self.mode_combo.currentData() == PAIRING_MANUAL
+        self.pairing_tools.setCurrentIndex(
+            1 if self.mode_combo.currentData() == PAIRING_MANUAL else 0
         )
 
     def _current_pairs(self, state: ProductDraftState | None = None):
@@ -621,11 +817,7 @@ class TaskCreatePage(QWidget):
         if state is None:
             return
         result = self._current_pairs()
-        while self.pair_preview_layout.count():
-            item = self.pair_preview_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
+        self._clear_pair_preview()
         if result is None:
             return
         if result.errors:
@@ -637,20 +829,42 @@ class TaskCreatePage(QWidget):
             grouped.setdefault(pair.model_index, []).append(
                 pair.garment_index
             )
-        for model_index in sorted(grouped):
+        manual = self.mode_combo.currentData() == PAIRING_MANUAL
+        for position, model_index in enumerate(sorted(grouped)):
             model_path = state.models[model_index]
             garment_paths = [
                 state.garments[index]
                 for index in dict.fromkeys(grouped[model_index])
             ]
-            self.pair_preview_layout.addWidget(
-                PairPreviewCard(model_path, garment_paths)
+            card = PairPreviewCard(
+                model_path,
+                garment_paths,
+                index=model_index,
+                selectable=manual,
             )
-        self.pair_preview_layout.addStretch(1)
+            card.selected.connect(self._select_manual_pair)
+            self.pair_cards.append(card)
+            self.pair_preview_layout.addWidget(
+                card,
+                position // 4,
+                position % 4,
+            )
+        if self.pair_cards:
+            self.pair_preview_layout.setRowStretch(
+                (len(self.pair_cards) + 3) // 4,
+                1,
+            )
         self.pair_summary.setText(
             f"将创建 {len(grouped)} 个子任务，共引用 {len(result.pairs)} 组衣服。"
         )
         self.pair_summary.setStyleSheet("color:#2a7a50;")
+
+    def _select_manual_pair(self, model_index: int) -> None:
+        if self.mode_combo.currentData() != PAIRING_MANUAL:
+            return
+        self.selected_pair_model_index = model_index
+        for card in self.pair_cards:
+            card.set_selected(card.index == model_index)
 
     def _add_manual_pair(self) -> None:
         state = self.current_state
@@ -667,7 +881,6 @@ class TaskCreatePage(QWidget):
             return
         model_path = Path(model_items[0].data(Qt.ItemDataRole.UserRole))
         model_index = state.models.index(model_path)
-        added = 0
         for garment_item in garment_items:
             garment_path = Path(
                 garment_item.data(Qt.ItemDataRole.UserRole)
@@ -678,57 +891,37 @@ class TaskCreatePage(QWidget):
             )
             if pair not in state.manual_pairs:
                 state.manual_pairs.append(pair)
-                added += 1
-        self._refresh_manual_table()
+        self.selected_pair_model_index = model_index
         self._refresh_pair_preview()
+        self._select_manual_pair(model_index)
 
     def _remove_manual_pair(self) -> None:
         state = self.current_state
         if state is None:
             return
-        row = self.manual_table.currentRow()
-        if 0 <= row < len(state.manual_pairs):
-            state.manual_pairs.pop(row)
-            self._refresh_manual_table()
-            self._refresh_pair_preview()
-
-    def _refresh_manual_table(self) -> None:
-        state = self.current_state
-        self.manual_table.setRowCount(0)
-        if state is None:
+        model_index = self.selected_pair_model_index
+        if model_index is None:
+            QMessageBox.information(
+                self,
+                "尚未选择配对",
+                "请先点击要移除的配对卡片。",
+            )
             return
-        for pair in state.manual_pairs:
-            row = self.manual_table.rowCount()
-            self.manual_table.insertRow(row)
-            self.manual_table.setItem(
-                row,
-                0,
-                QTableWidgetItem(state.models[pair.model_index].name),
-            )
-            self.manual_table.setItem(
-                row,
-                1,
-                QTableWidgetItem(state.garments[pair.garment_index].name),
-            )
-
-    def _select_new(self) -> None:
-        for row in range(self.product_table.rowCount()):
-            code = self.product_table.item(row, 0).data(
-                Qt.ItemDataRole.UserRole
-            )
-            state = self.states.get(code)
-            if state and not state.existing_tasks and not state.errors:
-                self.product_table.item(row, 0).setCheckState(
-                    Qt.CheckState.Checked
-                )
+        state.manual_pairs[:] = [
+            pair
+            for pair in state.manual_pairs
+            if pair.model_index != model_index
+        ]
+        self.selected_pair_model_index = None
+        self._refresh_pair_preview()
 
     def _selected_codes(self) -> list[str]:
-        codes: list[str] = []
-        for row in range(self.product_table.rowCount()):
-            check = self.product_table.item(row, 0)
-            if check.checkState() == Qt.CheckState.Checked:
-                codes.append(str(check.data(Qt.ItemDataRole.UserRole)))
-        return codes
+        return [
+            str(item.data(Qt.ItemDataRole.UserRole))
+            for row in range(self.product_table.rowCount())
+            if (item := self.product_table.item(row, 0)) is not None
+            and item.checkState() == Qt.CheckState.Checked
+        ]
 
     def _create_selected(self) -> None:
         codes = self._selected_codes()

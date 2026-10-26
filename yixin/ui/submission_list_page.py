@@ -2,16 +2,12 @@ from __future__ import annotations
 
 from functools import partial
 
-from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QIcon, QPixmap
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -42,7 +38,7 @@ from ..collaboration.types import (
 from ..time_utils import utc_naive_to_local
 from .result_gallery import ResultGallery, ResultGalleryDialog
 from .subtask_source_dialog import SubtaskSourceDialog
-from .widgets import load_scaled_pixmap
+from .widgets import ImageStrip, ImageView
 
 
 VIEW_STATUSES = {
@@ -177,28 +173,15 @@ class SubmissionListPage(QWidget):
     def _build_reference_preview(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        model_box = QGroupBox("模特图")
-        model_layout = QVBoxLayout(model_box)
-        self.model_preview = QLabel("尚未选择任务")
-        self.model_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.model_preview.setMinimumHeight(210)
-        self.model_preview.setStyleSheet(
-            "background:#f3f6fb;border:1px solid #dbe3ef;border-radius:6px;"
+        self.reference_strip = ImageStrip(icon_size=96)
+        self.reference_preview = ImageView()
+        self.reference_preview.set_placeholder("选择参考图查看大图")
+        self.reference_preview.setMinimumHeight(320)
+        self.reference_strip.currentRowChanged.connect(
+            self._show_reference_image
         )
-        self.model_name = QLabel()
-        self.model_name.setWordWrap(True)
-        model_layout.addWidget(self.model_preview, 1)
-        model_layout.addWidget(self.model_name)
-        layout.addWidget(model_box, 1)
-        garment_box = QGroupBox("衣服图")
-        garment_layout = QVBoxLayout(garment_box)
-        self.reference_list = QListWidget()
-        self.reference_list.setViewMode(QListWidget.ViewMode.IconMode)
-        self.reference_list.setIconSize(QSize(92, 92))
-        self.reference_list.setGridSize(QSize(120, 125))
-        self.reference_list.setResizeMode(QListWidget.ResizeMode.Adjust)
-        garment_layout.addWidget(self.reference_list)
-        layout.addWidget(garment_box, 1)
+        layout.addWidget(self.reference_strip)
+        layout.addWidget(self.reference_preview, 1)
         return widget
 
     def refresh(self) -> None:
@@ -255,10 +238,9 @@ class SubmissionListPage(QWidget):
             self.tasks = []
             self.task_table.setRowCount(0)
             self.info_line.setText("当前状态下没有任务")
-            self.model_preview.setText("尚无参考图")
-            self.model_preview.setPixmap(QPixmap())
-            self.model_name.clear()
-            self.reference_list.clear()
+            self.reference_strip.clear()
+            self.reference_preview.set_image(None)
+            self.reference_preview.set_placeholder("尚无参考图")
             self.result_gallery.set_task(
                 self._empty_task(),
                 [],
@@ -346,6 +328,9 @@ class SubmissionListPage(QWidget):
         task = self._current_task()
         project = self._current_project()
         if task is None or project is None:
+            self.reference_strip.clear()
+            self.reference_preview.set_image(None)
+            self.reference_preview.set_placeholder("尚未选择任务")
             self._update_actions()
             return
         self.info_line.setText(
@@ -363,27 +348,26 @@ class SubmissionListPage(QWidget):
         self._update_actions()
 
     def _set_reference_preview(self, task: ProjectTask) -> None:
-        model_path = self.resolver.resolve_project_path(
-            task.project_relative_root,
-            task.model_path,
-        )
-        pixmap = load_scaled_pixmap(model_path, QSize(420, 300))
-        if pixmap.isNull():
-            self.model_preview.setText("模特图不存在")
-        else:
-            self.model_preview.setPixmap(pixmap)
-        self.model_name.setText(task.model_name)
-        self.reference_list.clear()
-        for asset in task.garment_assets:
+        items = []
+        for index, asset in enumerate(task.garment_assets, start=1):
             path = self.resolver.resolve_project_path(
                 task.project_relative_root,
                 asset.relative_path,
             )
-            item = QListWidgetItem(asset.original_name)
-            thumb = load_scaled_pixmap(path, QSize(92, 92))
-            if not thumb.isNull():
-                item.setIcon(QIcon(thumb))
-            self.reference_list.addItem(item)
+            items.append((path, f"衣服 {index}", path))
+        model_path = self.resolver.resolve_project_path(
+            task.project_relative_root,
+            task.model_path,
+        )
+        items.append((model_path, "模特", model_path))
+        self.reference_strip.set_images(items)
+        self.reference_strip.setCurrentRow(len(items) - 1)
+
+    def _show_reference_image(self, row: int) -> None:
+        if 0 <= row < self.reference_strip.count():
+            item = self.reference_strip.item(row)
+            path = item.data(Qt.ItemDataRole.UserRole)
+            self.reference_preview.set_image(path)
 
     def _update_actions(self) -> None:
         task = self._current_task()

@@ -22,7 +22,7 @@ QLabel#BrandSubtitle {
 }
 QLabel#NavGroup {
     color: #7f94b5;
-    font-size: 11px;
+    font-size: 14px;
     font-weight: 700;
     padding: 10px 14px 2px 14px;
 }
