@@ -66,6 +66,7 @@ from ..model_router import choose_model
 from ..local_export import export_original_image
 from ..settings import (
     AUTO_STRATEGY_QUALITY,
+    INPUT_MANUAL_UPLOAD,
     LOCAL_SAVE_FIXED,
     LOCAL_SAVE_REFERENCE,
     AppSettings,
@@ -298,11 +299,12 @@ class TaskCenterPage(QWidget):
         top = QWidget()
         top_layout = QVBoxLayout(top)
         top_layout.setContentsMargins(8, 0, 8, 0)
+        top_layout.setSpacing(4)
         source_tools = QHBoxLayout()
         source_tools.setSpacing(4)
-        info_title = QLabel("子任务信息与参考图")
-        info_title.setStyleSheet("font-size:16px;font-weight:700;")
-        source_tools.addWidget(info_title)
+        self.source_title = QLabel("子任务参考图")
+        self.source_title.setStyleSheet("font-size:16px;font-weight:700;")
+        source_tools.addWidget(self.source_title)
         source_tools.addStretch(1)
         self.add_source_files_button = QPushButton("添加图片")
         self.add_source_folder_button = QPushButton("添加文件夹")
@@ -323,13 +325,6 @@ class TaskCenterPage(QWidget):
             button.setStyleSheet("padding:5px 7px;")
             source_tools.addWidget(button)
         top_layout.addLayout(source_tools)
-        self.task_detail = QLabel("选择一个子任务")
-        self.task_detail.setWordWrap(False)
-        self.task_detail.setStyleSheet("color:#60708a;")
-        self.task_detail.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        top_layout.addWidget(self.task_detail)
         self.local_source_hint = QLabel()
         self.local_source_hint.hide()
         top_layout.addWidget(self.local_source_hint)
@@ -445,7 +440,7 @@ class TaskCenterPage(QWidget):
         self.queue_hint.setStyleSheet("color:#60708a;")
         queue_layout.addWidget(self.queue_hint)
         self.generation_splitter.addWidget(queue_card)
-        self.generation_splitter.setSizes([220, 380, 260])
+        self.generation_splitter.setSizes([180, 410, 250])
         return self.generation_splitter
 
     def _build_candidate_panel(self) -> QWidget:
@@ -718,7 +713,6 @@ class TaskCenterPage(QWidget):
             self.current_task = None
             self.source_strip.clear()
             self.gallery.clear()
-            self.task_detail.setText("该任务当前没有可显示的子任务")
             self._update_controls()
             return
         target_row = 0
@@ -803,34 +797,18 @@ class TaskCenterPage(QWidget):
                 len(items) - 1 if select_model else 0
             )
         self._update_local_source_hint()
-        self._update_task_detail()
-
-    def _update_task_detail(self) -> None:
-        task = self.current_task
-        if task is None:
-            return
-        garment_count = (
-            len(self.local_state.garments)
-            if self.local_state is not None
-            else len(task.garment_assets)
-        )
-        self.task_detail.setText(
-            f"{task.task_code} · 货号 "
-            f"{task.product_code or task.project_name} · 制作 "
-            f"{task.assignee_name or '未分配'} · "
-            f"{TASK_STATUS_LABELS.get(task.status, task.status)} · "
-            f"衣服 {garment_count} 张"
-        )
 
     def _update_local_source_hint(self) -> None:
         state = self.local_state
         if state is None:
             self.local_source_hint.setText("尚未加载本机参考素材")
+            self.local_source_hint.show()
             return
         if not state.garments or state.model is None:
             self.local_source_hint.setText(
                 "本机素材不完整：至少需要一张衣服图和一张模特图"
             )
+            self.local_source_hint.show()
             return
         shared_garments = tuple(
             asset.content_hash for asset in self.current_task.garment_assets
@@ -845,11 +823,14 @@ class TaskCenterPage(QWidget):
                 and state.model.content_hash != self.current_task.model_hash
             )
         )
-        self.local_source_hint.setText(
-            "本机素材已修改，仅影响当前账号和本机生成"
-            if customized
-            else "当前使用共享盘素材；本机修改仅影响当前账号和本机生成"
-        )
+        if customized:
+            self.local_source_hint.setText(
+                "本机素材已修改，仅影响当前账号和本机生成"
+            )
+            self.local_source_hint.show()
+        else:
+            self.local_source_hint.clear()
+            self.local_source_hint.hide()
 
     def _is_assignee(self, task: ProjectTask | None) -> bool:
         return bool(task and task.assignee_id == self.actor.id)
@@ -1425,14 +1406,22 @@ class TaskCenterPage(QWidget):
         task = self.current_task
         if task is None or not self._can_upload_manual(task):
             return
+        initial_folder = self.app_settings.input_folder(
+            INPUT_MANUAL_UPLOAD
+        )
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "选择 PS 成品",
-            "",
+            str(initial_folder or Path.home()),
             "图片 (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)",
+            options=QFileDialog.Option(0),
         )
         if not paths:
             return
+        self.app_settings.set_input_folder(
+            INPUT_MANUAL_UPLOAD,
+            Path(paths[0]).parent,
+        )
         try:
             count = upload_manual_candidates(
                 self.repository,

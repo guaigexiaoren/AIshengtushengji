@@ -183,8 +183,8 @@ class SubmissionListPage(QWidget):
         )
         self.info_line.setStyleSheet("color:#60708a;padding:4px 0;")
         left_layout.addWidget(self.info_line)
-        actions = QHBoxLayout()
-        actions.addStretch(1)
+        body.addWidget(left)
+
         self.view_results = QPushButton("查看/对比成品")
         self.return_button = QPushButton("退回返工")
         self.approve_button = QPushButton("验收通过")
@@ -192,6 +192,23 @@ class SubmissionListPage(QWidget):
         self.view_results.clicked.connect(self._show_results)
         self.return_button.clicked.connect(self._return_task)
         self.approve_button.clicked.connect(self._approve_task)
+
+        preview_panel = QWidget()
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        self.result_gallery = ResultGallery(self.resolver)
+        self.preview_tabs = QTabWidget()
+        self.preview_tabs.addTab(self.result_gallery, "结果图（0）")
+        self.preview_tabs.addTab(
+            self._build_reference_preview(),
+            "参考图（0）",
+        )
+        preview_layout.addWidget(self.preview_tabs, 1)
+
+        self.review_actions = QWidget()
+        actions = QHBoxLayout(self.review_actions)
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(4)
         for button in (
             self.view_results,
             self.return_button,
@@ -199,17 +216,15 @@ class SubmissionListPage(QWidget):
         ):
             button.setVisible(self.view_mode == "pending")
             actions.addWidget(button)
-        left_layout.addLayout(actions)
-        body.addWidget(left)
-
-        self.result_gallery = ResultGallery(self.resolver)
-        self.preview_tabs = QTabWidget()
-        self.preview_tabs.addTab(self.result_gallery, "结果图")
-        self.preview_tabs.addTab(self._build_reference_preview(), "参考图")
+        self.review_actions.setVisible(self.view_mode == "pending")
+        self.preview_tabs.setCornerWidget(
+            self.review_actions,
+            Qt.Corner.TopRightCorner,
+        )
         if self.view_mode == "submitted":
             self.preview_tabs.setTabVisible(0, False)
             self.preview_tabs.setCurrentIndex(1)
-        body.addWidget(self.preview_tabs)
+        body.addWidget(preview_panel)
         body.setSizes([760, 440])
         outer.addWidget(body, 1)
         self.search_edit.textChanged.connect(self._apply_filters)
@@ -344,6 +359,7 @@ class SubmissionListPage(QWidget):
                 self._empty_task(),
                 [],
             )
+            self._update_preview_tab_counts()
         self._update_actions()
 
     def _current_project(self) -> ProjectRecord | None:
@@ -466,6 +482,9 @@ class SubmissionListPage(QWidget):
             self.reference_strip.clear()
             self.reference_preview.set_image(None)
             self.reference_preview.set_placeholder("尚未选择任务")
+            if self.view_mode != "submitted":
+                self.result_gallery.clear()
+            self._update_preview_tab_counts()
             self._update_actions()
             return
         self.info_line.setText(
@@ -480,6 +499,7 @@ class SubmissionListPage(QWidget):
                 task,
                 self.repository.list_results(task.id),
             )
+        self._update_preview_tab_counts()
         self._update_actions()
 
     def _set_reference_preview(self, task: ProjectTask) -> None:
@@ -497,6 +517,17 @@ class SubmissionListPage(QWidget):
         items.append((model_path, "模特", model_path))
         self.reference_strip.set_images(items)
         self.reference_strip.setCurrentRow(len(items) - 1)
+        self._update_preview_tab_counts()
+
+    def _update_preview_tab_counts(self) -> None:
+        self.preview_tabs.setTabText(
+            0,
+            f"结果图（{self.result_gallery.list_widget.count()}）",
+        )
+        self.preview_tabs.setTabText(
+            1,
+            f"参考图（{self.reference_strip.count()}）",
+        )
 
     def _show_reference_image(self, row: int) -> None:
         if 0 <= row < self.reference_strip.count():
@@ -524,7 +555,9 @@ class SubmissionListPage(QWidget):
             and can_manage
             and task.status == TASK_AWAITING_ACCEPTANCE
         )
-        self.view_results.setEnabled(bool(task))
+        self.view_results.setEnabled(
+            bool(task and self.result_gallery.list_widget.count())
+        )
         self.return_button.setEnabled(reviewable)
         self.approve_button.setEnabled(reviewable)
 

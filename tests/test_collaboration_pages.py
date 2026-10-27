@@ -1,4 +1,5 @@
 import importlib.util
+import hashlib
 import os
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ if HAS_PYSIDE:
     from PySide6.QtWidgets import (
         QApplication,
         QDialog,
+        QFileDialog,
         QHeaderView,
         QLabel,
         QMessageBox,
@@ -45,8 +47,9 @@ if HAS_PYSIDE:
     from yixin.library import LibraryService
     from yixin.paths import AppPaths
     from yixin.security import SecretStore
-    from yixin.settings import AppSettings
+    from yixin.settings import INPUT_MANUAL_UPLOAD, AppSettings
     from yixin.storage import FileStore
+    from yixin.time_utils import utc_naive_to_local
     from yixin.ui.admin_page import AddUserDialog, AdminPage, EditUserDialog
     from yixin.ui.collaboration_login import LoginDialog
     from yixin.ui.dialogs import SettingsDialog
@@ -1051,6 +1054,11 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(submitted.urgent_button.isVisible())
         self.assertTrue(submitted.preview_tabs.isTabVisible(1))
         self.assertFalse(submitted.preview_tabs.isTabVisible(0))
+        self.assertFalse(submitted.review_actions.isVisible())
+        self.assertEqual(
+            submitted.preview_tabs.tabText(1),
+            "参考图（3）",
+        )
         self.assertEqual(submitted.reference_strip.count(), 3)
         self.assertEqual(submitted.reference_strip.currentRow(), 2)
         self.assertEqual(submitted.reference_strip.item(2).text(), "模特")
@@ -1080,8 +1088,14 @@ class CollaborationPageTests(unittest.TestCase):
         submitted.search_edit.clear()
         self.app.processEvents()
         self.assertEqual(submitted.project_table.rowCount(), 1)
-        submitted.start_date_edit.setDate(QDate.currentDate())
-        submitted.end_date_edit.setDate(QDate.currentDate())
+        task_date = utc_naive_to_local(submitted_task.created_at).date()
+        task_qdate = QDate(
+            task_date.year,
+            task_date.month,
+            task_date.day,
+        )
+        submitted.start_date_edit.setDate(task_qdate)
+        submitted.end_date_edit.setDate(task_qdate)
         self.app.processEvents()
         self.assertEqual(submitted.project_table.rowCount(), 1)
         submitted._reset_filters()
@@ -1103,9 +1117,32 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(pending.view_results.isVisible())
         self.assertTrue(pending.return_button.isVisible())
         self.assertTrue(pending.approve_button.isVisible())
+        self.assertTrue(pending.view_results.isEnabled())
+        self.assertIs(
+            pending.preview_tabs.cornerWidget(
+                Qt.Corner.TopRightCorner
+            ),
+            pending.review_actions,
+        )
+        self.assertEqual(
+            [
+                pending.view_results.text(),
+                pending.return_button.text(),
+                pending.approve_button.text(),
+            ],
+            ["查看/对比成品", "退回返工", "验收通过"],
+        )
         self.assertEqual(pending.task_table.columnCount(), 7)
         self.assertTrue(pending.preview_tabs.isTabVisible(0))
         self.assertTrue(pending.preview_tabs.isTabVisible(1))
+        self.assertEqual(
+            pending.preview_tabs.tabText(0),
+            "结果图（1）",
+        )
+        self.assertEqual(
+            pending.preview_tabs.tabText(1),
+            "参考图（3）",
+        )
         self.assertEqual(pending.preview_tabs.currentIndex(), 0)
         self.assertEqual(pending.result_gallery.list_widget.count(), 1)
         self.assertEqual(
@@ -1114,6 +1151,26 @@ class CollaborationPageTests(unittest.TestCase):
         )
         pending.close()
         pending.deleteLater()
+
+        self.repository.list_results = lambda _task_id: []
+        pending_empty = SubmissionListPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            "pending",
+        )
+        pending_empty.show()
+        self.app.processEvents()
+        self.assertFalse(pending_empty.view_results.isEnabled())
+        self.assertTrue(pending_empty.return_button.isEnabled())
+        self.assertTrue(pending_empty.approve_button.isEnabled())
+        self.assertEqual(
+            pending_empty.preview_tabs.tabText(0),
+            "结果图（0）",
+        )
+        pending_empty.close()
+        pending_empty.deleteLater()
+        self.repository.list_results = lambda _task_id: [result]
 
         completed_project = make_project("in_progress")
         self.repository.list_projects = lambda **_: [completed_project]
@@ -1133,6 +1190,7 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertFalse(completed.view_results.isVisible())
         self.assertFalse(completed.return_button.isVisible())
         self.assertFalse(completed.approve_button.isVisible())
+        self.assertFalse(completed.review_actions.isVisible())
         self.assertEqual(completed.project_table.rowCount(), 1)
         self.assertEqual(completed.task_table.rowCount(), 1)
         self.assertEqual(
@@ -1150,6 +1208,8 @@ class CollaborationPageTests(unittest.TestCase):
             def load():
                 return "test-key"
 
+        settings_database = Database(self.root / "preview.db")
+        settings_database.initialize()
         center = TaskCenterPage(
             self.repository,
             self.resolver,
@@ -1157,7 +1217,7 @@ class CollaborationPageTests(unittest.TestCase):
             NanoBananaClient(lambda: "test-key"),
             KeyStore(),
             FileStore(AppPaths(self.root / "data")),
-            AppSettings(Database(self.root / "preview.db")),
+            AppSettings(settings_database),
         )
         self.assertFalse(hasattr(center, "claim_button"))
         self.assertEqual(
@@ -1192,7 +1252,32 @@ class CollaborationPageTests(unittest.TestCase):
             patch(
                 "yixin.ui.task_center_page.QFileDialog.getOpenFileNames",
                 return_value=([str(ps_image)], ""),
+            ) as first_open_files,
+            patch(
+                "yixin.ui.task_center_page.upload_manual_candidates",
+                return_value=1,
             ),
+            patch(
+                "yixin.ui.task_center_page.QMessageBox.information"
+            ),
+            patch.object(center, "refresh"),
+        ):
+            center._upload_manual()
+        self.assertEqual(
+            first_open_files.call_args.args[2],
+            str(Path.home()),
+        )
+        upload_history = self.root / "上次修后图目录"
+        upload_history.mkdir()
+        center.app_settings.set_input_folder(
+            INPUT_MANUAL_UPLOAD,
+            upload_history,
+        )
+        with (
+            patch(
+                "yixin.ui.task_center_page.QFileDialog.getOpenFileNames",
+                return_value=([str(ps_image)], ""),
+            ) as open_files,
             patch(
                 "yixin.ui.task_center_page.upload_manual_candidates",
                 return_value=1,
@@ -1205,6 +1290,18 @@ class CollaborationPageTests(unittest.TestCase):
             center._upload_manual()
         upload_manual.assert_called_once()
         self.assertEqual(upload_manual.call_args.args[3].id, task.id)
+        self.assertEqual(
+            open_files.call_args.args[2],
+            str(upload_history.resolve()),
+        )
+        self.assertEqual(
+            open_files.call_args.kwargs["options"],
+            QFileDialog.Option(0),
+        )
+        self.assertEqual(
+            center.app_settings.input_folder(INPUT_MANUAL_UPLOAD),
+            ps_image.parent.resolve(),
+        )
         center.prompt_edit.setPlainText("临时修改")
         with patch.object(center.prompt_edit, "setFocus") as set_focus:
             center._retry_task()
@@ -1227,6 +1324,26 @@ class CollaborationPageTests(unittest.TestCase):
         write_task_images(self.root)
         task = make_task("working")
         product_root = self.root / task.project_relative_root
+        garment_assets = tuple(
+            replace(
+                asset,
+                content_hash=hashlib.sha256(
+                    (
+                        product_root / asset.relative_path
+                    ).read_bytes()
+                ).hexdigest(),
+            )
+            for asset in task.garment_assets
+        )
+        model_hash = hashlib.sha256(
+            (product_root / task.model_path).read_bytes()
+        ).hexdigest()
+        task = replace(
+            task,
+            garment_assets=garment_assets,
+            garment_hash=garment_assets[0].content_hash,
+            model_hash=model_hash,
+        )
         result_path = (
             product_root
             / "AI成品"
@@ -1275,8 +1392,10 @@ class CollaborationPageTests(unittest.TestCase):
             FileStore(AppPaths(self.root / "task-center-data")),
             AppSettings(Database(self.root / "task-center.db")),
         )
-        self.assertNotIn("\n", center.task_detail.text())
-        self.assertIn("衣服 2 张", center.task_detail.text())
+        self.assertFalse(hasattr(center, "task_detail"))
+        self.assertEqual(center.source_title.text(), "子任务参考图")
+        self.assertTrue(center.local_source_hint.isHidden())
+        self.assertLessEqual(center.generation_splitter.sizes()[0], 190)
         self.assertEqual(center.source_strip.count(), 3)
         self.assertEqual(center.source_strip.currentRow(), 2)
         self.assertEqual(center.source_strip.item(0).text(), "衣服 1")
@@ -1366,7 +1485,8 @@ class CollaborationPageTests(unittest.TestCase):
         ):
             center._add_source_files()
         self.assertEqual(len(center.local_state.garments), 3)
-        self.assertIn("衣服 3 张", center.task_detail.text())
+        self.assertEqual(center.source_strip.count(), 4)
+        self.assertFalse(center.local_source_hint.isHidden())
         extra_model = self.root / "额外模特.png"
         Image.new("RGB", (30, 40), "cyan").save(extra_model)
         center.source_strip.setCurrentRow(
@@ -1656,8 +1776,14 @@ class CollaborationPageTests(unittest.TestCase):
         center.product_search.setText("不存在")
         self.assertEqual(center.project_table.rowCount(), 0)
         center.product_search.clear()
-        center.center_start_date.setDate(QDate.currentDate())
-        center.center_end_date.setDate(QDate.currentDate())
+        working_date = utc_naive_to_local(working.created_at).date()
+        working_qdate = QDate(
+            working_date.year,
+            working_date.month,
+            working_date.day,
+        )
+        center.center_start_date.setDate(working_qdate)
+        center.center_end_date.setDate(working_qdate)
         self.assertEqual(center.project_table.rowCount(), 1)
         center.deleteLater()
 

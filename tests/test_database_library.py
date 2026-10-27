@@ -22,6 +22,7 @@ from yixin.settings import (
     INPUT_BATCH_GARMENT,
     INPUT_BATCH_PERSON,
     INPUT_CREATE_REFERENCE,
+    INPUT_MANUAL_UPLOAD,
     AppSettings,
 )
 from yixin.storage import FileStore
@@ -293,27 +294,44 @@ class DatabaseLibraryTests(unittest.TestCase):
         create_folder = Path(self.temp.name) / "create"
         garment_folder = Path(self.temp.name) / "garment"
         person_folder = Path(self.temp.name) / "person"
-        for folder in (create_folder, garment_folder, person_folder):
+        manual_folder = Path(self.temp.name) / "manual"
+        for folder in (
+            create_folder,
+            garment_folder,
+            person_folder,
+            manual_folder,
+        ):
             folder.mkdir()
         settings.set_input_folder(INPUT_CREATE_REFERENCE, create_folder)
         settings.set_input_folder(INPUT_BATCH_GARMENT, garment_folder)
         settings.set_input_folder(INPUT_BATCH_PERSON, person_folder)
+        settings.set_input_folder(INPUT_MANUAL_UPLOAD, manual_folder)
         self.assertEqual(
             settings.input_folder(INPUT_CREATE_REFERENCE),
-            create_folder,
+            create_folder.resolve(),
         )
         self.assertEqual(
             settings.input_folder(INPUT_BATCH_GARMENT),
-            garment_folder,
+            garment_folder.resolve(),
         )
         self.assertEqual(
             settings.input_folder(INPUT_BATCH_PERSON),
-            person_folder,
+            person_folder.resolve(),
+        )
+        self.assertEqual(
+            settings.input_folder(INPUT_MANUAL_UPLOAD),
+            manual_folder.resolve(),
         )
         garment_folder.rmdir()
         self.assertIsNone(settings.input_folder(INPUT_BATCH_GARMENT))
         self.assertEqual(
             self.database.get_setting("input_last_folder_batch_garment", ""),
+            "",
+        )
+        manual_folder.rmdir()
+        self.assertIsNone(settings.input_folder(INPUT_MANUAL_UPLOAD))
+        self.assertEqual(
+            self.database.get_setting("input_last_folder_manual_upload", ""),
             "",
         )
 

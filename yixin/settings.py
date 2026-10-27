@@ -17,10 +17,12 @@ LOCAL_SAVE_LABELS = {
 INPUT_CREATE_REFERENCE = "create_reference"
 INPUT_BATCH_GARMENT = "batch_garment"
 INPUT_BATCH_PERSON = "batch_person"
+INPUT_MANUAL_UPLOAD = "manual_upload"
 INPUT_FOLDER_KEYS = {
     INPUT_CREATE_REFERENCE: "input_last_folder_create_reference",
     INPUT_BATCH_GARMENT: "input_last_folder_batch_garment",
     INPUT_BATCH_PERSON: "input_last_folder_batch_person",
+    INPUT_MANUAL_UPLOAD: "input_last_folder_manual_upload",
 }
 AUTO_STRATEGY_QUALITY = "quality"
 AUTO_STRATEGY_VALUE = "value"
