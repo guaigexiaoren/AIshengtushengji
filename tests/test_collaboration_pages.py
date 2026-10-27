@@ -1412,6 +1412,10 @@ class CollaborationPageTests(unittest.TestCase):
             center.task_table.selectionMode(),
             QAbstractItemView.SelectionMode.ExtendedSelection,
         )
+        self.assertEqual(
+            center.subtask_hint.text(),
+            "按住 Ctrl 多选，按住 Shift 连续选择",
+        )
         self.assertTrue(center.local_source_hint.isHidden())
         center._sync_task_splitter_to_generation()
         self.assertEqual(

@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import unittest
+from pathlib import Path
 
 HAS_PYSIDE = importlib.util.find_spec("PySide6") is not None
 
@@ -9,6 +10,7 @@ if HAS_PYSIDE:
         QApplication,
         QDialog,
         QDialogButtonBox,
+        QLineEdit,
         QMessageBox,
         QVBoxLayout,
         QWidget,
@@ -16,6 +18,7 @@ if HAS_PYSIDE:
 
     from yixin.ui.localization import (
         install_chinese_dialog_filter,
+        install_chinese_translations,
         localize_dialog,
     )
 
@@ -84,6 +87,33 @@ class ChineseDialogTests(unittest.TestCase):
         self.assertEqual(box.button(QMessageBox.StandardButton.No).text(), "否")
         box.close()
         box.deleteLater()
+
+    def test_standard_context_menu_is_chinese(self) -> None:
+        translator = install_chinese_translations(self.app)
+        self.assertIsNotNone(translator)
+        line = QLineEdit("测试")
+        menu = line.createStandardContextMenu()
+        texts = [
+            action.text()
+            for action in menu.actions()
+            if not action.isSeparator()
+        ]
+        self.assertTrue(any("复制" in text for text in texts))
+        self.assertTrue(any("粘贴" in text for text in texts))
+        self.assertTrue(any("全选" in text for text in texts))
+        self.assertFalse(any("Copy" in text for text in texts))
+        self.assertFalse(any("Paste" in text for text in texts))
+        self.assertFalse(any("Select All" in text for text in texts))
+        menu.deleteLater()
+        line.deleteLater()
+
+    def test_packaging_includes_qtbase_translation(self) -> None:
+        spec = (
+            Path(__file__).resolve().parent.parent
+            / "亦欣AI生图工作台.spec"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"qtbase_zh_CN.qm"', spec)
+        self.assertIn('"assets/translations"', spec)
 
 
 if __name__ == "__main__":

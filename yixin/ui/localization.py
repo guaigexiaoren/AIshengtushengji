@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QEvent, QObject, QTimer
+from pathlib import Path
+
+from PySide6.QtCore import (
+    QEvent,
+    QLibraryInfo,
+    QObject,
+    QTimer,
+    QTranslator,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -9,6 +17,8 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QMessageBox,
 )
+
+from ..paths import resource_path
 
 
 BUTTON_TEXT = {
@@ -35,6 +45,31 @@ MESSAGEBOX_BUTTON_TEXT = {
     QMessageBox.StandardButton.Yes: "是",
     QMessageBox.StandardButton.No: "否",
 }
+
+
+def install_chinese_translations(
+    app: QApplication,
+) -> QTranslator | None:
+    existing = getattr(app, "_chinese_translations", None)
+    if existing is not None:
+        return existing
+    folders = (
+        Path(resource_path("assets", "translations")),
+        Path(
+            QLibraryInfo.path(
+                QLibraryInfo.LibraryPath.TranslationsPath
+            )
+        ),
+    )
+    for folder in folders:
+        for catalog in ("qtbase_zh_CN", "qt_zh_CN"):
+            translator = QTranslator(app)
+            if not translator.load(catalog, str(folder)):
+                continue
+            app.installTranslator(translator)
+            app._chinese_translations = translator
+            return translator
+    return None
 
 
 def localize_dialog(dialog: QDialog) -> None:

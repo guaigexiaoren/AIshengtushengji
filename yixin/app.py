@@ -4,7 +4,7 @@ import ctypes
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QLibraryInfo, QLocale, QTimer, QTranslator
+from PySide6.QtCore import QLocale, QTimer
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -32,7 +32,10 @@ from .ui.collaboration_login import (
     LoginDialog,
 )
 from .ui.theme import APP_STYLESHEET
-from .ui.localization import install_chinese_dialog_filter
+from .ui.localization import (
+    install_chinese_dialog_filter,
+    install_chinese_translations,
+)
 from .worker import TaskWorker
 
 
@@ -61,11 +64,7 @@ def run() -> int:
     app.setFont(QFont("Microsoft YaHei UI", 10))
     app.setStyleSheet(APP_STYLESHEET)
     app.setWindowIcon(QIcon(str(resource_path("assets", "app_icon.ico"))))
-    translator = QTranslator(app)
-    translations_path = QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
-    if translator.load("qt_zh_CN", translations_path):
-        app.installTranslator(translator)
-        app.translator = translator
+    install_chinese_translations(app)
     install_chinese_dialog_filter(app)
 
     paths = AppPaths.default()

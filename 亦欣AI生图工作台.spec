@@ -1,5 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
+from PySide6.QtCore import QLibraryInfo
+
+
+translations_dir = Path(
+    QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)
+)
+qtbase_translation = translations_dir / "qtbase_zh_CN.qm"
+
 
 a = Analysis(
     ["main.py"],
@@ -9,6 +19,7 @@ a = Analysis(
         ("assets/app_icon.ico", "assets"),
         ("assets/app_icon.png", "assets"),
         ("yixin/collaboration/schema.sql", "yixin/collaboration"),
+        (str(qtbase_translation), "assets/translations"),
     ],
     hiddenimports=["pymysql", "openpyxl", "cryptography"],
     hookspath=[],

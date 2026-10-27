@@ -276,9 +276,17 @@ class TaskCenterPage(QWidget):
         subtask_host = QWidget()
         subtask_layout = QVBoxLayout(subtask_host)
         subtask_layout.setContentsMargins(0, 0, 0, 0)
+        subtask_header = QHBoxLayout()
         subtask_title = QLabel("子任务明细")
         subtask_title.setStyleSheet("font-size:16px;font-weight:700;")
-        subtask_layout.addWidget(subtask_title)
+        subtask_header.addWidget(subtask_title)
+        subtask_header.addStretch(1)
+        self.subtask_hint = QLabel(
+            "按住 Ctrl 多选，按住 Shift 连续选择"
+        )
+        self.subtask_hint.setStyleSheet("color:#7a879c;font-size:10px;")
+        subtask_header.addWidget(self.subtask_hint)
+        subtask_layout.addLayout(subtask_header)
         self.task_table = QTableWidget(0, 5)
         self.task_table.setHorizontalHeaderLabels(
             ["子任务编码", "制作人员", "状态", "加急", "创建时间"]
