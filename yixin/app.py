@@ -4,7 +4,7 @@ import ctypes
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QLibraryInfo, QLocale, Qt, QTimer, QTranslator
+from PySide6.QtCore import QLibraryInfo, QLocale, QTimer, QTranslator
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -48,10 +48,6 @@ def run() -> int:
             )
         except Exception:
             pass
-    QApplication.setAttribute(
-        Qt.ApplicationAttribute.AA_DontUseNativeDialogs,
-        True,
-    )
     app = QApplication.instance() or QApplication([])
     QLocale.setDefault(
         QLocale(

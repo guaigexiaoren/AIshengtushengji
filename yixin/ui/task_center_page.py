@@ -1474,7 +1474,6 @@ class TaskCenterPage(QWidget):
             "选择 PS 成品",
             str(initial_folder or Path.home()),
             "图片 (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)",
-            options=QFileDialog.Option(0),
         )
         if not paths:
             return

@@ -19,7 +19,6 @@ if HAS_PYSIDE:
         QAbstractItemView,
         QApplication,
         QDialog,
-        QFileDialog,
         QHeaderView,
         QLabel,
         QMessageBox,
@@ -1307,10 +1306,7 @@ class CollaborationPageTests(unittest.TestCase):
             open_files.call_args.args[2],
             str(upload_history.resolve()),
         )
-        self.assertEqual(
-            open_files.call_args.kwargs["options"],
-            QFileDialog.Option(0),
-        )
+        self.assertNotIn("options", open_files.call_args.kwargs)
         self.assertEqual(
             center.app_settings.input_folder(INPUT_MANUAL_UPLOAD),
             ps_image.parent.resolve(),
