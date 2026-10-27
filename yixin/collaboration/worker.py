@@ -15,7 +15,7 @@ from ..storage import (
     sha256_bytes,
 )
 from .repository import MySQLCentralRepository
-from .shared_paths import SharedPathResolver
+from .shared_paths import SharedPathResolver, safe_path_component
 from .types import (
     AuthUser,
     GeneratedResultInput,
@@ -145,18 +145,24 @@ class ProjectGenerationWorker:
             )
             output_directory.mkdir(parents=True, exist_ok=True)
             generated: list[GeneratedResultInput] = []
+            task_prefix = safe_path_component(self.task.task_code)
             for index, remote in enumerate(api_result.images):
                 data = self.client.resolve_image(remote)
                 mime, width, height = image_metadata(data)
                 suffix = MIME_TO_SUFFIX.get(mime, ".png")
                 content_hash = sha256_bytes(data)
                 image_path = output_directory / (
-                    f"result_{index + 1:02d}_{content_hash[:12]}{suffix}"
+                    f"result_{task_prefix}_r{attempt.attempt_no:03d}_"
+                    f"{index + 1:02d}_{content_hash[:12]}{suffix}"
                 )
                 atomic_write_bytes(image_path, data)
                 thumbnail_path = self.file_store.create_thumbnail(
                     image_path,
-                    output_directory / f"thumb_{index + 1:02d}.jpg",
+                    output_directory
+                    / (
+                        f"thumb_{task_prefix}_r{attempt.attempt_no:03d}_"
+                        f"{index + 1:02d}.jpg"
+                    ),
                 )
                 generated.append(
                     GeneratedResultInput(

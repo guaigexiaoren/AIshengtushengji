@@ -12,7 +12,7 @@ from ..storage import (
     sha256_bytes,
 )
 from .repository import MySQLCentralRepository
-from .shared_paths import SharedPathResolver
+from .shared_paths import SharedPathResolver, safe_path_component
 from .types import AuthUser, GeneratedResultInput, ProjectTask
 
 
@@ -28,10 +28,11 @@ def upload_manual_candidates(
         return 0
     attempt = repository.create_manual_attempt(task.id, actor)
     project_root = resolver.project_root(task.project_relative_root)
-    output = resolver.output_directory(task, attempt.attempt_no) / "manual"
+    output = resolver.output_directory(task, attempt.attempt_no)
     output.mkdir(parents=True, exist_ok=True)
     generated: list[GeneratedResultInput] = []
     seen: set[str] = set()
+    task_prefix = safe_path_component(task.task_code)
     try:
         for source in paths:
             data = Path(source).read_bytes()
@@ -43,12 +44,17 @@ def upload_manual_candidates(
             index = len(generated)
             suffix = MIME_TO_SUFFIX.get(mime, ".png")
             destination = output / (
-                f"manual_{index + 1:02d}_{content_hash[:12]}{suffix}"
+                f"manual_{task_prefix}_r{attempt.attempt_no:03d}_"
+                f"{index + 1:02d}_{content_hash[:12]}{suffix}"
             )
             atomic_write_bytes(destination, data)
             thumbnail = file_store.create_thumbnail(
                 destination,
-                output / f"thumb_{index + 1:02d}.jpg",
+                output
+                / (
+                    f"thumb_manual_{task_prefix}_"
+                    f"r{attempt.attempt_no:03d}_{index + 1:02d}.jpg"
+                ),
             )
             generated.append(
                 GeneratedResultInput(

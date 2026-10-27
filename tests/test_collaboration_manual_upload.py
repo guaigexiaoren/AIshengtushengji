@@ -121,6 +121,14 @@ class ManualUploadTests(unittest.TestCase):
             self.assertTrue(
                 all("manual" in result.relative_path for result in results)
             )
+            self.assertTrue(
+                all(
+                    result.relative_path.startswith(
+                        "AI成品/项目-123-001/manual_"
+                    )
+                    for result in results
+                )
+            )
 
 
 if __name__ == "__main__":

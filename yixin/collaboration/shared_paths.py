@@ -68,8 +68,7 @@ class SharedPathResolver:
         return (
             project_root
             / "AI成品"
-            / safe_path_component(task.task_code)
-            / f"attempt_{attempt_no:03d}"
+            / safe_path_component(task.project_code)
         )
 
     def relative_output_path(self, task: ProjectTask, path: Path) -> str:
