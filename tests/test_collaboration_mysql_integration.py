@@ -308,6 +308,20 @@ class MySQLIntegrationTests(unittest.TestCase):
             self.assertEqual(claimed_task.assignee_id, queue_winner.id)
             self.assertEqual(queued_attempt.status, ATTEMPT_QUEUED)
             self.assertEqual(queued_attempt.operator_id, queue_winner.id)
+            skipped_count = repository.skip_remaining_subtasks(
+                project_id,
+                admin,
+                reason="实际只需完成一个子任务",
+            )
+            self.assertEqual(skipped_count, 1)
+            self.assertEqual(
+                repository.get_task(queued_task.id).status,
+                "skipped",
+            )
+            self.assertEqual(
+                repository.get_project(project_id).status,
+                "completed",
+            )
         finally:
             with repository.connection() as connection:
                 with connection.cursor() as cursor:

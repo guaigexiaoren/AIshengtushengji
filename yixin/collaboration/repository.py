@@ -45,6 +45,7 @@ from .types import (
     TASK_CANCELLED,
     TASK_CLAIMED,
     TASK_RETURNED,
+    TASK_SKIPPED,
     TASK_WORKING,
     AuthUser,
     GeneratedResultInput,
@@ -447,6 +448,93 @@ class MySQLCentralRepository:
                     """,
                     (clean, utc_now(), user_id),
                 )
+
+    def update_user(
+        self,
+        actor: AuthUser,
+        user_id: int,
+        *,
+        username: str,
+        display_name: str,
+        role: str,
+        is_active: bool,
+        urgent_quota_per_day: int,
+        max_generation_concurrency: int,
+    ) -> None:
+        if actor.role != ROLE_ADMIN:
+            raise PermissionDeniedError("只有管理员可以编辑账号")
+        clean_username = username.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{3,64}", clean_username):
+            raise ValueError("账号只能包含字母、数字、点、下划线或短横线，长度 3–64")
+        clean_display_name = _validate_display_name(display_name)
+        if role not in ROLES:
+            raise ValueError("不支持的账号角色")
+        if not 0 <= urgent_quota_per_day <= 99:
+            raise ValueError("加急额度必须在 0 到 99 之间")
+        if not 1 <= max_generation_concurrency <= 10:
+            raise ValueError("生成并发数必须在 1 到 10 之间")
+        if user_id == actor.id and (not is_active or role != ROLE_ADMIN):
+            raise ValueError("不能停用当前账号或取消自己的管理员角色")
+        try:
+            with self.connection() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT id FROM users WHERE id = %s FOR UPDATE",
+                        (user_id,),
+                    )
+                    if cursor.fetchone() is None:
+                        raise ValueError("账号不存在")
+                    cursor.execute(
+                        """
+                        SELECT id FROM users
+                        WHERE username = %s AND id <> %s
+                        LIMIT 1
+                        """,
+                        (clean_username, user_id),
+                    )
+                    if cursor.fetchone() is not None:
+                        raise StateConflictError("登录账号已存在")
+                    cursor.execute(
+                        """
+                        SELECT id FROM users
+                        WHERE display_name = %s AND id <> %s
+                        LIMIT 1
+                        """,
+                        (clean_display_name, user_id),
+                    )
+                    if cursor.fetchone() is not None:
+                        raise StateConflictError("显示名称或项目名已被其他账号使用")
+                    if role != ROLE_ADMIN or not is_active:
+                        cursor.execute(
+                            """
+                            SELECT COUNT(*) AS count FROM users
+                            WHERE role = %s AND is_active = 1 AND id <> %s
+                            """,
+                            (ROLE_ADMIN, user_id),
+                        )
+                        if int(cursor.fetchone()["count"]) == 0:
+                            raise ValueError("必须保留至少一个启用的管理员账号")
+                    cursor.execute(
+                        """
+                        UPDATE users
+                        SET username = %s, display_name = %s, role = %s,
+                            is_active = %s, urgent_quota_per_day = %s,
+                            max_generation_concurrency = %s, updated_at = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            clean_username,
+                            clean_display_name,
+                            role,
+                            int(is_active),
+                            urgent_quota_per_day,
+                            max_generation_concurrency,
+                            utc_now(),
+                            user_id,
+                        ),
+                    )
+        except pymysql.err.IntegrityError as exc:
+            raise StateConflictError("账号或显示名称已存在") from exc
 
     def save_api_key(
         self,
@@ -2055,6 +2143,100 @@ class MySQLCentralRepository:
                     {"reason": reason},
                 )
 
+    def skip_remaining_subtasks(
+        self,
+        project_id: int,
+        actor: AuthUser,
+        *,
+        reason: str,
+    ) -> int:
+        if actor.role not in (ROLE_AI, ROLE_ADMIN):
+            raise PermissionDeniedError("当前角色不能结束剩余子任务")
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("必须填写剩余子任务不制作的原因")
+        now = utc_now()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._project_row_for_update(cursor, project_id)
+                cursor.execute(
+                    """
+                    SELECT id, status, assignee_id
+                    FROM project_tasks
+                    WHERE project_id = %s
+                    ORDER BY task_no
+                    FOR UPDATE
+                    """,
+                    (project_id,),
+                )
+                tasks = cursor.fetchall()
+                if not tasks:
+                    raise ValueError("当前主任务没有子任务")
+                completed = [
+                    task
+                    for task in tasks
+                    if task["status"] in (
+                        TASK_AWAITING_ACCEPTANCE,
+                        TASK_APPROVED,
+                    )
+                ]
+                if not completed:
+                    raise StateConflictError(
+                        "请先至少提交一个子任务，再结束剩余制作"
+                    )
+                if actor.role != ROLE_ADMIN and not any(
+                    int(task["assignee_id"] or 0) == actor.id
+                    for task in completed
+                ):
+                    raise PermissionDeniedError(
+                        "只能结束自己已领取主任务下的剩余子任务"
+                    )
+                active = [
+                    task
+                    for task in tasks
+                    if task["status"]
+                    in (
+                        TASK_AVAILABLE,
+                        TASK_CLAIMED,
+                        TASK_WORKING,
+                        TASK_RETURNED,
+                    )
+                ]
+                if not active:
+                    raise StateConflictError("没有需要结束的剩余子任务")
+                if actor.role != ROLE_ADMIN:
+                    occupied = [
+                        task
+                        for task in active
+                        if task["assignee_id"] is not None
+                        and int(task["assignee_id"]) != actor.id
+                    ]
+                    if occupied:
+                        raise StateConflictError(
+                            "部分剩余子任务已被其他制作人员领取，请联系管理员处理"
+                        )
+                for task in active:
+                    cursor.execute(
+                        """
+                        UPDATE project_tasks
+                        SET status = %s, updated_at = %s
+                        WHERE id = %s
+                        """,
+                        (TASK_SKIPPED, now, task["id"]),
+                    )
+                    self._event(
+                        cursor,
+                        project_id,
+                        int(task["id"]),
+                        actor.id,
+                        "subtask_skipped",
+                        task["status"],
+                        TASK_SKIPPED,
+                        {"reason": reason},
+                    )
+                self._update_project_status(cursor, project_id)
+                return len(active)
+
     def reassign_task(self, task_id: int, actor: AuthUser, target_user_id: int) -> None:
         if actor.role != ROLE_ADMIN:
             raise PermissionDeniedError("只有管理员可以改派任务")
@@ -2910,10 +3092,16 @@ class MySQLCentralRepository:
         total = sum(counts.values())
         if not total:
             status = PROJECT_SUBMITTED
-        elif counts.get(TASK_APPROVED, 0) == total:
+        elif (
+            counts.get(TASK_APPROVED, 0) > 0
+            and counts.get(TASK_APPROVED, 0) + counts.get(TASK_SKIPPED, 0)
+            == total
+        ):
             status = PROJECT_COMPLETED
         elif (
-            counts.get(TASK_APPROVED, 0) + counts.get(TASK_AWAITING_ACCEPTANCE, 0)
+            counts.get(TASK_APPROVED, 0)
+            + counts.get(TASK_AWAITING_ACCEPTANCE, 0)
+            + counts.get(TASK_SKIPPED, 0)
             == total
         ):
             status = PROJECT_AWAITING_ACCEPTANCE

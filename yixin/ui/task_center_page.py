@@ -47,6 +47,7 @@ from ..collaboration.types import (
     TASK_CANCELLED,
     TASK_CLAIMED,
     TASK_RETURNED,
+    TASK_SKIPPED,
     TASK_STATUS_LABELS,
     TASK_WORKING,
     AuthUser,
@@ -432,18 +433,21 @@ class TaskCenterPage(QWidget):
         self.upload_button = QPushButton("上传修后图")
         self.compare_button = QPushButton("查看/对比成品")
         self.submit_button = QPushButton("提交验收")
+        self.skip_button = QPushButton("剩余不制作")
         self.submit_button.setObjectName("PrimaryButton")
         self.retry_button.clicked.connect(self._retry_task)
         self.save_button.clicked.connect(self._save_result)
         self.upload_button.clicked.connect(self._upload_manual)
         self.compare_button.clicked.connect(self._compare_result)
         self.submit_button.clicked.connect(self._submit)
+        self.skip_button.clicked.connect(self._skip_remaining)
         for button in (
             self.retry_button,
             self.save_button,
             self.upload_button,
             self.compare_button,
             self.submit_button,
+            self.skip_button,
         ):
             button.setMinimumHeight(36)
             button_row.addWidget(button)
@@ -474,7 +478,10 @@ class TaskCenterPage(QWidget):
     @staticmethod
     def _group_status(tasks: tuple[ProjectTask, ...]) -> str:
         statuses = {task.status for task in tasks}
-        if statuses and statuses <= {TASK_APPROVED}:
+        if (
+            TASK_APPROVED in statuses
+            and statuses <= {TASK_APPROVED, TASK_SKIPPED}
+        ):
             return "已完成"
         if TASK_AWAITING_ACCEPTANCE in statuses:
             return "待审核"
@@ -550,6 +557,7 @@ class TaskCenterPage(QWidget):
         def task_visible(task: ProjectTask) -> bool:
             return include_finished or task.status not in (
                 TASK_APPROVED,
+                TASK_SKIPPED,
                 TASK_CANCELLED,
             )
 
@@ -575,10 +583,16 @@ class TaskCenterPage(QWidget):
             approved = sum(
                 task.status == TASK_APPROVED for task in group.tasks
             )
+            skipped = sum(
+                task.status == TASK_SKIPPED for task in group.tasks
+            )
+            progress = f"{approved}/{len(group.tasks)}"
+            if skipped:
+                progress += f" · 无需制作 {skipped}"
             values = (
                 group.project_code,
                 group.product_code,
-                f"{approved}/{len(group.tasks)}",
+                progress,
                 group.status,
                 utc_naive_to_local(group.created_at).strftime(
                     "%Y-%m-%d %H:%M"
@@ -628,7 +642,11 @@ class TaskCenterPage(QWidget):
             task
             for task in group.tasks
             if include_finished
-            or task.status not in (TASK_APPROVED, TASK_CANCELLED)
+            or task.status not in (
+                TASK_APPROVED,
+                TASK_SKIPPED,
+                TASK_CANCELLED,
+            )
         ]
         self._tasks_by_id = {
             task.id: task for task in self.visible_project_tasks
@@ -1079,6 +1097,10 @@ class TaskCenterPage(QWidget):
         self.retry_button.setEnabled(can_work)
         self.save_button.setEnabled(self.gallery.current_path() is not None)
         self.compare_button.setEnabled(self.gallery.current_path() is not None)
+        self.skip_button.setEnabled(
+            self.current_project_id is not None
+            and self.actor.role in (ROLE_AI, ROLE_ADMIN)
+        )
         for button in (
             self.add_source_files_button,
             self.add_source_folder_button,
@@ -1445,6 +1467,64 @@ class TaskCenterPage(QWidget):
             right_label="生成成品",
             parent=self,
         ).exec()
+
+    def _skip_remaining(self) -> None:
+        if self.current_project_id is None:
+            return
+        group = self._groups_by_id.get(self.current_project_id)
+        if group is None:
+            return
+        remaining = [
+            task
+            for task in group.tasks
+            if task.status
+            in (
+                TASK_AVAILABLE,
+                TASK_CLAIMED,
+                TASK_WORKING,
+                TASK_RETURNED,
+            )
+        ]
+        if not remaining:
+            QMessageBox.information(
+                self,
+                "没有剩余子任务",
+                "当前主任务没有可标记为无需制作的子任务。",
+            )
+            return
+        reason, ok = QInputDialog.getMultiLineText(
+            self,
+            "剩余不制作",
+            "请填写剩余子任务不制作的原因：",
+        )
+        if not ok:
+            return
+        if not reason.strip():
+            QMessageBox.warning(self, "需要原因", "请填写不制作原因。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认剩余不制作",
+            f"将把当前主任务中 {len(remaining)} 个未完成子任务"
+            "标记为“无需制作”，是否继续？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            count = self.repository.skip_remaining_subtasks(
+                self.current_project_id,
+                self.actor,
+                reason=reason,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "操作失败", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "操作完成",
+            f"已将 {count} 个子任务标记为无需制作。",
+        )
+        self.refresh()
 
     def _submit(self) -> None:
         task = self.current_task

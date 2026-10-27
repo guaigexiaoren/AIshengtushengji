@@ -16,6 +16,7 @@ if HAS_PYSIDE:
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import (
         QApplication,
+        QDialog,
         QLabel,
         QMessageBox,
         QPushButton,
@@ -45,7 +46,7 @@ if HAS_PYSIDE:
     from yixin.security import SecretStore
     from yixin.settings import AppSettings
     from yixin.storage import FileStore
-    from yixin.ui.admin_page import AdminPage
+    from yixin.ui.admin_page import AdminPage, EditUserDialog
     from yixin.ui.collaboration_login import LoginDialog
     from yixin.ui.dialogs import SettingsDialog
     from yixin.ui.main_window import MainWindow, SidebarNav
@@ -70,6 +71,8 @@ class FakeCentralRepository:
         self.project_attempt_history = []
         self.attempt_results = {}
         self.tasks_by_id = {}
+        self.user_updates = []
+        self.skip_requests = []
 
     def create_project(self, _actor, draft):
         self.created_drafts.append(draft)
@@ -110,6 +113,13 @@ class FakeCentralRepository:
 
     def list_users(self, role=None):
         return []
+
+    def update_user(self, actor, user_id, **kwargs):
+        self.user_updates.append((actor, user_id, kwargs))
+
+    def skip_remaining_subtasks(self, project_id, actor, *, reason):
+        self.skip_requests.append((project_id, actor, reason))
+        return 3
 
     def api_key_statuses(self):
         return {}
@@ -602,6 +612,46 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertIn("9X2A", page.user_table.item(0, 5).text())
         self.assertEqual(page.user_table.item(0, 7).text(), "4")
         self.assertEqual(page.user_table.item(0, 8).text(), "3")
+        page.deleteLater()
+
+    def test_admin_can_edit_account_fields_and_permissions(self) -> None:
+        ai_user = AuthUser(
+            8,
+            "ai_amy",
+            "AI制作Amy",
+            "ai",
+            urgent_quota_per_day=4,
+            max_generation_concurrency=3,
+        )
+        self.repository.list_users = lambda role=None: [ai_user]
+        page = AdminPage(self.repository, self.actor)
+        page.user_table.selectRow(0)
+        dialog = EditUserDialog(ai_user)
+        dialog.username.setText("ai_amy_new")
+        dialog.display_name.setText("AI制作Amy新")
+        dialog.role.setCurrentIndex(dialog.role.findData("admin"))
+        dialog.active.setChecked(True)
+        dialog.urgent_quota.setValue(6)
+        dialog.max_concurrency.setValue(5)
+        with (
+            patch(
+                "yixin.ui.admin_page.EditUserDialog",
+                return_value=dialog,
+            ),
+            patch.object(
+                dialog,
+                "exec",
+                return_value=QDialog.DialogCode.Accepted,
+            ),
+        ):
+            page._edit_user()
+        self.assertEqual(len(self.repository.user_updates), 1)
+        update = self.repository.user_updates[0][2]
+        self.assertEqual(update["username"], "ai_amy_new")
+        self.assertEqual(update["display_name"], "AI制作Amy新")
+        self.assertEqual(update["role"], "admin")
+        self.assertEqual(update["urgent_quota_per_day"], 6)
+        self.assertEqual(update["max_generation_concurrency"], 5)
         page.deleteLater()
 
     def test_auto_scan_builds_one_subtask_per_model(self) -> None:
@@ -1320,6 +1370,105 @@ class CollaborationPageTests(unittest.TestCase):
         center.center_start_date.setDate(QDate.currentDate())
         center.center_end_date.setDate(QDate.currentDate())
         self.assertEqual(center.project_table.rowCount(), 1)
+        center.deleteLater()
+
+    def test_task_center_skip_remaining_marks_project_tasks(self) -> None:
+        write_task_images(self.root)
+        working = make_task("working")
+        remaining = [
+            replace(
+                working,
+                id=20 + index,
+                task_code=f"春季项目-123-001-{index + 2:03d}",
+                status="available",
+                assignee_id=None,
+                assignee_name="",
+            )
+            for index in range(3)
+        ]
+        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
+            working,
+            *remaining,
+        ]
+        center = TaskCenterPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            NanoBananaClient(lambda: "test-key"),
+            type(
+                "KeyStore",
+                (),
+                {"load": staticmethod(lambda: "test-key")},
+            )(),
+            FileStore(AppPaths(self.root / "skip-data")),
+            AppSettings(Database(self.root / "skip.db")),
+        )
+        button_names = [
+            center.retry_button.text(),
+            center.save_button.text(),
+            center.upload_button.text(),
+            center.compare_button.text(),
+            center.submit_button.text(),
+            center.skip_button.text(),
+        ]
+        self.assertEqual(button_names[-2:], ["提交验收", "剩余不制作"])
+        with (
+            patch(
+                "yixin.ui.task_center_page.QInputDialog.getMultiLineText",
+                return_value=("实际只需完成一张", True),
+            ),
+            patch(
+                "yixin.ui.task_center_page.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch(
+                "yixin.ui.task_center_page.QMessageBox.information"
+            ),
+        ):
+            center._skip_remaining()
+        self.assertEqual(len(self.repository.skip_requests), 1)
+        self.assertEqual(
+            self.repository.skip_requests[0][2],
+            "实际只需完成一张",
+        )
+        center.deleteLater()
+
+    def test_task_center_completed_with_skipped_tasks(self) -> None:
+        write_task_images(self.root)
+        approved = make_task("approved")
+        skipped = replace(
+            approved,
+            id=31,
+            task_code="春季项目-123-001-009",
+            status="skipped",
+            assignee_id=None,
+            assignee_name="",
+        )
+        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
+            approved,
+            skipped,
+        ]
+        center = TaskCenterPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            NanoBananaClient(lambda: "test-key"),
+            type(
+                "KeyStore",
+                (),
+                {"load": staticmethod(lambda: "test-key")},
+            )(),
+            FileStore(AppPaths(self.root / "skipped-data")),
+            AppSettings(Database(self.root / "skipped.db")),
+        )
+        center.include_finished.setChecked(True)
+        self.app.processEvents()
+        self.assertEqual(center.project_table.item(0, 3).text(), "已完成")
+        self.assertIn(
+            "无需制作 1",
+            center.project_table.item(0, 2).text(),
+        )
+        self.assertEqual(center.task_table.rowCount(), 2)
         center.deleteLater()
 
     def test_project_history_filters_and_shows_attempt_results(self) -> None:

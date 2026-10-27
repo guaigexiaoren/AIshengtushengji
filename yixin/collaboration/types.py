@@ -34,6 +34,7 @@ TASK_WORKING = "working"
 TASK_AWAITING_ACCEPTANCE = "awaiting_acceptance"
 TASK_RETURNED = "returned"
 TASK_APPROVED = "approved"
+TASK_SKIPPED = "skipped"
 TASK_CANCELLED = "cancelled"
 TASK_STATUS_LABELS = {
     TASK_AVAILABLE: "已提交",
@@ -42,6 +43,7 @@ TASK_STATUS_LABELS = {
     TASK_AWAITING_ACCEPTANCE: "待审核",
     TASK_RETURNED: "已退回",
     TASK_APPROVED: "已完成",
+    TASK_SKIPPED: "无需制作",
     TASK_CANCELLED: "已取消",
 }
 

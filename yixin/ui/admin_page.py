@@ -8,10 +8,10 @@ from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDateEdit,
     QDialog,
-    QDialogButtonBox,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
@@ -79,13 +79,60 @@ class AddUserDialog(QDialog):
         form.addRow("每日加急额度", self.urgent_quota)
         form.addRow("最大生成并发", self.max_concurrency)
         layout.addLayout(form)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok
-            | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
+        actions = QHBoxLayout()
+        cancel = QPushButton("取消")
+        save = QPushButton("保存")
+        save.setObjectName("PrimaryButton")
+        cancel.clicked.connect(self.reject)
+        save.clicked.connect(self.accept)
+        actions.addStretch(1)
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+        layout.addLayout(actions)
+
+
+class EditUserDialog(QDialog):
+    def __init__(
+        self,
+        user: AuthUser,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.user = user
+        self.setWindowTitle(f"编辑账号 · {user.display_name}")
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.username = QLineEdit(user.username)
+        self.display_name = QLineEdit(user.display_name)
+        self.role = QComboBox()
+        for role in (ROLE_OPERATIONS, ROLE_AI, ROLE_ADMIN):
+            self.role.addItem(ROLE_LABELS[role], role)
+        self.role.setCurrentIndex(self.role.findData(user.role))
+        self.active = QCheckBox("启用账号")
+        self.active.setChecked(user.is_active)
+        self.urgent_quota = QSpinBox()
+        self.urgent_quota.setRange(0, 99)
+        self.urgent_quota.setValue(user.urgent_quota_per_day)
+        self.max_concurrency = QSpinBox()
+        self.max_concurrency.setRange(1, 10)
+        self.max_concurrency.setValue(user.max_generation_concurrency)
+        form.addRow("登录账号", self.username)
+        form.addRow("显示名称/项目名", self.display_name)
+        form.addRow("角色", self.role)
+        form.addRow("账号状态", self.active)
+        form.addRow("每日加急额度", self.urgent_quota)
+        form.addRow("最大生成并发", self.max_concurrency)
+        layout.addLayout(form)
+        actions = QHBoxLayout()
+        cancel = QPushButton("取消")
+        save = QPushButton("保存")
+        save.setObjectName("PrimaryButton")
+        cancel.clicked.connect(self.reject)
+        save.clicked.connect(self.accept)
+        actions.addStretch(1)
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+        layout.addLayout(actions)
 
 
 class ApiKeyDialog(QDialog):
@@ -328,6 +375,8 @@ class AdminPage(QWidget):
         toolbar = QHBoxLayout()
         add_button = QPushButton("新增账号")
         add_button.clicked.connect(self._add_user)
+        edit_button = QPushButton("编辑账号")
+        edit_button.clicked.connect(self._edit_user)
         self.toggle_user_button = QPushButton("停用/启用")
         self.toggle_user_button.clicked.connect(self._toggle_user)
         reset_button = QPushButton("重置密码")
@@ -341,6 +390,7 @@ class AdminPage(QWidget):
         refresh_button = QPushButton("刷新")
         refresh_button.clicked.connect(self._refresh_users)
         toolbar.addWidget(add_button)
+        toolbar.addWidget(edit_button)
         toolbar.addWidget(self.toggle_user_button)
         toolbar.addWidget(reset_button)
         toolbar.addWidget(self.api_key_button)
@@ -601,6 +651,30 @@ class AdminPage(QWidget):
             )
         except Exception as exc:
             QMessageBox.warning(self, "新增失败", str(exc))
+            return
+        self._refresh_users()
+
+    def _edit_user(self) -> None:
+        user = self._current_user()
+        if user is None:
+            QMessageBox.information(self, "未选择账号", "请先选择一个账号。")
+            return
+        dialog = EditUserDialog(user, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            self.repository.update_user(
+                self.actor,
+                user.id,
+                username=dialog.username.text(),
+                display_name=dialog.display_name.text(),
+                role=dialog.role.currentData(),
+                is_active=dialog.active.isChecked(),
+                urgent_quota_per_day=dialog.urgent_quota.value(),
+                max_generation_concurrency=dialog.max_concurrency.value(),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "编辑失败", str(exc))
             return
         self._refresh_users()
 
