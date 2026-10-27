@@ -7,6 +7,7 @@ from yixin.collaboration.shared_paths import (
     safe_path_component,
 )
 from yixin.collaboration.types import ProjectTask
+from yixin.private_config import SHARED_ROOT
 from datetime import datetime
 
 
@@ -41,6 +42,9 @@ def make_task(project_root: str) -> ProjectTask:
 
 
 class SharedPathTests(unittest.TestCase):
+    def test_private_shared_root_uses_ipv4_address(self) -> None:
+        self.assertEqual(SHARED_ROOT, r"\\10.6.6.6\AI作图")
+
     def test_project_relative_and_output_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp) / "share"

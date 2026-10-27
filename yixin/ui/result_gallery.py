@@ -139,6 +139,26 @@ class ResultGallery(QWidget):
                 selected.append(int(item.data(Qt.ItemDataRole.UserRole)))
         return selected
 
+    def set_selected_result_ids(self, result_ids: tuple[int, ...]) -> None:
+        selected = set(result_ids)
+        self.list_widget.blockSignals(True)
+        try:
+            for index in range(self.list_widget.count()):
+                item = self.list_widget.item(index)
+                if not (
+                    item.flags()
+                    & Qt.ItemFlag.ItemIsUserCheckable
+                ):
+                    continue
+                item.setCheckState(
+                    Qt.CheckState.Checked
+                    if int(item.data(Qt.ItemDataRole.UserRole))
+                    in selected
+                    else Qt.CheckState.Unchecked
+                )
+        finally:
+            self.list_widget.blockSignals(False)
+
     def current_path(self) -> Path | None:
         current = self.list_widget.currentItem()
         if current is None:

@@ -159,6 +159,7 @@ class TaskCenterPage(QWidget):
         self.visible_project_tasks: list[ProjectTask] = []
         self.current_project_id: int | None = None
         self.current_task: ProjectTask | None = None
+        self.final_selections: dict[int, tuple[int, ...]] = {}
         self._groups_by_id: dict[int, ProjectTaskGroup] = {}
         self._tasks_by_id: dict[int, ProjectTask] = {}
         self.local_store: LocalTaskSourceStore | None = None
@@ -166,12 +167,21 @@ class TaskCenterPage(QWidget):
         self.active_workers: set[ProjectGenerationWorker] = set()
         self.waiting_jobs: deque[dict] = deque()
         self._build()
+        self.generation_splitter.splitterMoved.connect(
+            self._sync_task_splitter_to_generation
+        )
+        self._sync_task_splitter_to_generation()
         self.queue_timer = QTimer(self)
         self.queue_timer.setInterval(1200)
         self.queue_timer.timeout.connect(self._refresh_queue)
         self.queue_timer.start()
         if auto_load:
             self.refresh()
+
+    def _sync_task_splitter_to_generation(self, *_args) -> None:
+        sizes = self.generation_splitter.sizes()
+        if sizes and sum(sizes) > 0:
+            self.task_splitter.setSizes(sizes)
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
@@ -277,6 +287,9 @@ class TaskCenterPage(QWidget):
         self.task_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
+        self.task_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
         self.task_table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
@@ -306,6 +319,7 @@ class TaskCenterPage(QWidget):
         self.source_title.setStyleSheet("font-size:16px;font-weight:700;")
         source_tools.addWidget(self.source_title)
         source_tools.addStretch(1)
+        top_layout.addLayout(source_tools)
         self.add_source_files_button = QPushButton("添加图片")
         self.add_source_folder_button = QPushButton("添加文件夹")
         self.add_source_library_button = QPushButton("从作品库添加")
@@ -313,6 +327,12 @@ class TaskCenterPage(QWidget):
         self.restore_source_button = QPushButton("恢复")
         self.remove_source_button = QPushButton("移除所选")
         self.clear_sources_button = QPushButton("清空")
+        source_actions_host = QWidget()
+        source_actions_host.setMinimumHeight(34)
+        source_actions = QHBoxLayout(source_actions_host)
+        source_actions.setContentsMargins(0, 0, 0, 0)
+        source_actions.setSpacing(4)
+        source_actions.addStretch(1)
         for button in (
             self.add_source_files_button,
             self.add_source_folder_button,
@@ -323,11 +343,10 @@ class TaskCenterPage(QWidget):
             self.clear_sources_button,
         ):
             button.setStyleSheet("padding:5px 7px;")
-            source_tools.addWidget(button)
-        top_layout.addLayout(source_tools)
+            source_actions.addWidget(button)
+        top_layout.addWidget(source_actions_host)
         self.local_source_hint = QLabel()
         self.local_source_hint.hide()
-        top_layout.addWidget(self.local_source_hint)
         self.source_strip = DroppableImageStrip(icon_size=82)
         self.source_strip.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
@@ -336,6 +355,7 @@ class TaskCenterPage(QWidget):
             self._handle_source_drop
         )
         top_layout.addWidget(self.source_strip)
+        top_layout.addWidget(self.local_source_hint)
         self.add_source_files_button.clicked.connect(
             self._add_source_files
         )
@@ -349,11 +369,7 @@ class TaskCenterPage(QWidget):
         self.restore_source_button.clicked.connect(self._restore_source)
         self.remove_source_button.clicked.connect(self._remove_sources)
         self.clear_sources_button.clicked.connect(self._clear_sources)
-        self.generation_splitter.addWidget(top)
 
-        middle = QWidget()
-        layout = QVBoxLayout(middle)
-        layout.setContentsMargins(8, 0, 8, 0)
         prompt_card = QGroupBox("提示词与参数")
         prompt_layout = QVBoxLayout(prompt_card)
         template_row = QHBoxLayout()
@@ -416,8 +432,8 @@ class TaskCenterPage(QWidget):
         for column in range(4):
             form.setColumnStretch(column, 1)
         prompt_layout.addLayout(form)
-        layout.addWidget(prompt_card)
-        self.generation_splitter.addWidget(middle)
+        top_layout.addWidget(prompt_card)
+        self.generation_splitter.addWidget(top)
 
         queue_card = QGroupBox("生成任务队列")
         queue_layout = QVBoxLayout(queue_card)
@@ -440,7 +456,7 @@ class TaskCenterPage(QWidget):
         self.queue_hint.setStyleSheet("color:#60708a;")
         queue_layout.addWidget(self.queue_hint)
         self.generation_splitter.addWidget(queue_card)
-        self.generation_splitter.setSizes([180, 410, 250])
+        self.generation_splitter.setSizes([420, 400])
         return self.generation_splitter
 
     def _build_candidate_panel(self) -> QWidget:
@@ -450,10 +466,16 @@ class TaskCenterPage(QWidget):
         self.result_title = QLabel("当前任务生成结果")
         self.result_title.setStyleSheet("font-size:16px;font-weight:700;")
         layout.addWidget(self.result_title)
-        toolbar = QHBoxLayout()
+        toolbar_host = QWidget()
+        toolbar_host.setMinimumHeight(29)
+        toolbar = QHBoxLayout(toolbar_host)
+        toolbar.setContentsMargins(0, 0, 0, 0)
         self.selection_label = QLabel("已选择 0 张最终图")
+        self.selection_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
         toolbar.addWidget(self.selection_label, 1)
-        layout.addLayout(toolbar)
+        layout.addWidget(toolbar_host)
         self.gallery = ResultGallery(self.resolver, checkable=True)
         self.gallery.list_widget.itemChanged.connect(self._selection_changed)
         layout.addWidget(self.gallery, 1)
@@ -727,6 +749,7 @@ class TaskCenterPage(QWidget):
         self._task_selected()
 
     def _task_selected(self) -> None:
+        self._remember_result_selection()
         row = self.task_table.currentRow()
         item = self.task_table.item(row, 0) if row >= 0 else None
         task_id = (
@@ -772,6 +795,10 @@ class TaskCenterPage(QWidget):
                 self.resolution_combo.findData(task.resolution)
             )
         self._load_results()
+        saved_selection = self.final_selections.get(task.id)
+        if saved_selection is not None:
+            self.gallery.set_selected_result_ids(saved_selection)
+            self._selection_changed()
         self._refresh_queue()
         self._update_controls()
 
@@ -1158,6 +1185,12 @@ class TaskCenterPage(QWidget):
         self.submit_button.setEnabled(
             can_work and not task_busy and bool(self.gallery.selected_result_ids())
         )
+        selected_count = len(self._selected_task_ids())
+        self.submit_button.setText(
+            f"提交验收（{selected_count}）"
+            if selected_count > 1
+            else "提交验收"
+        )
         self.retry_button.setEnabled(can_work)
         self.save_button.setEnabled(self.gallery.current_path() is not None)
         self.compare_button.setEnabled(self.gallery.current_path() is not None)
@@ -1398,9 +1431,36 @@ class TaskCenterPage(QWidget):
         self._selection_changed()
 
     def _selection_changed(self, *_args) -> None:
+        if self.current_task is not None:
+            self.final_selections[self.current_task.id] = tuple(
+                self.gallery.selected_result_ids()
+            )
         count = len(self.gallery.selected_result_ids())
         self.selection_label.setText(f"已选择 {count} 张最终图")
         self._update_controls()
+
+    def _remember_result_selection(self) -> None:
+        if self.current_task is None:
+            return
+        if self.gallery.task is None or self.gallery.task.id != self.current_task.id:
+            return
+        self.final_selections[self.current_task.id] = tuple(
+            self.gallery.selected_result_ids()
+        )
+
+    def _selected_task_ids(self) -> list[int]:
+        selected_rows = sorted(
+            index.row()
+            for index in self.task_table.selectionModel().selectedRows(0)
+        )
+        task_ids = []
+        for row in selected_rows:
+            item = self.task_table.item(row, 0)
+            if item is not None:
+                task_ids.append(
+                    int(item.data(Qt.ItemDataRole.UserRole))
+                )
+        return list(dict.fromkeys(task_ids))
 
     def _upload_manual(self) -> None:
         task = self.current_task
@@ -1618,30 +1678,62 @@ class TaskCenterPage(QWidget):
         self.refresh()
 
     def _submit(self) -> None:
-        task = self.current_task
-        if task is None:
+        current_task = self.current_task
+        if current_task is None:
             return
-        result_ids = self.gallery.selected_result_ids()
-        if not result_ids:
-            QMessageBox.warning(self, "未选择成品", "请至少选择一张最终图。")
+        self._remember_result_selection()
+        task_ids = self._selected_task_ids() or [current_task.id]
+        tasks = [
+            task
+            for task_id in task_ids
+            if (task := self._tasks_by_id.get(task_id)) is not None
+        ]
+        if not tasks:
             return
+        missing = [
+            task.task_code
+            for task in tasks
+            if not self.final_selections.get(task.id)
+        ]
+        if missing:
+            QMessageBox.warning(
+                self,
+                "部分子任务未选图",
+                "以下子任务还没有选择最终图：\n"
+                + "\n".join(missing[:10]),
+            )
+            return
+        total_images = sum(
+            len(self.final_selections[task.id])
+            for task in tasks
+        )
         answer = QMessageBox.question(
             self,
             "提交运营验收",
-            f"确认提交选中的 {len(result_ids)} 张图片吗？",
+            f"确认提交所选 {len(tasks)} 个子任务，"
+            f"共 {total_images} 张最终图吗？",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        try:
-            self.repository.submit_for_acceptance(
-                task.id,
-                self.actor,
-                final_result_ids=result_ids,
-                final_quantity=len(result_ids),
+        failures = []
+        for task in tasks:
+            result_ids = self.final_selections[task.id]
+            try:
+                self.repository.submit_for_acceptance(
+                    task.id,
+                    self.actor,
+                    final_result_ids=result_ids,
+                    final_quantity=len(result_ids),
+                )
+                self.final_selections.pop(task.id, None)
+            except Exception as exc:
+                failures.append(f"{task.task_code}：{exc}")
+        if failures:
+            QMessageBox.warning(
+                self,
+                "部分提交失败",
+                "\n".join(failures[:10]),
             )
-        except Exception as exc:
-            QMessageBox.warning(self, "提交失败", str(exc))
-            return
         self.refresh()
 
     def _refresh_templates(self) -> None:

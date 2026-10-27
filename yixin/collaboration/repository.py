@@ -62,6 +62,9 @@ from .types import (
 )
 
 SCHEMA_VERSION = 3
+LEGACY_SHARED_ROOT = (
+    r"\\fe80--211-32ff-fe87-ba49.ipv6-literal.net\AI作图"
+)
 
 
 class CentralRepositoryError(RuntimeError):
@@ -171,6 +174,7 @@ class MySQLCentralRepository:
                         cursor.execute(statement)
                     self._apply_schema_v2(cursor)
                     self._apply_schema_v3(cursor)
+                    self._apply_shared_root_update(cursor)
                     cursor.execute(
                         "INSERT IGNORE INTO schema_migrations(version, applied_at) "
                         "VALUES (%s, %s)",
@@ -293,6 +297,33 @@ class MySQLCentralRepository:
                     """,
                     (user["id"], menu_key),
                 )
+
+    @staticmethod
+    def _apply_shared_root_update(cursor) -> None:
+        cursor.execute(
+            """
+            SELECT value_json FROM shared_settings
+            WHERE setting_key = 'share_root'
+            LIMIT 1
+            """
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return
+        try:
+            current_root = json.loads(row["value_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        if str(current_root).casefold() != LEGACY_SHARED_ROOT.casefold():
+            return
+        cursor.execute(
+            """
+            UPDATE shared_settings
+            SET value_json = %s, updated_at = %s
+            WHERE setting_key = 'share_root'
+            """,
+            (json.dumps(SHARED_ROOT, ensure_ascii=False), utc_now()),
+        )
 
     def create_initial_admin(
         self,

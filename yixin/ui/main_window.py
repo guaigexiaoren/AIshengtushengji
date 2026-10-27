@@ -359,10 +359,6 @@ class MainWindow(QMainWindow):
         self.nav_list.setObjectName("NavList")
         layout.addWidget(self.nav_list)
         layout.addStretch(1)
-        note = QLabel("任务候选图保留 30 天")
-        note.setStyleSheet("color:#91a3bf;font-size:11px;")
-        note.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        layout.addWidget(note)
         if self.actor.role in (ROLE_AI, ROLE_ADMIN):
             settings = QPushButton("设置")
             settings.setObjectName("GhostButton")

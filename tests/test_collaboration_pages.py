@@ -13,9 +13,10 @@ HAS_PYSIDE = importlib.util.find_spec("PySide6") is not None
 
 if HAS_PYSIDE:
     from PIL import Image
-    from PySide6.QtCore import QDate, QPoint, Qt
+    from PySide6.QtCore import QDate, QItemSelectionModel, QPoint, Qt
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import (
+        QAbstractItemView,
         QApplication,
         QDialog,
         QFileDialog,
@@ -81,6 +82,7 @@ class FakeCentralRepository:
         self.skip_requests = []
         self.project_urgent_updates = []
         self.queued_attempts = []
+        self.submission_requests = []
 
     def create_project(self, _actor, draft):
         self.created_drafts.append(draft)
@@ -158,6 +160,9 @@ class FakeCentralRepository:
     def skip_remaining_subtasks(self, project_id, actor, *, reason):
         self.skip_requests.append((project_id, actor, reason))
         return 3
+
+    def submit_for_acceptance(self, task_id, actor, **kwargs):
+        self.submission_requests.append((task_id, actor, kwargs))
 
     def api_key_statuses(self):
         return {}
@@ -951,6 +956,12 @@ class CollaborationPageTests(unittest.TestCase):
             window.nav_list.item(index).text()
             for index in range(window.nav_list.count())
         ]
+        self.assertFalse(
+            any(
+                "任务候选图保留" in label.text()
+                for label in window.findChildren(QLabel)
+            )
+        )
         self.assertEqual(
             labels,
             ["新建任务", "已提交", "待审核", "已完成"],
@@ -1052,11 +1063,11 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.assertTrue(self.repository.project_urgent_updates[-1][2])
         self.assertTrue(submitted.urgent_button.isVisible())
-        self.assertTrue(submitted.preview_tabs.isTabVisible(1))
-        self.assertFalse(submitted.preview_tabs.isTabVisible(0))
+        self.assertTrue(submitted.result_panel.isHidden())
+        self.assertFalse(submitted.reference_panel.isHidden())
         self.assertFalse(submitted.review_actions.isVisible())
         self.assertEqual(
-            submitted.preview_tabs.tabText(1),
+            submitted.reference_header.text(),
             "参考图（3）",
         )
         self.assertEqual(submitted.reference_strip.count(), 3)
@@ -1118,37 +1129,37 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(pending.return_button.isVisible())
         self.assertTrue(pending.approve_button.isVisible())
         self.assertTrue(pending.view_results.isEnabled())
-        self.assertIs(
-            pending.preview_tabs.cornerWidget(
-                Qt.Corner.TopRightCorner
-            ),
-            pending.review_actions,
-        )
+        self.assertTrue(pending.review_actions.isVisible())
+        self.assertFalse(pending.result_panel.isHidden())
+        self.assertFalse(pending.reference_panel.isHidden())
         self.assertEqual(
             [
                 pending.view_results.text(),
                 pending.return_button.text(),
                 pending.approve_button.text(),
             ],
-            ["查看/对比成品", "退回返工", "验收通过"],
+            ["与原模特图对比", "退回返工", "验收通过"],
         )
         self.assertEqual(pending.task_table.columnCount(), 7)
-        self.assertTrue(pending.preview_tabs.isTabVisible(0))
-        self.assertTrue(pending.preview_tabs.isTabVisible(1))
         self.assertEqual(
-            pending.preview_tabs.tabText(0),
+            pending.result_header.text(),
             "结果图（1）",
         )
         self.assertEqual(
-            pending.preview_tabs.tabText(1),
+            pending.reference_header.text(),
             "参考图（3）",
         )
-        self.assertEqual(pending.preview_tabs.currentIndex(), 0)
         self.assertEqual(pending.result_gallery.list_widget.count(), 1)
         self.assertEqual(
             pending.result_gallery.preview.current_path,
             result_path.resolve(),
         )
+        with patch(
+            "yixin.ui.submission_list_page.CompareDialog"
+        ) as compare_dialog:
+            pending.view_results.click()
+        compare_dialog.assert_called_once()
+        compare_dialog.return_value.exec.assert_called_once_with()
         pending.close()
         pending.deleteLater()
 
@@ -1165,7 +1176,7 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(pending_empty.return_button.isEnabled())
         self.assertTrue(pending_empty.approve_button.isEnabled())
         self.assertEqual(
-            pending_empty.preview_tabs.tabText(0),
+            pending_empty.result_header.text(),
             "结果图（0）",
         )
         pending_empty.close()
@@ -1191,6 +1202,8 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertFalse(completed.return_button.isVisible())
         self.assertFalse(completed.approve_button.isVisible())
         self.assertFalse(completed.review_actions.isVisible())
+        self.assertFalse(completed.result_panel.isHidden())
+        self.assertFalse(completed.reference_panel.isHidden())
         self.assertEqual(completed.project_table.rowCount(), 1)
         self.assertEqual(completed.task_table.rowCount(), 1)
         self.assertEqual(
@@ -1392,10 +1405,39 @@ class CollaborationPageTests(unittest.TestCase):
             FileStore(AppPaths(self.root / "task-center-data")),
             AppSettings(Database(self.root / "task-center.db")),
         )
+        center.resize(1480, 900)
+        center.show()
+        self.app.processEvents()
+        center._sync_task_splitter_to_generation()
+        self.app.processEvents()
         self.assertFalse(hasattr(center, "task_detail"))
         self.assertEqual(center.source_title.text(), "子任务参考图")
+        self.assertEqual(
+            center.task_table.selectionMode(),
+            QAbstractItemView.SelectionMode.ExtendedSelection,
+        )
         self.assertTrue(center.local_source_hint.isHidden())
-        self.assertLessEqual(center.generation_splitter.sizes()[0], 190)
+        center._sync_task_splitter_to_generation()
+        self.assertEqual(
+            center.generation_splitter.sizes(),
+            center.task_splitter.sizes(),
+        )
+        self.assertLessEqual(
+            abs(
+                center.source_strip.mapTo(center, QPoint(0, 0)).y()
+                - center.gallery.list_widget.mapTo(
+                    center, QPoint(0, 0)
+                ).y()
+            ),
+            8,
+        )
+        self.assertLessEqual(
+            abs(
+                center.task_table.mapTo(center, QPoint(0, 0)).y()
+                - center.queue_table.mapTo(center, QPoint(0, 0)).y()
+            ),
+            12,
+        )
         self.assertEqual(center.source_strip.count(), 3)
         self.assertEqual(center.source_strip.currentRow(), 2)
         self.assertEqual(center.source_strip.item(0).text(), "衣服 1")
@@ -1424,7 +1466,7 @@ class CollaborationPageTests(unittest.TestCase):
             "结果数",
         )
         self.assertIs(
-            center.generation_splitter.widget(2).findChild(QTableWidget),
+            center.generation_splitter.widget(1).findChild(QTableWidget),
             center.queue_table,
         )
         self.assertEqual(center.project_filter_combo.count(), 2)
@@ -1698,6 +1740,112 @@ class CollaborationPageTests(unittest.TestCase):
         snapshot = center.local_store.load_attempt_snapshot(77)
         self.assertIsNotNone(snapshot)
         self.assertNotEqual(snapshot[0].content_hash, original_hash)
+        center.deleteLater()
+
+    def test_task_center_batch_submits_selected_subtasks(self) -> None:
+        write_task_images(self.root)
+        first = replace(
+            make_task("working"),
+            assignee_id=self.actor.id,
+            assignee_name=self.actor.display_name,
+        )
+        second = replace(
+            first,
+            id=12,
+            task_code="春季项目-123-001-002",
+        )
+        product_root = self.root / first.project_relative_root
+        results_by_task = {}
+        for task, result_id, color in (
+            (first, 101, "orange"),
+            (second, 102, "purple"),
+        ):
+            result_path = product_root / "AI成品" / f"{result_id}.png"
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (40, 50), color).save(result_path)
+            results_by_task[task.id] = [
+                GenerationResult(
+                    id=result_id,
+                    attempt_id=result_id,
+                    result_index=0,
+                    relative_path=result_path.relative_to(
+                        product_root
+                    ).as_posix(),
+                    thumbnail_relative_path=result_path.relative_to(
+                        product_root
+                    ).as_posix(),
+                    content_hash=f"{result_id:064d}",
+                    mime="image/png",
+                    width=40,
+                    height=50,
+                    is_final=False,
+                )
+            ]
+        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
+            first,
+            second,
+        ]
+        self.repository.list_results = lambda task_id: list(
+            results_by_task[task_id]
+        )
+        center = TaskCenterPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            NanoBananaClient(lambda: "test-key"),
+            type(
+                "KeyStore",
+                (),
+                {"load": staticmethod(lambda: "test-key")},
+            )(),
+            FileStore(AppPaths(self.root / "batch-submit-data")),
+            AppSettings(Database(self.root / "batch-submit.db")),
+        )
+        first_task_id = center.current_task.id
+        first_result_id = results_by_task[first_task_id][0].id
+        center.gallery.set_selected_result_ids((first_result_id,))
+        center._selection_changed()
+        other_row = next(
+            row
+            for row in range(center.task_table.rowCount())
+            if int(
+                center.task_table.item(row, 0).data(
+                    Qt.ItemDataRole.UserRole
+                )
+            )
+            != first_task_id
+        )
+        center.task_table.setCurrentCell(
+            other_row,
+            0,
+            QItemSelectionModel.SelectionFlag.Select
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+        center._task_selected()
+        second_task_id = center.current_task.id
+        second_result_id = results_by_task[second_task_id][0].id
+        center.gallery.set_selected_result_ids((second_result_id,))
+        center._selection_changed()
+        self.assertCountEqual(center._selected_task_ids(), [11, 12])
+        with (
+            patch(
+                "yixin.ui.task_center_page.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(center, "refresh"),
+        ):
+            center._submit()
+        submitted = {
+            request[0]: request[2]["final_result_ids"]
+            for request in self.repository.submission_requests
+        }
+        self.assertEqual(
+            submitted,
+            {
+                first_task_id: (first_result_id,),
+                second_task_id: (second_result_id,),
+            },
+        )
         center.deleteLater()
 
     def test_task_center_default_prompt_and_two_column_parameters(self) -> None:

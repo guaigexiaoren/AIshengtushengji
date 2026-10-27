@@ -11,7 +11,7 @@ DATABASE = {
 }
 
 SHARED_ROOT = (
-    r"\\fe80--211-32ff-fe87-ba49.ipv6-literal.net\AI作图"
+    r"\\10.6.6.6\AI作图"
 )
 
 # The application must be able to decrypt account API keys on every AI client.

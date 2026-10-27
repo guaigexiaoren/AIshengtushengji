@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -36,8 +35,9 @@ from ..collaboration.types import (
     ProjectTask,
 )
 from ..time_utils import utc_naive_to_local
-from .result_gallery import ResultGallery, ResultGalleryDialog
+from .result_gallery import ResultGallery
 from .date_filter import OptionalDateEdit
+from .dialogs import CompareDialog
 from .subtask_source_dialog import SubtaskSourceDialog
 from .widgets import ImageStrip, ImageView
 
@@ -185,30 +185,23 @@ class SubmissionListPage(QWidget):
         left_layout.addWidget(self.info_line)
         body.addWidget(left)
 
-        self.view_results = QPushButton("查看/对比成品")
+        self.view_results = QPushButton("与原模特图对比")
         self.return_button = QPushButton("退回返工")
         self.approve_button = QPushButton("验收通过")
         self.approve_button.setObjectName("PrimaryButton")
-        self.view_results.clicked.connect(self._show_results)
+        self.view_results.clicked.connect(self._compare_current_result)
         self.return_button.clicked.connect(self._return_task)
         self.approve_button.clicked.connect(self._approve_task)
 
         preview_panel = QWidget()
         preview_layout = QVBoxLayout(preview_panel)
         preview_layout.setContentsMargins(0, 0, 0, 0)
-        self.result_gallery = ResultGallery(self.resolver)
-        self.preview_tabs = QTabWidget()
-        self.preview_tabs.addTab(self.result_gallery, "结果图（0）")
-        self.preview_tabs.addTab(
-            self._build_reference_preview(),
-            "参考图（0）",
-        )
-        preview_layout.addWidget(self.preview_tabs, 1)
 
         self.review_actions = QWidget()
         actions = QHBoxLayout(self.review_actions)
         actions.setContentsMargins(0, 0, 0, 0)
         actions.setSpacing(4)
+        actions.addStretch(1)
         for button in (
             self.view_results,
             self.return_button,
@@ -217,15 +210,19 @@ class SubmissionListPage(QWidget):
             button.setVisible(self.view_mode == "pending")
             actions.addWidget(button)
         self.review_actions.setVisible(self.view_mode == "pending")
-        self.preview_tabs.setCornerWidget(
-            self.review_actions,
-            Qt.Corner.TopRightCorner,
-        )
+        preview_layout.addWidget(self.review_actions)
+
+        self.preview_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.result_panel = self._build_result_preview()
+        self.reference_panel = self._build_reference_preview()
+        self.preview_splitter.addWidget(self.result_panel)
+        self.preview_splitter.addWidget(self.reference_panel)
+        self.preview_splitter.setSizes([300, 300])
+        preview_layout.addWidget(self.preview_splitter, 1)
         if self.view_mode == "submitted":
-            self.preview_tabs.setTabVisible(0, False)
-            self.preview_tabs.setCurrentIndex(1)
+            self.result_panel.hide()
         body.addWidget(preview_panel)
-        body.setSizes([760, 440])
+        body.setSizes([700, 620])
         outer.addWidget(body, 1)
         self.search_edit.textChanged.connect(self._apply_filters)
         self.start_date_edit.dateChanged.connect(self._apply_filters)
@@ -236,9 +233,24 @@ class SubmissionListPage(QWidget):
     def _optional_date_edit(placeholder: str) -> OptionalDateEdit:
         return OptionalDateEdit(placeholder)
 
+    def _build_result_preview(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 6, 0)
+        self.result_header = QLabel("结果图（0）")
+        self.result_header.setStyleSheet("font-weight:700;color:#1f2d43;")
+        layout.addWidget(self.result_header)
+        self.result_gallery = ResultGallery(self.resolver)
+        layout.addWidget(self.result_gallery, 1)
+        return widget
+
     def _build_reference_preview(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(6, 0, 0, 0)
+        self.reference_header = QLabel("参考图（0）")
+        self.reference_header.setStyleSheet("font-weight:700;color:#1f2d43;")
+        layout.addWidget(self.reference_header)
         self.reference_strip = ImageStrip(icon_size=96)
         self.reference_preview = ImageView()
         self.reference_preview.set_placeholder("选择参考图查看大图")
@@ -359,7 +371,7 @@ class SubmissionListPage(QWidget):
                 self._empty_task(),
                 [],
             )
-            self._update_preview_tab_counts()
+            self._update_preview_counts()
         self._update_actions()
 
     def _current_project(self) -> ProjectRecord | None:
@@ -484,7 +496,7 @@ class SubmissionListPage(QWidget):
             self.reference_preview.set_placeholder("尚未选择任务")
             if self.view_mode != "submitted":
                 self.result_gallery.clear()
-            self._update_preview_tab_counts()
+            self._update_preview_counts()
             self._update_actions()
             return
         self.info_line.setText(
@@ -499,7 +511,7 @@ class SubmissionListPage(QWidget):
                 task,
                 self.repository.list_results(task.id),
             )
-        self._update_preview_tab_counts()
+        self._update_preview_counts()
         self._update_actions()
 
     def _set_reference_preview(self, task: ProjectTask) -> None:
@@ -517,16 +529,14 @@ class SubmissionListPage(QWidget):
         items.append((model_path, "模特", model_path))
         self.reference_strip.set_images(items)
         self.reference_strip.setCurrentRow(len(items) - 1)
-        self._update_preview_tab_counts()
+        self._update_preview_counts()
 
-    def _update_preview_tab_counts(self) -> None:
-        self.preview_tabs.setTabText(
-            0,
-            f"结果图（{self.result_gallery.list_widget.count()}）",
+    def _update_preview_counts(self) -> None:
+        self.result_header.setText(
+            f"结果图（{self.result_gallery.list_widget.count()}）"
         )
-        self.preview_tabs.setTabText(
-            1,
-            f"参考图（{self.reference_strip.count()}）",
+        self.reference_header.setText(
+            f"参考图（{self.reference_strip.count()}）"
         )
 
     def _show_reference_image(self, row: int) -> None:
@@ -608,15 +618,21 @@ class SubmissionListPage(QWidget):
             return
         self.refresh()
 
-    def _show_results(self) -> None:
+    def _compare_current_result(self) -> None:
         task = self._current_task()
-        if task is None:
+        result_path = self.result_gallery.current_path()
+        if task is None or result_path is None:
             return
-        ResultGalleryDialog(
-            self.resolver,
-            task,
-            self.repository.list_results(task.id),
-            self,
+        model_path = self.resolver.resolve_project_path(
+            task.project_relative_root,
+            task.model_path,
+        )
+        CompareDialog(
+            model_path,
+            result_path,
+            left_label="原模特图",
+            right_label="生成成品",
+            parent=self,
         ).exec()
 
     def _approve_task(self) -> None:
