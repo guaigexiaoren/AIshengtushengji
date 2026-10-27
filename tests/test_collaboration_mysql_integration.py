@@ -62,6 +62,8 @@ class MySQLIntegrationTests(unittest.TestCase):
                 "集成运营",
                 "operations",
                 "TempOps123",
+                urgent_quota_per_day=2,
+                project_access=(("internal", "集成项目"),),
             )
             ai_one = repository.create_user(
                 "_integration_ai1",
@@ -81,6 +83,14 @@ class MySQLIntegrationTests(unittest.TestCase):
                 operator.id,
                 urgent_quota_per_day=2,
                 max_generation_concurrency=2,
+            )
+            self.assertNotIn(
+                "task_center",
+                repository.user_menu_permissions(operator.id),
+            )
+            self.assertEqual(
+                repository.list_accessible_projects(operator),
+                (("internal", "集成项目"),),
             )
             repository.save_api_key(
                 admin,
@@ -103,7 +113,7 @@ class MySQLIntegrationTests(unittest.TestCase):
                     name="集成测试",
                     deadline=datetime.now() + timedelta(days=1),
                     priority="normal",
-                    project_relative_root="_integration_project",
+                    project_relative_root="内部项目/集成项目/_integration_project",
                     pairing_mode="filename",
                     assets=(
                         ProjectAssetInput(
@@ -162,8 +172,15 @@ class MySQLIntegrationTests(unittest.TestCase):
                     ),
                     source_date=date.today(),
                     product_code="集成货号",
+                    project_scope="internal",
+                    access_project_name="集成项目",
                 ),
             )
+            repository.set_project_urgent(project_id, operator, True)
+            self.assertTrue(repository.get_project(project_id).is_urgent)
+            repository.set_project_urgent(project_id, operator, False)
+            self.assertFalse(repository.get_project(project_id).is_urgent)
+            repository.set_project_urgent(project_id, operator, True)
             project = repository.get_project(project_id)
             self.assertRegex(
                 project.project_code,

@@ -15,6 +15,56 @@ ROLE_LABELS = {
     ROLE_ADMIN: "管理员",
 }
 
+MENU_KEYS = {
+    "new_task": "新建任务",
+    "submitted": "已提交",
+    "pending": "待审核",
+    "completed": "已完成",
+    "task_center": "任务中心",
+    "create": "普通创作",
+    "batch": "批量换装",
+    "history": "历史记录",
+    "library": "作品库",
+    "admin": "管理控制台",
+}
+ROLE_DEFAULT_MENUS = {
+    ROLE_OPERATIONS: (
+        "new_task",
+        "submitted",
+        "pending",
+        "completed",
+    ),
+    ROLE_AI: (
+        "new_task",
+        "submitted",
+        "pending",
+        "completed",
+        "task_center",
+        "create",
+        "batch",
+        "history",
+        "library",
+    ),
+    ROLE_ADMIN: tuple(MENU_KEYS),
+}
+ROLE_ALLOWED_MENUS = {
+    ROLE_OPERATIONS: (
+        "new_task",
+        "submitted",
+        "pending",
+        "completed",
+        "task_center",
+    ),
+    ROLE_AI: ROLE_DEFAULT_MENUS[ROLE_AI],
+    ROLE_ADMIN: ROLE_DEFAULT_MENUS[ROLE_ADMIN],
+}
+
+PROJECT_SCOPES = ("internal", "external")
+PROJECT_SCOPE_LABELS = {
+    "internal": "内部项目",
+    "external": "外部项目",
+}
+
 PROJECT_SUBMITTED = "submitted"
 PROJECT_IN_PROGRESS = "in_progress"
 PROJECT_AWAITING_ACCEPTANCE = "awaiting_acceptance"
@@ -80,6 +130,8 @@ class AuthUser:
     is_active: bool = True
     urgent_quota_per_day: int = 3
     max_generation_concurrency: int = 2
+    menu_permissions: tuple[str, ...] = ()
+    project_access: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -114,6 +166,9 @@ class ProjectDraft:
     note: str = ""
     source_date: date | None = None
     product_code: str = ""
+    project_scope: str = "internal"
+    access_project_name: str = ""
+    is_urgent: bool = False
 
 
 @dataclass(frozen=True)
@@ -139,6 +194,11 @@ class ProjectRecord:
     product_code: str = ""
     source_date: date | None = None
     urgent_count: int = 0
+    project_scope: str = "internal"
+    project_name: str = ""
+    is_urgent: bool = False
+    urgent_date: date | None = None
+    urgent_by: int | None = None
 
 
 @dataclass(frozen=True)
@@ -168,6 +228,7 @@ class ProjectTask:
     final_quantity: int
     owner_id: int
     created_at: datetime
+    updated_at: datetime | None = None
     claimed_at: datetime | None = None
     work_started_at: datetime | None = None
     submitted_at: datetime | None = None
@@ -182,6 +243,9 @@ class ProjectTask:
     is_urgent: bool = False
     urgent_date: date | None = None
     urgent_by: int | None = None
+    project_scope: str = "internal"
+    access_project_name: str = ""
+    project_is_urgent: bool = False
 
 
 @dataclass(frozen=True)

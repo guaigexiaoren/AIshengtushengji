@@ -99,6 +99,7 @@ def run() -> int:
             return 0
         actor = login.user
         repository = login.repository
+        actor = repository.load_user_access(actor)
         repository.recover_stale_generation_attempts()
         shared_root = repository.get_shared_setting("share_root")
         resolver = SharedPathResolver(Path(shared_root or SHARED_ROOT))

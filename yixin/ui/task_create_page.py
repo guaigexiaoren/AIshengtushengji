@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import QRect, QSize, Qt, Signal
-from PySide6.QtGui import QIcon, QMouseEvent
+from PySide6.QtGui import QDragEnterEvent, QDropEvent, QIcon, QMouseEvent
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -34,7 +35,6 @@ from PySide6.QtWidgets import (
 
 from ..collaboration.folders import (
     AccountDirectory,
-    default_account_directory,
     natural_sort_key,
     project_assets,
     resolve_account_directory,
@@ -51,9 +51,10 @@ from ..collaboration.types import (
     AuthUser,
     PairingInput,
     ProjectDraft,
+    PROJECT_SCOPE_LABELS,
 )
 from ..storage import SUPPORTED_IMAGE_SUFFIXES, atomic_copy_file, image_metadata
-from .widgets import load_scaled_pixmap
+from .widgets import load_scaled_pixmap, scan_image_inputs
 
 
 @dataclass
@@ -65,6 +66,39 @@ class ProductDraftState:
     errors: list[str] = field(default_factory=list)
     manual_pairs: list[PairingInput] = field(default_factory=list)
     existing_tasks: list = field(default_factory=list)
+
+
+class DroppableImageList(QListWidget):
+    files_dropped = Signal(list)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+
+    @staticmethod
+    def _local_paths(event) -> list[Path]:
+        mime = event.mimeData()
+        if not mime.hasUrls():
+            return []
+        return [
+            Path(url.toLocalFile())
+            for url in mime.urls()
+            if url.isLocalFile() and url.toLocalFile()
+        ]
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if self._local_paths(event):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        paths = self._local_paths(event)
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
 
 
 class CheckableHeaderView(QHeaderView):
@@ -276,6 +310,7 @@ class TaskCreatePage(QWidget):
         self.states: dict[str, ProductDraftState] = {}
         self.current_state: ProductDraftState | None = None
         self.account_directory: AccountDirectory | None = None
+        self.accessible_projects: tuple[tuple[str, str], ...] = ()
         self.pair_cards: list[PairPreviewCard] = []
         self.selected_pair_model_index: int | None = None
         self._build()
@@ -300,6 +335,14 @@ class TaskCreatePage(QWidget):
 
         path_card = QGroupBox("账号目录")
         path_layout = QVBoxLayout(path_card)
+        project_row = QHBoxLayout()
+        self.project_combo = QComboBox()
+        self.project_combo.currentIndexChanged.connect(
+            self._project_changed
+        )
+        project_row.addWidget(QLabel("当前项目"))
+        project_row.addWidget(self.project_combo, 1)
+        path_layout.addLayout(project_row)
         self.account_path = QLineEdit()
         self.account_path.returnPressed.connect(self.refresh)
         choose_directory = QPushButton("选择目录")
@@ -434,6 +477,8 @@ class TaskCreatePage(QWidget):
         )
         footer.addWidget(self.note_edit, 1)
         footer.addStretch(1)
+        self.urgent_checkbox = QCheckBox("设为加急")
+        footer.addWidget(self.urgent_checkbox)
         self.create_button = QPushButton("创建所选任务")
         self.create_button.setObjectName("PrimaryButton")
         self.create_button.setMinimumHeight(42)
@@ -460,7 +505,7 @@ class TaskCreatePage(QWidget):
         for button in (add_folder, add_images, remove, clear):
             buttons.addWidget(button)
         layout.addLayout(buttons)
-        images = QListWidget()
+        images = DroppableImageList()
         images.setViewMode(QListWidget.ViewMode.IconMode)
         images.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
@@ -469,6 +514,9 @@ class TaskCreatePage(QWidget):
         images.setGridSize(QSize(120, 125))
         images.setResizeMode(QListWidget.ResizeMode.Adjust)
         images.setMinimumHeight(145)
+        images.files_dropped.connect(
+            lambda paths: self._handle_image_drop(role, paths)
+        )
         layout.addWidget(images)
         return images, box
 
@@ -476,22 +524,51 @@ class TaskCreatePage(QWidget):
         shared_root = self.repository.get_shared_setting("share_root")
         if shared_root:
             self.resolver = SharedPathResolver(shared_root)
+        self._load_project_choices()
+        project = self.project_combo.currentData()
+        if not project:
+            self.scan_summary.setText(
+                "尚未分配项目，请联系管理员在账号编辑中分配"
+            )
+            self.product_table.setRowCount(0)
+            self.states = {}
+            self.current_state = None
+            self.garment_list.clear()
+            self.model_list.clear()
+            self._clear_pair_preview()
+            self.create_button.setEnabled(False)
+            return
+        self.create_button.setEnabled(
+            self.actor.role in (ROLE_OPERATIONS, ROLE_ADMIN)
+        )
+        scope, project_name = project
+        project_root = (
+            self.resolver.root
+            / PROJECT_SCOPE_LABELS[scope]
+            / project_name
+        )
         raw_path = self.account_path.text().strip()
         if not raw_path:
             raw_path = str(
-                default_account_directory(
-                    self.resolver.root,
-                    self.actor.display_name,
-                )
+                project_root / f"{date.today().month}.{date.today().day}"
             )
         try:
             account_directory = resolve_account_directory(
                 raw_path,
-                self.resolver.root,
+                project_root,
             )
             account_directory.path.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
-            QMessageBox.warning(self, "无法访问共享盘", str(exc))
+            self.account_directory = None
+            self.states = {}
+            self.current_state = None
+            self.product_table.setRowCount(0)
+            self.create_button.setEnabled(False)
+            QMessageBox.warning(
+                self,
+                "无法访问共享盘",
+                f"路径：{raw_path}\n{exc}",
+            )
             return
         self.account_path.setText(str(account_directory.path))
         self.account_directory = account_directory
@@ -506,6 +583,43 @@ class TaskCreatePage(QWidget):
             )
             self.date_hint.setStyleSheet("color:#b25a24;")
         self._scan_directory()
+
+    def _load_project_choices(self) -> None:
+        selected = self.project_combo.currentData()
+        try:
+            self.accessible_projects = self.repository.list_accessible_projects(
+                self.actor
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "读取项目失败", str(exc))
+            self.accessible_projects = ()
+        self.project_combo.blockSignals(True)
+        self.project_combo.clear()
+        for scope, project_name in self.accessible_projects:
+            self.project_combo.addItem(
+                f"{PROJECT_SCOPE_LABELS[scope]} · {project_name}",
+                (scope, project_name),
+            )
+        index = self.project_combo.findData(selected)
+        if index < 0 and self.project_combo.count():
+            index = 0
+        if index >= 0:
+            self.project_combo.setCurrentIndex(index)
+        self.project_combo.blockSignals(False)
+
+    def _project_changed(self) -> None:
+        project = self.project_combo.currentData()
+        if not project:
+            return
+        scope, project_name = project
+        directory = (
+            self.resolver.root
+            / PROJECT_SCOPE_LABELS[scope]
+            / project_name
+            / f"{date.today().month}.{date.today().day}"
+        )
+        self.account_path.setText(str(directory))
+        self.refresh()
 
     def _choose_directory(self) -> None:
         selected = QFileDialog.getExistingDirectory(
@@ -756,6 +870,25 @@ class TaskCreatePage(QWidget):
             QMessageBox.information(self, "导入结果", "没有新增图片。")
         self._show_state()
 
+    def _handle_image_drop(self, role: str, raw_paths: list) -> None:
+        if self.current_state is None:
+            QMessageBox.information(
+                self,
+                "请选择货号",
+                "请先在列表中选择一个货号。",
+            )
+            return
+        paths, errors = scan_image_inputs(
+            [Path(path) for path in raw_paths]
+        )
+        if errors:
+            QMessageBox.warning(
+                self,
+                "部分图片未导入",
+                "\n".join(errors[:8]),
+            )
+        self._import_paths(role, paths)
+
     def _add_folder(self, role: str) -> None:
         state = self.current_state
         if state is None:
@@ -954,6 +1087,37 @@ class TaskCreatePage(QWidget):
         account_directory = self.account_directory
         if account_directory is None:
             return
+        selected_project = self.project_combo.currentData()
+        if not selected_project:
+            QMessageBox.warning(
+                self,
+                "缺少项目",
+                "请先选择管理员分配的项目。",
+            )
+            return
+        project_scope, project_name = selected_project
+        is_urgent = self.urgent_checkbox.isChecked()
+        if is_urgent:
+            new_urgent_count = sum(
+                1
+                for code in codes
+                if not (
+                    self.states[code].existing_tasks
+                    and self.states[code].existing_tasks[0].is_urgent
+                )
+            )
+            remaining = self.repository.remaining_urgent_quota(
+                self.actor,
+                date.today(),
+            )
+            if remaining < new_urgent_count:
+                QMessageBox.warning(
+                    self,
+                    "加急额度不足",
+                    f"本次需要新增 {new_urgent_count} 个加急主任务，"
+                    f"今日仅剩 {remaining} 个加急额度。",
+                )
+                return
         answer = QMessageBox.question(
             self,
             "确认创建",
@@ -997,6 +1161,9 @@ class TaskCreatePage(QWidget):
                     note=self.note_edit.text().strip(),
                     source_date=account_directory.source_date,
                     product_code=state.product_code,
+                    project_scope=project_scope,
+                    access_project_name=project_name,
+                    is_urgent=is_urgent,
                 )
                 existing = state.existing_tasks[0] if state.existing_tasks else None
                 action = self._duplicate_action(existing) if existing else "new"
@@ -1014,8 +1181,16 @@ class TaskCreatePage(QWidget):
                         self.actor,
                         draft,
                     )
+                    self.repository.set_project_urgent(
+                        existing.id,
+                        self.actor,
+                        is_urgent,
+                    )
                 else:
-                    self.repository.create_project(self.actor, draft)
+                    self.repository.create_project(
+                        self.actor,
+                        draft,
+                    )
                 created += 1
         except Exception as exc:
             QMessageBox.warning(self, "创建失败", str(exc))

@@ -56,9 +56,12 @@ from .types import (
     ProjectDraft,
     ProjectRecord,
     ProjectTask,
+    PROJECT_SCOPES,
+    ROLE_DEFAULT_MENUS,
+    ROLE_ALLOWED_MENUS,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class CentralRepositoryError(RuntimeError):
@@ -167,6 +170,7 @@ class MySQLCentralRepository:
                     for statement in _split_sql(schema):
                         cursor.execute(statement)
                     self._apply_schema_v2(cursor)
+                    self._apply_schema_v3(cursor)
                     cursor.execute(
                         "INSERT IGNORE INTO schema_migrations(version, applied_at) "
                         "VALUES (%s, %s)",
@@ -252,6 +256,44 @@ class MySQLCentralRepository:
             (json.dumps(SHARED_ROOT, ensure_ascii=False), utc_now()),
         )
 
+    @staticmethod
+    def _apply_schema_v3(cursor) -> None:
+        cursor.execute(
+            "SELECT COALESCE(MAX(version), 0) AS version "
+            "FROM schema_migrations"
+        )
+        previous_version = int(cursor.fetchone()["version"])
+        project_columns = {
+            "project_scope": "VARCHAR(24) NOT NULL DEFAULT 'internal'",
+            "project_name": "VARCHAR(200) NOT NULL DEFAULT ''",
+            "is_urgent": "TINYINT(1) NOT NULL DEFAULT 0",
+            "urgent_date": "DATE NULL",
+            "urgent_by": "BIGINT UNSIGNED NULL",
+        }
+        for column, definition in project_columns.items():
+            _add_column_if_missing(cursor, "projects", column, definition)
+        cursor.execute(
+            """
+            UPDATE projects
+            SET project_name = CASE
+                WHEN project_name = '' THEN COALESCE(NULLIF(product_code, ''), name)
+                ELSE project_name
+            END
+            """
+        )
+        if previous_version >= SCHEMA_VERSION:
+            return
+        cursor.execute("SELECT id, role FROM users")
+        for user in cursor.fetchall():
+            for menu_key in ROLE_DEFAULT_MENUS.get(user["role"], ()):
+                cursor.execute(
+                    """
+                    INSERT IGNORE INTO user_menu_permissions(user_id, menu_key)
+                    VALUES (%s, %s)
+                    """,
+                    (user["id"], menu_key),
+                )
+
     def create_initial_admin(
         self,
         username: str,
@@ -271,6 +313,11 @@ class MySQLCentralRepository:
                     ROLE_ADMIN,
                     password,
                     must_change_password=True,
+                )
+                self._seed_user_menu_permissions(
+                    cursor,
+                    user_id,
+                    ROLE_ADMIN,
                 )
                 self._seed_defaults(cursor)
         return AuthUser(
@@ -342,12 +389,130 @@ class MySQLCentralRepository:
                 cursor.execute(query, params)
                 return [_auth_user(row) for row in cursor.fetchall()]
 
+    def load_user_access(self, user: AuthUser) -> AuthUser:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT menu_key FROM user_menu_permissions
+                    WHERE user_id = %s ORDER BY menu_key
+                    """,
+                    (user.id,),
+                )
+                menus = tuple(
+                    row["menu_key"] for row in cursor.fetchall()
+                )
+                cursor.execute(
+                    """
+                    SELECT project_scope, project_name
+                    FROM user_project_access
+                    WHERE user_id = %s
+                    ORDER BY project_scope, project_name
+                    """,
+                    (user.id,),
+                )
+                projects = tuple(
+                    (row["project_scope"], row["project_name"])
+                    for row in cursor.fetchall()
+                )
+        return AuthUser(
+            id=user.id,
+            username=user.username,
+            display_name=user.display_name,
+            role=user.role,
+            must_change_password=user.must_change_password,
+            is_active=user.is_active,
+            urgent_quota_per_day=user.urgent_quota_per_day,
+            max_generation_concurrency=user.max_generation_concurrency,
+            menu_permissions=menus,
+            project_access=projects,
+        )
+
+    def user_menu_permissions(self, user_id: int) -> tuple[str, ...]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT menu_key FROM user_menu_permissions
+                    WHERE user_id = %s ORDER BY menu_key
+                    """,
+                    (user_id,),
+                )
+                return tuple(
+                    row["menu_key"] for row in cursor.fetchall()
+                )
+
+    def user_project_access(
+        self,
+        user_id: int,
+    ) -> tuple[tuple[str, str], ...]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT project_scope, project_name
+                    FROM user_project_access
+                    WHERE user_id = %s
+                    ORDER BY project_scope, project_name
+                    """,
+                    (user_id,),
+                )
+                return tuple(
+                    (row["project_scope"], row["project_name"])
+                    for row in cursor.fetchall()
+                )
+
+    def list_shared_projects(self) -> dict[str, tuple[str, ...]]:
+        root = Path(
+            self.get_shared_setting("share_root") or SHARED_ROOT
+        ).expanduser()
+        result: dict[str, tuple[str, ...]] = {}
+        for scope, folder_name in (
+            ("internal", "内部项目"),
+            ("external", "外部项目"),
+        ):
+            folder = root / folder_name
+            names = (
+                tuple(
+                    sorted(
+                        (
+                            path.name
+                            for path in folder.iterdir()
+                            if path.is_dir()
+                        ),
+                        key=str.casefold,
+                    )
+                )
+                if folder.is_dir()
+                else ()
+            )
+            result[scope] = names
+        return result
+
+    def list_accessible_projects(
+        self,
+        actor: AuthUser,
+    ) -> tuple[tuple[str, str], ...]:
+        if actor.role == ROLE_OPERATIONS:
+            return actor.project_access or self.user_project_access(actor.id)
+        discovered = self.list_shared_projects()
+        return tuple(
+            (scope, name)
+            for scope in PROJECT_SCOPES
+            for name in discovered.get(scope, ())
+        )
+
     def create_user(
         self,
         username: str,
         display_name: str,
         role: str,
         temporary_password: str,
+        *,
+        urgent_quota_per_day: int = 3,
+        max_generation_concurrency: int = 2,
+        menu_permissions: Sequence[str] | None = None,
+        project_access: Sequence[tuple[str, str]] | None = None,
     ) -> AuthUser:
         username = username.strip()
         display_name = _validate_display_name(display_name)
@@ -357,6 +522,10 @@ class MySQLCentralRepository:
             raise ValueError("姓名不能为空")
         if role not in ROLES:
             raise ValueError("不支持的账号角色")
+        if not 0 <= urgent_quota_per_day <= 99:
+            raise ValueError("加急额度必须在 0 到 99 之间")
+        if not 1 <= max_generation_concurrency <= 10:
+            raise ValueError("生成并发数必须在 1 到 10 之间")
         validate_new_password(temporary_password)
         try:
             with self.connection() as connection:
@@ -368,16 +537,73 @@ class MySQLCentralRepository:
                     if cursor.fetchone() is not None:
                         raise StateConflictError("显示名称或项目名已被其他账号使用")
                     user_id = self._insert_user(
-                        cursor,
-                        username,
-                        display_name,
-                        role,
-                        temporary_password,
-                        must_change_password=True,
+                cursor,
+                username,
+                display_name,
+                role,
+                temporary_password,
+                must_change_password=True,
+            )
+            cursor.execute(
+                """
+                UPDATE users
+                SET urgent_quota_per_day = %s,
+                    max_generation_concurrency = %s
+                WHERE id = %s
+                """,
+                (
+                    urgent_quota_per_day,
+                    max_generation_concurrency,
+                    user_id,
+                ),
+            )
+            selected_menus = (
+                tuple(
+                    dict.fromkeys(
+                        key
+                        for key in menu_permissions
+                        if key in ROLE_ALLOWED_MENUS.get(role, ())
                     )
+                )
+                if menu_permissions is not None
+                else ROLE_DEFAULT_MENUS.get(role, ())
+            )
+            for menu_key in selected_menus:
+                cursor.execute(
+                    """
+                    INSERT INTO user_menu_permissions(user_id, menu_key)
+                    VALUES (%s, %s)
+                    """,
+                    (user_id, menu_key),
+                )
+            for scope, project_name in dict.fromkeys(project_access or ()):
+                if (
+                    scope not in PROJECT_SCOPES
+                    or not str(project_name).strip()
+                ):
+                    continue
+                cursor.execute(
+                    """
+                    INSERT INTO user_project_access(
+                        user_id, project_scope, project_name
+                    ) VALUES (%s, %s, %s)
+                    """,
+                    (user_id, scope, str(project_name).strip()),
+                )
         except pymysql.err.IntegrityError as exc:
             raise StateConflictError("账号已存在") from exc
-        return AuthUser(user_id, username, display_name, role, True, True)
+        return AuthUser(
+            user_id,
+            username,
+            display_name,
+            role,
+            True,
+            True,
+            urgent_quota_per_day,
+            max_generation_concurrency,
+            selected_menus,
+            tuple(dict.fromkeys(project_access or ())),
+        )
 
     def set_user_active(self, user_id: int, active: bool) -> None:
         with self.connection() as connection:
@@ -460,6 +686,8 @@ class MySQLCentralRepository:
         is_active: bool,
         urgent_quota_per_day: int,
         max_generation_concurrency: int,
+        menu_permissions: Sequence[str] | None = None,
+        project_access: Sequence[tuple[str, str]] | None = None,
     ) -> None:
         if actor.role != ROLE_ADMIN:
             raise PermissionDeniedError("只有管理员可以编辑账号")
@@ -533,6 +761,50 @@ class MySQLCentralRepository:
                             user_id,
                         ),
                     )
+                    if menu_permissions is not None:
+                        allowed = ROLE_ALLOWED_MENUS.get(role, ())
+                        selected = tuple(
+                            key
+                            for key in dict.fromkeys(menu_permissions)
+                            if key in allowed
+                        )
+                        cursor.execute(
+                            "DELETE FROM user_menu_permissions WHERE user_id = %s",
+                            (user_id,),
+                        )
+                        for menu_key in selected:
+                            cursor.execute(
+                                """
+                                INSERT INTO user_menu_permissions(
+                                    user_id, menu_key
+                                ) VALUES (%s, %s)
+                                """,
+                                (user_id, menu_key),
+                            )
+                    if project_access is not None:
+                        selected_projects = tuple(
+                            dict.fromkeys(
+                                (
+                                    str(scope),
+                                    str(name).strip(),
+                                )
+                                for scope, name in project_access
+                                if scope in PROJECT_SCOPES and str(name).strip()
+                            )
+                        )
+                        cursor.execute(
+                            "DELETE FROM user_project_access WHERE user_id = %s",
+                            (user_id,),
+                        )
+                        for scope, name in selected_projects:
+                            cursor.execute(
+                                """
+                                INSERT INTO user_project_access(
+                                    user_id, project_scope, project_name
+                                ) VALUES (%s, %s, %s)
+                                """,
+                                (user_id, scope, name),
+                            )
         except pymysql.err.IntegrityError as exc:
             raise StateConflictError("账号或显示名称已存在") from exc
 
@@ -647,9 +919,21 @@ class MySQLCentralRepository:
             or draft.name.strip()
             or Path(draft.project_relative_root).name
         )
+        access_project_name = (
+            draft.access_project_name.strip() or product_code
+        )
+        if draft.project_scope not in PROJECT_SCOPES:
+            raise ValueError("项目类型不正确")
         try:
             with self.connection() as connection:
                 with connection.cursor() as cursor:
+                    if actor.role == ROLE_OPERATIONS:
+                        self._assert_project_access(
+                            cursor,
+                            actor.id,
+                            draft.project_scope,
+                            access_project_name,
+                        )
                     task_code = draft.project_code.strip()
                     if not task_code:
                         while True:
@@ -670,16 +954,38 @@ class MySQLCentralRepository:
                     deadline = local_to_utc_naive(
                         datetime.combine(source_date, time.max)
                     )
+                    if draft.is_urgent:
+                        urgent_day = date.today()
+                        cursor.execute(
+                            "SELECT urgent_quota_per_day FROM users "
+                            "WHERE id = %s FOR UPDATE",
+                            (actor.id,),
+                        )
+                        quota = int(cursor.fetchone()["urgent_quota_per_day"])
+                        cursor.execute(
+                            """
+                            SELECT COUNT(*) AS count FROM projects
+                            WHERE owner_id = %s AND urgent_date = %s
+                              AND is_urgent = 1
+                            """,
+                            (actor.id, urgent_day),
+                        )
+                        if int(cursor.fetchone()["count"]) >= quota:
+                            raise StateConflictError(
+                                f"今日加急额度已用完（上限 {quota} 个）"
+                            )
                     cursor.execute(
                         """
                         INSERT INTO projects(
                             project_code, name, deadline, priority, brand_platform,
                             category, note, status, owner_id, project_relative_root,
                             pairing_mode, source_date, product_code,
+                            project_scope, project_name, is_urgent,
+                            urgent_date, urgent_by,
                             source_revision, created_at, updated_at
                         ) VALUES (
                             %s, %s, %s, 'normal', '', '', %s, %s, %s, %s, %s,
-                            %s, %s, 1, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, 1, %s, %s
                         )
                         """,
                         (
@@ -693,6 +999,11 @@ class MySQLCentralRepository:
                             draft.pairing_mode,
                             source_date,
                             product_code,
+                            draft.project_scope,
+                            access_project_name,
+                            int(draft.is_urgent),
+                            urgent_day if draft.is_urgent else None,
+                            actor.id if draft.is_urgent else None,
                             now,
                             now,
                         ),
@@ -731,12 +1042,22 @@ class MySQLCentralRepository:
         draft: ProjectDraft,
     ) -> None:
         self._validate_draft(draft)
+        if draft.project_scope not in PROJECT_SCOPES:
+            raise ValueError("项目类型不正确")
         now = utc_now()
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 project = self._project_row_for_update(cursor, project_id)
                 if actor.role != ROLE_ADMIN and int(project["owner_id"]) != actor.id:
                     raise PermissionDeniedError("只能修改自己提交的项目")
+                if actor.role == ROLE_OPERATIONS:
+                    self._assert_project_access(
+                        cursor,
+                        actor.id,
+                        draft.project_scope,
+                        draft.access_project_name.strip()
+                        or draft.name.strip(),
+                    )
                 cursor.execute(
                     """
                     SELECT COUNT(*) AS count FROM project_tasks
@@ -760,6 +1081,7 @@ class MySQLCentralRepository:
                         brand_platform = %s, category = %s, note = %s,
                         project_relative_root = %s, pairing_mode = %s,
                         source_date = %s, product_code = %s,
+                        project_scope = %s, project_name = %s,
                         source_revision = source_revision + 1,
                         status = %s, updated_at = %s
                     WHERE id = %s
@@ -781,6 +1103,8 @@ class MySQLCentralRepository:
                         draft.pairing_mode,
                         draft.source_date or date.today(),
                         draft.product_code or draft.name,
+                        draft.project_scope,
+                        draft.access_project_name.strip() or draft.name,
                         PROJECT_SUBMITTED,
                         now,
                         project_id,
@@ -805,19 +1129,46 @@ class MySQLCentralRepository:
                     {"task_count": len(draft.pairs)},
                 )
 
-    def list_projects(self, limit: int = 5000) -> list[ProjectRecord]:
+    def list_projects(
+        self,
+        limit: int = 5000,
+        actor: AuthUser | None = None,
+    ) -> list[ProjectRecord]:
+        conditions = ["1 = 1"]
+        params: list[Any] = [
+            TASK_APPROVED,
+            TASK_AWAITING_ACCEPTANCE,
+        ]
+        if actor is not None and actor.role == ROLE_OPERATIONS:
+            conditions.extend(
+                (
+                    "p.owner_id = %s",
+                    """
+                    EXISTS (
+                        SELECT 1 FROM user_project_access upa
+                        WHERE upa.user_id = %s
+                          AND upa.project_scope = p.project_scope
+                          AND upa.project_name = p.project_name
+                    )
+                    """,
+                )
+            )
+            params.extend((actor.id, actor.id))
+        params.append(limit)
         query = """
             SELECT p.*, owner.display_name AS owner_name,
                    COUNT(t.id) AS task_count,
                    COALESCE(SUM(t.status = %s), 0) AS approved_count,
                    COALESCE(SUM(t.status = %s), 0) AS awaiting_count,
-                   COALESCE(SUM(t.is_urgent = 1), 0) AS urgent_count
+                   COALESCE(p.is_urgent, 0) AS urgent_count
             FROM projects p
             JOIN users owner ON owner.id = p.owner_id
             LEFT JOIN project_tasks t ON t.project_id = p.id
+            WHERE
+            """ + " AND ".join(conditions) + """
             GROUP BY p.id, owner.display_name
             ORDER BY
-                COALESCE(SUM(t.is_urgent), 0) DESC,
+                p.is_urgent DESC,
                 p.source_date DESC, p.id DESC
             LIMIT %s
         """
@@ -825,7 +1176,7 @@ class MySQLCentralRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     query,
-                    (TASK_APPROVED, TASK_AWAITING_ACCEPTANCE, limit),
+                    tuple(params),
                 )
                 return [_project_record(row) for row in cursor.fetchall()]
 
@@ -849,7 +1200,7 @@ class MySQLCentralRepository:
                            COUNT(t.id) AS task_count,
                            COALESCE(SUM(t.status = %s), 0) AS approved_count,
                            COALESCE(SUM(t.status = %s), 0) AS awaiting_count,
-                           COALESCE(SUM(t.is_urgent = 1), 0) AS urgent_count
+                           COALESCE(p.is_urgent, 0) AS urgent_count
                     FROM projects p
                     JOIN users owner ON owner.id = p.owner_id
                     LEFT JOIN project_tasks t ON t.project_id = p.id
@@ -875,7 +1226,7 @@ class MySQLCentralRepository:
                 cursor.execute(
                     self._task_select_sql()
                     + " WHERE t.project_id = %s "
-                    + "ORDER BY t.is_urgent DESC, t.task_no",
+                    + "ORDER BY p.is_urgent DESC, t.task_no",
                     (project_id,),
                 )
                 return [_project_task(row) for row in cursor.fetchall()]
@@ -948,6 +1299,11 @@ class MySQLCentralRepository:
             brand_platform=project["brand_platform"],
             category=project["category"],
             note=project["note"],
+            source_date=project.get("source_date"),
+            product_code=project.get("product_code") or "",
+            project_scope=project.get("project_scope") or "internal",
+            access_project_name=project.get("project_name") or "",
+            is_urgent=bool(project.get("is_urgent")),
         )
 
     def list_board_tasks(
@@ -962,13 +1318,28 @@ class MySQLCentralRepository:
         if not include_finished:
             conditions.append("t.status NOT IN (%s, %s)")
             params.extend((TASK_APPROVED, TASK_CANCELLED))
+        if actor.role == ROLE_OPERATIONS:
+            conditions.extend(
+                (
+                    "p.owner_id = %s",
+                    """
+                    EXISTS (
+                        SELECT 1 FROM user_project_access upa
+                        WHERE upa.user_id = %s
+                          AND upa.project_scope = p.project_scope
+                          AND upa.project_name = p.project_name
+                    )
+                    """,
+                )
+            )
+            params.extend((actor.id, actor.id))
         query = (
             self._task_select_sql()
             + " WHERE "
             + " AND ".join(conditions)
             + """
               ORDER BY
-                t.is_urgent DESC, p.source_date DESC, p.id, t.task_no
+                p.is_urgent DESC, p.source_date DESC, p.id, t.task_no
               LIMIT %s
             """
         )
@@ -1135,6 +1506,99 @@ class MySQLCentralRepository:
                         "urgent_date": today.isoformat() if urgent else "",
                     },
                 )
+
+    def set_project_urgent(
+        self,
+        project_id: int,
+        actor: AuthUser,
+        urgent: bool,
+    ) -> None:
+        today = date.today()
+        now = utc_now()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                project = self._project_row_for_update(cursor, project_id)
+                if (
+                    actor.role != ROLE_ADMIN
+                    and int(project["owner_id"]) != actor.id
+                ):
+                    raise PermissionDeniedError("只能设置自己任务的加急")
+                if project["status"] in (
+                    PROJECT_CANCELLED,
+                    PROJECT_COMPLETED,
+                ):
+                    raise StateConflictError("已结束任务不能修改加急")
+                if urgent and not bool(project["is_urgent"]):
+                    cursor.execute(
+                        "SELECT urgent_quota_per_day FROM users "
+                        "WHERE id = %s FOR UPDATE",
+                        (int(project["owner_id"]),),
+                    )
+                    quota = int(
+                        cursor.fetchone()["urgent_quota_per_day"]
+                    )
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*) AS count FROM projects
+                        WHERE owner_id = %s AND urgent_date = %s
+                          AND is_urgent = 1 AND id <> %s
+                        """,
+                        (int(project["owner_id"]), today, project_id),
+                    )
+                    if int(cursor.fetchone()["count"]) >= quota:
+                        raise StateConflictError(
+                            f"今日加急额度已用完（上限 {quota} 个）"
+                        )
+                cursor.execute(
+                    """
+                    UPDATE projects
+                    SET is_urgent = %s, urgent_date = %s,
+                        urgent_by = %s, updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        int(urgent),
+                        today if urgent else None,
+                        actor.id if urgent else None,
+                        now,
+                        project_id,
+                    ),
+                )
+                self._event(
+                    cursor,
+                    project_id,
+                    None,
+                    actor.id,
+                    "project_urgent" if urgent else "project_urgent_cleared",
+                    project["status"],
+                    project["status"],
+                    {
+                        "urgent": urgent,
+                        "urgent_date": today.isoformat() if urgent else "",
+                    },
+                )
+
+    def remaining_urgent_quota(self, actor: AuthUser, day: date) -> int:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT urgent_quota_per_day FROM users WHERE id = %s",
+                    (actor.id,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise ValueError("账号不存在")
+                quota = int(row["urgent_quota_per_day"])
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM projects
+                    WHERE owner_id = %s AND urgent_date = %s
+                      AND is_urgent = 1
+                    """,
+                    (actor.id, day),
+                )
+                used = int(cursor.fetchone()["count"])
+                return max(0, quota - used)
 
     def update_subtask_sources(
         self,
@@ -1771,14 +2235,47 @@ class MySQLCentralRepository:
                 task = self._task_row_for_update(cursor, task_id)
                 if actor.role not in (ROLE_AI, ROLE_ADMIN):
                     raise PermissionDeniedError("当前角色不能上传成品")
-                if int(task["assignee_id"] or 0) != actor.id:
-                    raise PermissionDeniedError("请先领取该任务")
+                assignee_id = int(task["assignee_id"] or 0)
+                claimed_here = False
+                if task["status"] == TASK_AVAILABLE:
+                    claimed_here = True
+                elif task["status"] == TASK_RETURNED and (
+                    assignee_id == actor.id or actor.role == ROLE_ADMIN
+                ):
+                    claimed_here = assignee_id != actor.id
+                elif assignee_id == actor.id and task["status"] in (
+                    TASK_CLAIMED,
+                    TASK_WORKING,
+                ):
+                    claimed_here = False
+                else:
+                    raise PermissionDeniedError("任务已被其他制作人员领取")
                 if task["status"] in (
                     TASK_AWAITING_ACCEPTANCE,
                     TASK_APPROVED,
                     TASK_CANCELLED,
                 ):
                     raise StateConflictError("当前子任务状态不能上传成品")
+                if claimed_here:
+                    cursor.execute(
+                        """
+                        UPDATE project_tasks
+                        SET assignee_id = %s, status = %s,
+                            claimed_at = %s, updated_at = %s
+                        WHERE id = %s
+                        """,
+                        (actor.id, TASK_CLAIMED, now, now, task_id),
+                    )
+                    self._event(
+                        cursor,
+                        int(task["project_id"]),
+                        task_id,
+                        actor.id,
+                        "task_claimed",
+                        task["status"],
+                        TASK_CLAIMED,
+                        {"claimed_for_manual_upload": True},
+                    )
                 self._assert_generation_slot(cursor, actor.id)
                 cursor.execute(
                     "SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_no "
@@ -2897,6 +3394,36 @@ class MySQLCentralRepository:
                     (name, prompt, now, now),
                 )
 
+    @staticmethod
+    def _seed_user_menu_permissions(cursor, user_id: int, role: str) -> None:
+        for menu_key in ROLE_DEFAULT_MENUS.get(role, ()):
+            cursor.execute(
+                """
+                INSERT IGNORE INTO user_menu_permissions(user_id, menu_key)
+                VALUES (%s, %s)
+                """,
+                (user_id, menu_key),
+            )
+
+    @staticmethod
+    def _assert_project_access(
+        cursor,
+        user_id: int,
+        project_scope: str,
+        project_name: str,
+    ) -> None:
+        cursor.execute(
+            """
+            SELECT 1 FROM user_project_access
+            WHERE user_id = %s AND project_scope = %s
+              AND project_name = %s
+            LIMIT 1
+            """,
+            (user_id, project_scope, project_name.strip()),
+        )
+        if cursor.fetchone() is None:
+            raise PermissionDeniedError("当前账号没有该共享盘项目的权限")
+
     def _insert_assets_and_tasks(
         self,
         cursor,
@@ -3010,6 +3537,9 @@ class MySQLCentralRepository:
                 p.owner_id,
                 p.deadline AS project_deadline,
                 p.priority AS project_priority,
+                p.project_scope,
+                p.project_name AS access_project_name,
+                p.is_urgent AS project_is_urgent,
                 garment.relative_path AS garment_path,
                 garment.original_name AS garment_name,
                 garment.content_hash AS garment_hash,
@@ -3267,6 +3797,11 @@ def _project_record(row: dict[str, Any]) -> ProjectRecord:
         product_code=row.get("product_code") or row["name"],
         source_date=row.get("source_date"),
         urgent_count=int(row.get("urgent_count") or 0),
+        project_scope=row.get("project_scope") or "internal",
+        project_name=row.get("project_name") or "",
+        is_urgent=bool(row.get("is_urgent")),
+        urgent_date=row.get("urgent_date"),
+        urgent_by=int(row["urgent_by"]) if row.get("urgent_by") else None,
     )
 
 
@@ -3323,6 +3858,7 @@ def _project_task(row: dict[str, Any]) -> ProjectTask:
         final_quantity=int(row["final_quantity"]),
         owner_id=int(row["owner_id"]),
         created_at=row["created_at"],
+        updated_at=row.get("updated_at"),
         claimed_at=row["claimed_at"],
         work_started_at=row["work_started_at"],
         submitted_at=row["submitted_at"],
@@ -3337,6 +3873,9 @@ def _project_task(row: dict[str, Any]) -> ProjectTask:
         is_urgent=bool(row.get("is_urgent")),
         urgent_date=row.get("urgent_date"),
         urgent_by=int(row["urgent_by"]) if row.get("urgent_by") else None,
+        project_scope=row.get("project_scope") or "internal",
+        access_project_name=row.get("access_project_name") or "",
+        project_is_urgent=bool(row.get("project_is_urgent")),
     )
 
 

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
-    QDateEdit,
     QFrame,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -33,6 +33,7 @@ from ..collaboration.types import (
 from ..constants import MODEL_LABELS
 from ..time_utils import utc_naive_to_local
 from .result_gallery import ResultGallery
+from .date_filter import OptionalDateEdit
 
 
 ATTEMPT_LABELS = {
@@ -118,6 +119,13 @@ class ProjectHistoryPage(QWidget):
         )
         self.table.setSortingEnabled(True)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive
+        )
+        for column, width in enumerate(
+            (220, 240, 90, 120, 130, 90, 145, 70, 260)
+        ):
+            self.table.setColumnWidth(column, width)
         self.table.itemSelectionChanged.connect(self._attempt_selected)
         splitter.addWidget(self.table)
 
@@ -150,14 +158,8 @@ class ProjectHistoryPage(QWidget):
         refresh.clicked.connect(self.refresh)
 
     @staticmethod
-    def _optional_date_edit(placeholder: str) -> QDateEdit:
-        widget = QDateEdit()
-        widget.setCalendarPopup(True)
-        widget.setDisplayFormat("yyyy-MM-dd")
-        widget.setMinimumDate(QDate(2000, 1, 1))
-        widget.setSpecialValueText(placeholder)
-        widget.setDate(widget.minimumDate())
-        return widget
+    def _optional_date_edit(placeholder: str) -> OptionalDateEdit:
+        return OptionalDateEdit(placeholder)
 
     def refresh(self) -> None:
         try:
@@ -193,24 +195,16 @@ class ProjectHistoryPage(QWidget):
         self.project_filter.setCurrentIndex(0)
         self.product_search.clear()
         self.status_filter.setCurrentIndex(0)
-        self.start_date.setDate(self.start_date.minimumDate())
-        self.end_date.setDate(self.end_date.minimumDate())
+        self.start_date.clear()
+        self.end_date.clear()
         self._apply_filters()
 
     def _apply_filters(self, *_args) -> None:
         project_code = self.project_filter.currentData()
         product = self.product_search.text().strip().casefold()
         status = self.status_filter.currentData()
-        start = (
-            self.start_date.date().toPython()
-            if self.start_date.date() != self.start_date.minimumDate()
-            else None
-        )
-        end = (
-            self.end_date.date().toPython()
-            if self.end_date.date() != self.end_date.minimumDate()
-            else None
-        )
+        start = self.start_date.python_date()
+        end = self.end_date.python_date()
         rows = []
         for attempt in self.attempts:
             created = utc_naive_to_local(attempt["created_at"]).date()

@@ -202,6 +202,10 @@ class LocalTaskSourceStore:
         self._save()
         return self.state
 
+    def restore_all(self) -> LocalSourceState:
+        self.state = self._seed_from_task()
+        return self.state
+
     def save_attempt_snapshot(
         self,
         attempt_id: int,

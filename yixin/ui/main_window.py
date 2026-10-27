@@ -23,6 +23,8 @@ from ..collaboration.types import (
     ROLE_ADMIN,
     ROLE_AI,
     ROLE_LABELS,
+    ROLE_DEFAULT_MENUS,
+    ROLE_ALLOWED_MENUS,
     AuthUser,
 )
 from ..constants import APP_NAME, MODE_DRESS_UP, MODE_FREE_COMPOSE, STATUS_LABELS
@@ -232,6 +234,43 @@ class MainWindow(QMainWindow):
                 auto_load=False,
             )
             self.page_specs.append(("管理控制台", self.admin_page))
+        role_allowed = set(
+            ROLE_ALLOWED_MENUS.get(self.actor.role, ())
+        )
+        role_defaults = set(ROLE_DEFAULT_MENUS.get(self.actor.role, ()))
+        configured = set(
+            self.actor.menu_permissions or role_defaults
+        )
+        allowed_menu_keys = configured & role_allowed
+        label_keys = {
+            "新建任务": "new_task",
+            "已提交": "submitted",
+            "待审核": "pending",
+            "已完成": "completed",
+            "任务中心": "task_center",
+            "普通创作": "create",
+            "批量换装": "batch",
+            "历史记录": "history",
+            "作品库": "library",
+            "管理控制台": "admin",
+        }
+        self.page_specs = [
+            spec
+            for spec in self.page_specs
+            if label_keys.get(spec[0]) in allowed_menu_keys
+        ]
+        if not self.page_specs:
+            empty_page = QWidget()
+            empty_layout = QVBoxLayout(empty_page)
+            empty_layout.addStretch(1)
+            empty_message = QLabel(
+                "当前账号还没有可查看的菜单，请联系管理员配置菜单权限。"
+            )
+            empty_message.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty_message.setStyleSheet("color:#60708a;font-size:16px;")
+            empty_layout.addWidget(empty_message)
+            empty_layout.addStretch(1)
+            self.page_specs.append(("无可用菜单", empty_page))
         for _, page in self.page_specs:
             self.stack.addWidget(page)
 
@@ -280,6 +319,8 @@ class MainWindow(QMainWindow):
             )
         else:
             initial_page = self.new_task_page
+        if all(page is not initial_page for _, page in self.page_specs):
+            initial_page = self.page_specs[0][1]
         self._select_page(initial_page)
 
     def _build_sidebar(self) -> QWidget:
@@ -299,11 +340,21 @@ class MainWindow(QMainWindow):
         layout.addWidget(subtitle)
         layout.addSpacing(20)
         labels = [text for text, _ in self.page_specs]
-        group_index = 0
+        submenu_labels = ("新建任务", "已提交", "待审核", "已完成")
+        submenu_indices = {
+            index
+            for index, label in enumerate(labels)
+            if label in submenu_labels
+        }
+        group_index = min(submenu_indices) if submenu_indices else 0
         self.nav_list = SidebarNav(
             labels,
-            group_before={group_index: "AI图提交"},
-            submenu_indices={0, 1, 2, 3},
+            group_before=(
+                {group_index: "AI图提交"}
+                if submenu_indices
+                else None
+            ),
+            submenu_indices=submenu_indices,
         )
         self.nav_list.setObjectName("NavList")
         layout.addWidget(self.nav_list)

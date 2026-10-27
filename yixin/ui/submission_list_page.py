@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from functools import partial
-
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QDateEdit,
+    QHeaderView,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -30,6 +28,7 @@ from ..collaboration.types import (
     TASK_AWAITING_ACCEPTANCE,
     TASK_CLAIMED,
     TASK_RETURNED,
+    TASK_SKIPPED,
     TASK_STATUS_LABELS,
     TASK_WORKING,
     AuthUser,
@@ -38,6 +37,7 @@ from ..collaboration.types import (
 )
 from ..time_utils import utc_naive_to_local
 from .result_gallery import ResultGallery, ResultGalleryDialog
+from .date_filter import OptionalDateEdit
 from .subtask_source_dialog import SubtaskSourceDialog
 from .widgets import ImageStrip, ImageView
 
@@ -45,10 +45,13 @@ from .widgets import ImageStrip, ImageView
 VIEW_STATUSES = {
     "submitted": (TASK_AVAILABLE, TASK_CLAIMED, TASK_WORKING, TASK_RETURNED),
     "pending": (TASK_AWAITING_ACCEPTANCE,),
-    "completed": (TASK_APPROVED,),
+    "completed": (TASK_APPROVED, TASK_SKIPPED),
 }
 VIEW_TITLES = {
-    "submitted": ("已提交", "查看可领取、制作中和已退回的子任务。"),
+    "submitted": (
+        "已提交",
+        "查看可领取、制作中和已退回的子任务；双击子任务可修改素材与配对。",
+    ),
     "pending": ("待审核", "查看参考图与成品，通过或填写修改点退回。"),
     "completed": ("已完成", "查看已经通过验收的子任务与成品。"),
 }
@@ -128,6 +131,11 @@ class SubmissionListPage(QWidget):
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
         self.project_table.horizontalHeader().setStretchLastSection(True)
+        self.project_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive
+        )
+        for column, width in enumerate((210, 110, 130, 90, 110, 110, 70)):
+            self.project_table.setColumnWidth(column, width)
         self.project_table.setMaximumHeight(220)
         self.project_table.setSortingEnabled(True)
         self.project_table.itemSelectionChanged.connect(self._project_selected)
@@ -137,7 +145,7 @@ class SubmissionListPage(QWidget):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 8, 8, 0)
-        self.task_table = QTableWidget(0, 8)
+        self.task_table = QTableWidget(0, 7)
         self.task_table.setHorizontalHeaderLabels(
             [
                 "子任务编码",
@@ -147,7 +155,6 @@ class SubmissionListPage(QWidget):
                 "加急",
                 "创建时间",
                 "更新时间",
-                "操作",
             ]
         )
         self.task_table.setSelectionBehavior(
@@ -157,8 +164,17 @@ class SubmissionListPage(QWidget):
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
         self.task_table.horizontalHeader().setStretchLastSection(True)
+        self.task_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive
+        )
+        for column, width in enumerate((250, 70, 130, 100, 70, 145, 145)):
+            self.task_table.setColumnWidth(column, width)
         self.task_table.setSortingEnabled(True)
         self.task_table.itemSelectionChanged.connect(self._task_selected)
+        if self.view_mode == "submitted":
+            self.task_table.itemDoubleClicked.connect(
+                self._edit_task_from_item
+            )
         left_layout.addWidget(self.task_table, 1)
         self.info_line = QLabel("选择一个子任务查看详情")
         self.info_line.setWordWrap(False)
@@ -202,14 +218,8 @@ class SubmissionListPage(QWidget):
         reset_filter.clicked.connect(self._reset_filters)
 
     @staticmethod
-    def _optional_date_edit(placeholder: str) -> QDateEdit:
-        widget = QDateEdit()
-        widget.setCalendarPopup(True)
-        widget.setDisplayFormat("yyyy-MM-dd")
-        widget.setMinimumDate(QDate(2000, 1, 1))
-        widget.setSpecialValueText(placeholder)
-        widget.setDate(widget.minimumDate())
-        return widget
+    def _optional_date_edit(placeholder: str) -> OptionalDateEdit:
+        return OptionalDateEdit(placeholder)
 
     def _build_reference_preview(self) -> QWidget:
         widget = QWidget()
@@ -235,7 +245,10 @@ class SubmissionListPage(QWidget):
                 include_finished=True,
                 limit=10000,
             )
-            projects = self.repository.list_projects(limit=10000)
+            projects = self.repository.list_projects(
+                limit=10000,
+                actor=self.actor,
+            )
         except Exception as exc:
             QMessageBox.warning(self, "读取任务失败", str(exc))
             return
@@ -252,23 +265,15 @@ class SubmissionListPage(QWidget):
 
     def _reset_filters(self) -> None:
         self.search_edit.clear()
-        self.start_date_edit.setDate(self.start_date_edit.minimumDate())
-        self.end_date_edit.setDate(self.end_date_edit.minimumDate())
+        self.start_date_edit.clear()
+        self.end_date_edit.clear()
         self._apply_filters()
 
     def _apply_filters(self, *_args) -> None:
         statuses = set(VIEW_STATUSES[self.view_mode])
         keyword = self.search_edit.text().strip().casefold()
-        start = (
-            self.start_date_edit.date().toPython()
-            if self.start_date_edit.date() != self.start_date_edit.minimumDate()
-            else None
-        )
-        end = (
-            self.end_date_edit.date().toPython()
-            if self.end_date_edit.date() != self.end_date_edit.minimumDate()
-            else None
-        )
+        start = self.start_date_edit.python_date()
+        end = self.end_date_edit.python_date()
         matching_tasks: dict[int, list[ProjectTask]] = {}
         for task in self._all_tasks:
             if task.status not in statuses:
@@ -318,7 +323,7 @@ class SubmissionListPage(QWidget):
                 project.source_date.isoformat() if project.source_date else "",
                 PROJECT_STATUS_LABELS.get(project.status, project.status),
                 f"{project.approved_count}/{project.task_count}",
-                str(project.urgent_count),
+                "是" if project.is_urgent else "否",
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -356,16 +361,8 @@ class SubmissionListPage(QWidget):
             return
         statuses = set(VIEW_STATUSES[self.view_mode])
         keyword = self.search_edit.text().strip().casefold()
-        start = (
-            self.start_date_edit.date().toPython()
-            if self.start_date_edit.date() != self.start_date_edit.minimumDate()
-            else None
-        )
-        end = (
-            self.end_date_edit.date().toPython()
-            if self.end_date_edit.date() != self.end_date_edit.minimumDate()
-            else None
-        )
+        start = self.start_date_edit.python_date()
+        end = self.end_date_edit.python_date()
         self.tasks = [
             task
             for task in self._all_tasks
@@ -384,7 +381,7 @@ class SubmissionListPage(QWidget):
                 str(len(task.garment_assets)),
                 task.assignee_name or "未分配",
                 TASK_STATUS_LABELS.get(task.status, task.status),
-                "是" if task.is_urgent else "否",
+                "是" if project.is_urgent else "否",
                 utc_naive_to_local(
                     task.created_at
                 ).strftime("%Y-%m-%d %H:%M"),
@@ -397,15 +394,6 @@ class SubmissionListPage(QWidget):
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, task.id)
                 self.task_table.setItem(row, column, item)
-            if self.view_mode == "submitted":
-                edit = QPushButton("修改素材与配对")
-                edit.setEnabled(self._can_edit_task(task))
-                edit.clicked.connect(partial(self._edit_task, task))
-                self.task_table.setCellWidget(row, 7, edit)
-            else:
-                self.task_table.setItem(
-                    row, 7, QTableWidgetItem("")
-                )
         self.task_table.setSortingEnabled(True)
         if self.tasks:
             self.task_table.selectRow(0)
@@ -517,22 +505,20 @@ class SubmissionListPage(QWidget):
             self.reference_preview.set_image(path)
 
     def _update_actions(self) -> None:
-        task = self._current_task()
         project = self._current_project()
         can_manage = self._can_manage(project)
-        editable = bool(
-            task
+        urgent_editable = bool(
+            project
             and can_manage
-            and task.status not in (
-                TASK_AWAITING_ACCEPTANCE,
-                TASK_APPROVED,
-                "cancelled",
-            )
+            and project.status not in ("completed", "cancelled")
         )
-        self.urgent_button.setEnabled(editable)
+        self.urgent_button.setEnabled(urgent_editable)
         self.urgent_button.setText(
-            "取消加急" if task and task.is_urgent else "设置加急"
+            "取消加急"
+            if project and project.is_urgent
+            else "设置加急"
         )
+        task = self._current_task()
         reviewable = bool(
             task
             and can_manage
@@ -560,15 +546,29 @@ class SubmissionListPage(QWidget):
         if dialog.exec():
             self.refresh()
 
+    def _edit_task_from_item(self, item: QTableWidgetItem) -> None:
+        row = item.row()
+        code_item = self.task_table.item(row, 0)
+        task = (
+            self._tasks_by_id.get(
+                int(code_item.data(Qt.ItemDataRole.UserRole))
+            )
+            if code_item is not None
+            else None
+        )
+        if task is None or not self._can_edit_task(task):
+            return
+        self._edit_task(task)
+
     def _toggle_urgent(self) -> None:
-        task = self._current_task()
-        if task is None:
+        project = self._current_project()
+        if project is None:
             return
         try:
-            self.repository.set_subtask_urgent(
-                task.id,
+            self.repository.set_project_urgent(
+                project.id,
                 self.actor,
-                not task.is_urgent,
+                not project.is_urgent,
             )
         except Exception as exc:
             QMessageBox.warning(self, "操作失败", str(exc))

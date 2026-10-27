@@ -17,6 +17,7 @@ if HAS_PYSIDE:
     from PySide6.QtWidgets import (
         QApplication,
         QDialog,
+        QHeaderView,
         QLabel,
         QMessageBox,
         QPushButton,
@@ -46,13 +47,15 @@ if HAS_PYSIDE:
     from yixin.security import SecretStore
     from yixin.settings import AppSettings
     from yixin.storage import FileStore
-    from yixin.ui.admin_page import AdminPage, EditUserDialog
+    from yixin.ui.admin_page import AddUserDialog, AdminPage, EditUserDialog
     from yixin.ui.collaboration_login import LoginDialog
     from yixin.ui.dialogs import SettingsDialog
     from yixin.ui.main_window import MainWindow, SidebarNav
     from yixin.ui.submission_list_page import SubmissionListPage
     from yixin.ui.subtask_source_dialog import SubtaskSourceDialog
     from yixin.ui.project_history_page import ProjectHistoryPage
+    from yixin.ui.history_page import HistoryTabsPage
+    from yixin.ui.date_filter import OptionalDateEdit
     from yixin.ui.task_center_page import TaskCenterPage
     from yixin.ui.task_create_page import (
         CheckableHeaderView,
@@ -73,6 +76,8 @@ class FakeCentralRepository:
         self.tasks_by_id = {}
         self.user_updates = []
         self.skip_requests = []
+        self.project_urgent_updates = []
+        self.queued_attempts = []
 
     def create_project(self, _actor, draft):
         self.created_drafts.append(draft)
@@ -90,6 +95,33 @@ class FakeCentralRepository:
     def list_projects(self, **_kwargs):
         return []
 
+    def list_accessible_projects(self, _actor):
+        return (("internal", "春季项目"),)
+
+    def list_shared_projects(self):
+        return {
+            "internal": ("春季项目", "夏季项目"),
+            "external": ("客户A",),
+        }
+
+    def user_menu_permissions(self, _user_id):
+        return (
+            "new_task",
+            "submitted",
+            "pending",
+            "completed",
+            "task_center",
+        )
+
+    def user_project_access(self, _user_id):
+        return (("internal", "春季项目"),)
+
+    def remaining_urgent_quota(self, _actor, _day):
+        return 3
+
+    def set_project_urgent(self, project_id, actor, urgent):
+        self.project_urgent_updates.append((project_id, actor, urgent))
+
     def list_project_tasks(self, _project_id):
         return []
 
@@ -98,6 +130,9 @@ class FakeCentralRepository:
 
     def list_attempts(self, _task_id):
         return []
+
+    def list_queued_attempts(self, _operator_id):
+        return list(self.queued_attempts)
 
     def list_results(self, _task_id):
         return []
@@ -188,13 +223,15 @@ def make_project(
         status=status,
         owner_id=3,
         owner_name="运营小林",
-        project_relative_root="春季项目/1.2/123",
+        project_relative_root="内部项目/春季项目/1.2/123",
         pairing_mode="all",
         created_at=now,
         updated_at=now,
         task_count=1,
         product_code="123",
         source_date=date(2026, 1, 2),
+        project_scope="internal",
+        project_name="春季项目",
     )
 
 
@@ -226,7 +263,7 @@ def make_task(status: str) -> ProjectTask:
         project_id=1,
         project_code="春季项目-123-001",
         project_name="123",
-        project_relative_root="春季项目/1.2/123",
+        project_relative_root="内部项目/春季项目/1.2/123",
         garment_asset_id=2,
         garment_path=garments[0].relative_path,
         garment_name=garments[0].original_name,
@@ -249,11 +286,14 @@ def make_task(status: str) -> ProjectTask:
         source_date=date(2026, 1, 2),
         product_code="123",
         garment_assets=garments,
+        project_scope="internal",
+        access_project_name="春季项目",
+        project_is_urgent=False,
     )
 
 
 def write_task_images(root: Path) -> None:
-    product = root / "春季项目" / "1.2" / "123"
+    product = root / "内部项目" / "春季项目" / "1.2" / "123"
     (product / "衣服图").mkdir(parents=True)
     (product / "模特图").mkdir(parents=True)
     Image.new("RGB", (20, 20), "red").save(product / "衣服图" / "衣服1.png")
@@ -407,8 +447,16 @@ class CollaborationPageTests(unittest.TestCase):
             self.actor,
         )
         expected_suffix = f"{date.today().month}.{date.today().day}"
+        expected_root = (
+            self.root / "内部项目" / "春季项目" / expected_suffix
+        ).resolve()
+        self.assertEqual(
+            Path(page.account_path.text()).resolve(),
+            expected_root,
+        )
         self.assertTrue(page.account_path.text().endswith(expected_suffix))
-        custom = self.root / self.actor.display_name / "2026.12.26"
+        project_root = self.root / "内部项目" / "春季项目"
+        custom = project_root / "2026.12.26"
         custom.mkdir(parents=True)
         page.account_path.setText(str(custom))
         page.refresh()
@@ -416,7 +464,7 @@ class CollaborationPageTests(unittest.TestCase):
             page.account_directory.source_date,
             date(2026, 12, 26),
         )
-        fallback = self.root / self.actor.display_name / "临时目录"
+        fallback = project_root / "临时目录"
         fallback.mkdir(parents=True)
         page.account_path.setText(str(fallback))
         page.refresh()
@@ -448,7 +496,7 @@ class CollaborationPageTests(unittest.TestCase):
 
     def test_product_header_selects_only_eligible_rows(self) -> None:
         date_folder = current_date_folder(
-            self.root / self.actor.display_name
+            self.root / "内部项目" / "春季项目"
         )
         for code in ("123", "456", "重复货号"):
             product = date_folder.path / code
@@ -536,7 +584,7 @@ class CollaborationPageTests(unittest.TestCase):
 
     def test_pair_preview_uses_four_columns_and_manual_selection(self) -> None:
         date_folder = current_date_folder(
-            self.root / self.actor.display_name
+            self.root / "内部项目" / "春季项目"
         )
         product = date_folder.path / "123"
         (product / "衣服图").mkdir(parents=True)
@@ -591,6 +639,47 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(len(page.pair_cards), 4)
         page.deleteLater()
 
+    def test_task_create_drag_folder_and_main_task_quota(self) -> None:
+        date_folder = current_date_folder(
+            self.root / "内部项目" / "春季项目"
+        )
+        product = date_folder.path / "123"
+        (product / "衣服图").mkdir(parents=True)
+        (product / "模特图").mkdir(parents=True)
+        Image.new("RGB", (20, 20), "red").save(
+            product / "衣服图" / "衣服1.png"
+        )
+        Image.new("RGB", (20, 20), "blue").save(
+            product / "模特图" / "模特1.png"
+        )
+        incoming = self.root / "拖入素材"
+        incoming.mkdir()
+        Image.new("RGB", (20, 20), "green").save(
+            incoming / "衣服2.png"
+        )
+        page = TaskCreatePage(
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        page.product_table.selectRow(0)
+        page._handle_image_drop("garment", [incoming])
+        self.assertEqual(len(page.current_state.garments), 2)
+        self.assertTrue(
+            (product / "衣服图" / "衣服2.png").is_file()
+        )
+        page.urgent_checkbox.setChecked(True)
+        self.repository.remaining_urgent_quota = (
+            lambda _actor, _day: 0
+        )
+        with patch(
+            "yixin.ui.task_create_page.QMessageBox.warning"
+        ) as warning:
+            page._create_selected()
+        warning.assert_called_once()
+        self.assertEqual(self.repository.created_drafts, [])
+        page.deleteLater()
+
     def test_admin_user_table_shows_masked_api_key_and_policies(self) -> None:
         ai_user = AuthUser(
             8,
@@ -626,7 +715,12 @@ class CollaborationPageTests(unittest.TestCase):
         self.repository.list_users = lambda role=None: [ai_user]
         page = AdminPage(self.repository, self.actor)
         page.user_table.selectRow(0)
-        dialog = EditUserDialog(ai_user)
+        dialog = EditUserDialog(
+            ai_user,
+            self.repository.user_menu_permissions(ai_user.id),
+            self.repository.user_project_access(ai_user.id),
+            self.repository.list_shared_projects(),
+        )
         dialog.username.setText("ai_amy_new")
         dialog.display_name.setText("AI制作Amy新")
         dialog.role.setCurrentIndex(dialog.role.findData("admin"))
@@ -652,11 +746,85 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(update["role"], "admin")
         self.assertEqual(update["urgent_quota_per_day"], 6)
         self.assertEqual(update["max_generation_concurrency"], 5)
+        self.assertIn("menu_permissions", update)
+        self.assertIn("project_access", update)
         page.deleteLater()
+
+    def test_admin_exception_filter_only_returns_abnormal_tasks(self) -> None:
+        page = AdminPage(self.repository, self.actor)
+        now = datetime.utcnow()
+        cutoff = now - timedelta(hours=24)
+        normal = replace(
+            make_task("awaiting_acceptance"),
+            created_at=now,
+            updated_at=now,
+        )
+        returned = replace(
+            make_task("returned"),
+            created_at=now,
+            updated_at=now,
+        )
+        stale_available = replace(
+            make_task("available"),
+            created_at=cutoff - timedelta(hours=1),
+            updated_at=cutoff - timedelta(hours=1),
+        )
+        self.assertFalse(
+            page._task_needs_admin_attention(normal, cutoff)
+        )
+        self.assertTrue(
+            page._task_needs_admin_attention(returned, cutoff)
+        )
+        self.assertTrue(
+            page._task_needs_admin_attention(stale_available, cutoff)
+        )
+        page.deleteLater()
+
+    def test_account_dialog_enforces_role_menu_ceiling(self) -> None:
+        operator = AuthUser(
+            9,
+            "operator_9",
+            "运营九组",
+            ROLE_OPERATIONS,
+        )
+        dialog = EditUserDialog(
+            operator,
+            (
+                "new_task",
+                "submitted",
+                "pending",
+                "completed",
+            ),
+            (("internal", "春季项目"),),
+            self.repository.list_shared_projects(),
+        )
+        self.assertTrue(dialog.permissions.menu_checks["task_center"].isEnabled())
+        self.assertFalse(
+            dialog.permissions.menu_checks["task_center"].isChecked()
+        )
+        self.assertFalse(
+            dialog.permissions.menu_checks["admin"].isEnabled()
+        )
+        self.assertTrue(
+            dialog.permissions.project_checks[
+                ("internal", "春季项目")
+            ].isChecked()
+        )
+        dialog.deleteLater()
+        add_dialog = AddUserDialog(self.repository.list_shared_projects())
+        self.assertFalse(
+            add_dialog.permissions.menu_checks[
+                "task_center"
+            ].isChecked()
+        )
+        self.assertFalse(
+            add_dialog.permissions.menu_checks["admin"].isEnabled()
+        )
+        add_dialog.deleteLater()
 
     def test_auto_scan_builds_one_subtask_per_model(self) -> None:
         date_folder = current_date_folder(
-            self.root / self.actor.display_name
+            self.root / "内部项目" / "春季项目"
         )
         product = date_folder.path / "123"
         garment = product / "衣服图"
@@ -782,7 +950,7 @@ class CollaborationPageTests(unittest.TestCase):
         ]
         self.assertEqual(
             labels,
-            ["新建任务", "已提交", "待审核", "已完成", "任务中心"],
+            ["新建任务", "已提交", "待审核", "已完成"],
         )
         with patch.object(window.new_task_page, "refresh") as refresh:
             window.show()
@@ -793,6 +961,12 @@ class CollaborationPageTests(unittest.TestCase):
         window.deleteLater()
 
     def test_submission_pages_have_requested_columns_and_actions(self) -> None:
+        picker = OptionalDateEdit("开始日期")
+        self.assertEqual(picker.text(), "开始日期")
+        self.assertIsNone(picker.python_date())
+        picker.setDate(QDate.currentDate())
+        self.assertEqual(picker.python_date(), date.today())
+        picker.clear()
         write_task_images(self.root)
         project = make_project()
         submitted_task = make_task("claimed")
@@ -846,16 +1020,34 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(submitted.project_table.isSortingEnabled())
         self.assertTrue(submitted.task_table.isSortingEnabled())
         self.assertEqual(
+            submitted.project_table.horizontalHeader().sectionResizeMode(0),
+            QHeaderView.ResizeMode.Interactive,
+        )
+        self.assertEqual(
+            submitted.task_table.horizontalHeader().sectionResizeMode(0),
+            QHeaderView.ResizeMode.Interactive,
+        )
+        self.assertIsNone(submitted.start_date_edit.python_date())
+        self.assertEqual(submitted.start_date_edit.text(), "开始日期")
+        self.assertEqual(
             submitted.task_table.horizontalHeaderItem(5).text(),
             "创建时间",
         )
         self.assertEqual(
-            submitted.task_table.horizontalHeaderItem(7).text(),
-            "操作",
+            submitted.task_table.columnCount(),
+            7,
         )
-        edit = submitted.task_table.cellWidget(0, 7)
-        self.assertIsInstance(edit, QPushButton)
-        self.assertEqual(edit.text(), "修改素材与配对")
+        self.assertIsNone(submitted.task_table.cellWidget(0, 6))
+        with patch.object(submitted, "_edit_task") as edit_task:
+            submitted._edit_task_from_item(submitted.task_table.item(0, 0))
+        edit_task.assert_called_once_with(submitted_task)
+        with patch.object(submitted, "refresh"):
+            submitted._toggle_urgent()
+        self.assertEqual(
+            self.repository.project_urgent_updates[-1][0],
+            project.id,
+        )
+        self.assertTrue(self.repository.project_urgent_updates[-1][2])
         self.assertTrue(submitted.urgent_button.isVisible())
         self.assertTrue(submitted.preview_tabs.isTabVisible(1))
         self.assertFalse(submitted.preview_tabs.isTabVisible(0))
@@ -911,7 +1103,7 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(pending.view_results.isVisible())
         self.assertTrue(pending.return_button.isVisible())
         self.assertTrue(pending.approve_button.isVisible())
-        self.assertIsNone(pending.task_table.cellWidget(0, 7))
+        self.assertEqual(pending.task_table.columnCount(), 7)
         self.assertTrue(pending.preview_tabs.isTabVisible(0))
         self.assertTrue(pending.preview_tabs.isTabVisible(1))
         self.assertEqual(pending.preview_tabs.currentIndex(), 0)
@@ -988,6 +1180,31 @@ class CollaborationPageTests(unittest.TestCase):
         self.repository.list_board_tasks = lambda *_args, **_kwargs: [task]
         center.refresh()
         self.assertEqual(center.current_task.id, task.id)
+        self.assertTrue(center.upload_button.isEnabled())
+        self.assertTrue(center._can_upload_manual(task))
+        self.assertEqual(
+            center.project_table.horizontalHeader().sectionResizeMode(0),
+            QHeaderView.ResizeMode.Interactive,
+        )
+        ps_image = self.root / "修后图.png"
+        Image.new("RGB", (20, 20), "white").save(ps_image)
+        with (
+            patch(
+                "yixin.ui.task_center_page.QFileDialog.getOpenFileNames",
+                return_value=([str(ps_image)], ""),
+            ),
+            patch(
+                "yixin.ui.task_center_page.upload_manual_candidates",
+                return_value=1,
+            ) as upload_manual,
+            patch(
+                "yixin.ui.task_center_page.QMessageBox.information"
+            ),
+            patch.object(center, "refresh"),
+        ):
+            center._upload_manual()
+        upload_manual.assert_called_once()
+        self.assertEqual(upload_manual.call_args.args[3].id, task.id)
         center.prompt_edit.setPlainText("临时修改")
         with patch.object(center.prompt_edit, "setFocus") as set_focus:
             center._retry_task()
@@ -1092,6 +1309,10 @@ class CollaborationPageTests(unittest.TestCase):
             center.queue_table,
         )
         self.assertEqual(center.project_filter_combo.count(), 2)
+        self.assertEqual(
+            center.project_filter_combo.itemText(1),
+            "春季项目",
+        )
         center.product_search.setText("不存在")
         self.app.processEvents()
         self.assertEqual(center.project_table.rowCount(), 0)
@@ -1160,6 +1381,14 @@ class CollaborationPageTests(unittest.TestCase):
             center.local_state.model.path.read_bytes(),
             extra_model.read_bytes(),
         )
+        dropped_folder = self.root / "拖入任务素材"
+        dropped_folder.mkdir()
+        Image.new("RGB", (30, 40), "black").save(
+            dropped_folder / "拖入衣服.png"
+        )
+        center.source_strip.setCurrentRow(0)
+        center._handle_source_drop([dropped_folder])
+        self.assertEqual(len(center.local_state.garments), 4)
         restored = TaskCenterPage(
             self.repository,
             self.resolver,
@@ -1174,7 +1403,7 @@ class CollaborationPageTests(unittest.TestCase):
             AppSettings(Database(self.root / "task-center.db")),
         )
         self.assertIsNotNone(restored.local_state)
-        self.assertEqual(len(restored.local_state.garments), 3)
+        self.assertEqual(len(restored.local_state.garments), 4)
         with patch(
             "yixin.ui.task_center_page.QMessageBox.question",
             return_value=QMessageBox.StandardButton.Yes,
@@ -1183,6 +1412,9 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(center.local_state.garments, ())
         self.assertIsNone(center.local_state.model)
         self.assertFalse(center.generate_button.isEnabled())
+        center._restore_source()
+        self.assertEqual(len(center.local_state.garments), 2)
+        self.assertIsNotNone(center.local_state.model)
         restored.deleteLater()
         center.deleteLater()
 
@@ -1291,6 +1523,63 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertFalse(pending.add_source_files_button.isEnabled())
         pending.deleteLater()
 
+    def test_task_center_crop_updates_unstarted_queue_snapshot(self) -> None:
+        write_task_images(self.root)
+        task = make_task("working")
+        queued = GenerationAttempt(
+            id=77,
+            task_id=task.id,
+            attempt_no=1,
+            operator_id=self.actor.id,
+            model="gemini-3.1-flash-image",
+            prompt_text="等待执行",
+            aspect_ratio="3:4",
+            resolution="2K",
+            n=1,
+            status=ATTEMPT_QUEUED,
+            source_revision=task.source_revision,
+            unit_price=Decimal("0"),
+            generated_image_count=0,
+            created_at=datetime.now(),
+        )
+        self.repository.queued_attempts = [queued]
+        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
+            task
+        ]
+        center = TaskCenterPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            NanoBananaClient(lambda: "test-key"),
+            type(
+                "KeyStore",
+                (),
+                {"load": staticmethod(lambda: "test-key")},
+            )(),
+            FileStore(AppPaths(self.root / "crop-queue-data")),
+            AppSettings(Database(self.root / "crop-queue.db")),
+        )
+        original_hash = center.local_state.garments[0].content_hash
+        center.source_strip.setCurrentRow(0)
+        dialog = type(
+            "CropDialogStub",
+            (),
+            {
+                "DialogCode": QDialog.DialogCode,
+                "exec": lambda _self: QDialog.DialogCode.Accepted,
+                "crop_box": lambda _self: (0, 0, 10, 10),
+            },
+        )()
+        with patch(
+            "yixin.ui.task_center_page.CropDialog",
+            return_value=dialog,
+        ):
+            center._crop_source()
+        snapshot = center.local_store.load_attempt_snapshot(77)
+        self.assertIsNotNone(snapshot)
+        self.assertNotEqual(snapshot[0].content_hash, original_hash)
+        center.deleteLater()
+
     def test_task_center_default_prompt_and_two_column_parameters(self) -> None:
         write_task_images(self.root)
         task = replace(make_task("working"), prompt_text="")
@@ -1323,12 +1612,12 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.assertEqual(
             center.template_combo.currentText(),
-            "[共享] 内置·基础服装替换",
+            "选择提示词模板",
         )
-        self.assertEqual(center.parameters_grid.count(), 8)
+        self.assertEqual(center.parameters_grid.count(), 4)
         self.assertEqual(
-            center.parameters_grid.getItemPosition(4)[:2],
-            (1, 0),
+            center.parameters_grid.getItemPosition(3)[:2],
+            (0, 3),
         )
         center.deleteLater()
 
@@ -1535,6 +1824,22 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(page.table.rowCount(), 1)
         self.assertTrue(page.table.isSortingEnabled())
         page.deleteLater()
+        database = Database(self.root / "history-tabs.db")
+        database.initialize()
+        paths = AppPaths(self.root / "history-tabs-data")
+        paths.ensure()
+        client = NanoBananaClient(lambda: "test-key")
+        history = HistoryTabsPage(
+            database,
+            LibraryService(database, FileStore(paths), paths),
+            TaskWorker(database, client, FileStore(paths)),
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        self.assertEqual(history.tabs.tabText(0), "项目任务")
+        self.assertEqual(history.tabs.tabText(1), "普通创作")
+        history.deleteLater()
 
 
 if __name__ == "__main__":

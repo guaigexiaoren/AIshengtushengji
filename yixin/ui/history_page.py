@@ -75,8 +75,8 @@ class HistoryTabsPage(QWidget):
             actor,
             auto_load=False,
         )
-        self.tabs.addTab(self.ordinary_page, "普通创作")
         self.tabs.addTab(self.project_page, "项目任务")
+        self.tabs.addTab(self.ordinary_page, "普通创作")
         layout.addWidget(self.tabs)
         self.ordinary_page.library_changed.connect(
             self.library_changed.emit

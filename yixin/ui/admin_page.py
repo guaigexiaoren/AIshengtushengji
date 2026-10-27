@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -15,7 +15,9 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
+    QHeaderView,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -24,6 +26,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QTabWidget,
@@ -44,6 +47,11 @@ from ..collaboration.types import (
     ROLE_OPERATIONS,
     TASK_STATUS_LABELS,
     AuthUser,
+    MENU_KEYS,
+    PROJECT_SCOPE_LABELS,
+    PROJECT_SCOPES,
+    ROLE_ALLOWED_MENUS,
+    ROLE_DEFAULT_MENUS,
     ProjectRecord,
     ProjectTask,
 )
@@ -52,10 +60,123 @@ from ..security import validate_api_key
 from ..time_utils import utc_naive_to_local
 
 
+class UserPermissionOptions(QWidget):
+    def __init__(
+        self,
+        role_combo: QComboBox,
+        menu_permissions: tuple[str, ...],
+        project_access: tuple[tuple[str, str], ...],
+        shared_projects: dict[str, tuple[str, ...]],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.role_combo = role_combo
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        menu_group = QGroupBox("菜单查看权限")
+        menu_layout = QGridLayout(menu_group)
+        self.menu_checks: dict[str, QCheckBox] = {}
+        selected_menus = set(menu_permissions)
+        for index, (key, label) in enumerate(MENU_KEYS.items()):
+            check = QCheckBox(label)
+            check.setChecked(key in selected_menus)
+            self.menu_checks[key] = check
+            menu_layout.addWidget(check, index // 3, index % 3)
+        layout.addWidget(menu_group)
+
+        self.project_group = QGroupBox("共享盘项目权限")
+        project_layout = QVBoxLayout(self.project_group)
+        project_hint = QLabel(
+            "项目来自共享盘“内部项目/外部项目”下的一级文件夹。"
+        )
+        project_hint.setStyleSheet("color:#60708a;")
+        project_layout.addWidget(project_hint)
+        project_scroll = QScrollArea()
+        project_scroll.setWidgetResizable(True)
+        project_content = QWidget()
+        project_checks_layout = QVBoxLayout(project_content)
+        selected_projects = set(project_access)
+        self.project_checks: dict[tuple[str, str], QCheckBox] = {}
+        available = {
+            (scope, name)
+            for scope in PROJECT_SCOPES
+            for name in shared_projects.get(scope, ())
+        }
+        available.update(selected_projects)
+        for scope in PROJECT_SCOPES:
+            names = sorted(
+                (
+                    name
+                    for item_scope, name in available
+                    if item_scope == scope
+                ),
+                key=str.casefold,
+            )
+            heading = QLabel(PROJECT_SCOPE_LABELS[scope])
+            heading.setStyleSheet("font-weight:700;padding-top:6px;")
+            project_checks_layout.addWidget(heading)
+            if not names:
+                project_checks_layout.addWidget(
+                    QLabel("共享盘中没有发现项目文件夹")
+                )
+            for name in names:
+                key = (scope, name)
+                check = QCheckBox(name)
+                check.setChecked(key in selected_projects)
+                self.project_checks[key] = check
+                project_checks_layout.addWidget(check)
+        project_checks_layout.addStretch(1)
+        project_scroll.setWidget(project_content)
+        project_layout.addWidget(project_scroll, 1)
+        layout.addWidget(self.project_group, 1)
+
+        self._last_role = str(role_combo.currentData())
+        self._apply_role_state(self._last_role)
+        self.role_combo.currentIndexChanged.connect(self._role_changed)
+
+    def _role_changed(self) -> None:
+        role = str(self.role_combo.currentData())
+        if role == self._last_role:
+            return
+        self._last_role = role
+        defaults = set(ROLE_DEFAULT_MENUS.get(role, ()))
+        for key, check in self.menu_checks.items():
+            check.setChecked(key in defaults)
+        self._apply_role_state(role)
+
+    def _apply_role_state(self, role: str) -> None:
+        allowed = set(ROLE_ALLOWED_MENUS.get(role, ()))
+        for key, check in self.menu_checks.items():
+            check.setEnabled(key in allowed)
+            if key not in allowed:
+                check.setChecked(False)
+        self.project_group.setEnabled(role == ROLE_OPERATIONS)
+
+    def selected_menu_permissions(self) -> tuple[str, ...]:
+        return tuple(
+            key
+            for key, check in self.menu_checks.items()
+            if check.isEnabled() and check.isChecked()
+        )
+
+    def selected_project_access(self) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            key
+            for key, check in self.project_checks.items()
+            if check.isChecked()
+        )
+
+
 class AddUserDialog(QDialog):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        shared_projects: dict[str, tuple[str, ...]] | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("新增账号")
+        self.resize(680, 780)
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.username = QLineEdit()
@@ -73,12 +194,22 @@ class AddUserDialog(QDialog):
         self.max_concurrency.setRange(1, 10)
         self.max_concurrency.setValue(2)
         form.addRow("登录账号", self.username)
-        form.addRow("显示名称/项目名", self.display_name)
+        form.addRow("显示名称", self.display_name)
         form.addRow("角色", self.role)
         form.addRow("临时密码", self.password)
         form.addRow("每日加急额度", self.urgent_quota)
         form.addRow("最大生成并发", self.max_concurrency)
         layout.addLayout(form)
+        self.permissions = UserPermissionOptions(
+            self.role,
+            ROLE_DEFAULT_MENUS.get(
+                self.role.currentData(),
+                (),
+            ),
+            (),
+            shared_projects or {},
+        )
+        layout.addWidget(self.permissions, 1)
         actions = QHBoxLayout()
         cancel = QPushButton("取消")
         save = QPushButton("保存")
@@ -95,11 +226,15 @@ class EditUserDialog(QDialog):
     def __init__(
         self,
         user: AuthUser,
+        menu_permissions: tuple[str, ...],
+        project_access: tuple[tuple[str, str], ...],
+        shared_projects: dict[str, tuple[str, ...]],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.user = user
         self.setWindowTitle(f"编辑账号 · {user.display_name}")
+        self.resize(680, 780)
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.username = QLineEdit(user.username)
@@ -117,12 +252,21 @@ class EditUserDialog(QDialog):
         self.max_concurrency.setRange(1, 10)
         self.max_concurrency.setValue(user.max_generation_concurrency)
         form.addRow("登录账号", self.username)
-        form.addRow("显示名称/项目名", self.display_name)
+        form.addRow("显示名称", self.display_name)
         form.addRow("角色", self.role)
         form.addRow("账号状态", self.active)
         form.addRow("每日加急额度", self.urgent_quota)
         form.addRow("最大生成并发", self.max_concurrency)
         layout.addLayout(form)
+
+        self.permissions = UserPermissionOptions(
+            self.role,
+            menu_permissions,
+            project_access,
+            shared_projects,
+        )
+        layout.addWidget(self.permissions, 1)
+
         actions = QHBoxLayout()
         cancel = QPushButton("取消")
         save = QPushButton("保存")
@@ -133,6 +277,11 @@ class EditUserDialog(QDialog):
         actions.addWidget(cancel)
         actions.addWidget(save)
         layout.addLayout(actions)
+    def selected_menu_permissions(self) -> tuple[str, ...]:
+        return self.permissions.selected_menu_permissions()
+
+    def selected_project_access(self) -> tuple[tuple[str, str], ...]:
+        return self.permissions.selected_project_access()
 
 
 class ApiKeyDialog(QDialog):
@@ -190,62 +339,6 @@ class ApiKeyDialog(QDialog):
                 self.actor,
                 self.target.id,
                 self.key_edit.text(),
-            )
-        except Exception as exc:
-            QMessageBox.warning(self, "保存失败", str(exc))
-            return
-        self.accept()
-
-
-class AccountPolicyDialog(QDialog):
-    def __init__(
-        self,
-        repository: MySQLCentralRepository,
-        actor: AuthUser,
-        target: AuthUser,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.repository = repository
-        self.actor = actor
-        self.target = target
-        self.setWindowTitle(f"账号策略 · {target.display_name}")
-        layout = QVBoxLayout(self)
-        form = QFormLayout()
-        self.display_name = QLineEdit(target.display_name)
-        form.addRow("显示名称/项目名", self.display_name)
-        self.urgent_quota = QSpinBox()
-        self.urgent_quota.setRange(0, 99)
-        self.urgent_quota.setValue(target.urgent_quota_per_day)
-        self.max_concurrency = QSpinBox()
-        self.max_concurrency.setRange(1, 10)
-        self.max_concurrency.setValue(target.max_generation_concurrency)
-        form.addRow("每日加急额度", self.urgent_quota)
-        form.addRow("最大生成并发", self.max_concurrency)
-        layout.addLayout(form)
-        actions = QHBoxLayout()
-        cancel = QPushButton("取消")
-        save = QPushButton("保存")
-        save.setObjectName("PrimaryButton")
-        cancel.clicked.connect(self.reject)
-        save.clicked.connect(self._save)
-        actions.addStretch(1)
-        actions.addWidget(cancel)
-        actions.addWidget(save)
-        layout.addLayout(actions)
-
-    def _save(self) -> None:
-        try:
-            self.repository.set_user_display_name(
-                self.actor,
-                self.target.id,
-                self.display_name.text(),
-            )
-            self.repository.set_user_policies(
-                self.actor,
-                self.target.id,
-                urgent_quota_per_day=self.urgent_quota.value(),
-                max_generation_concurrency=self.max_concurrency.value(),
             )
         except Exception as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
@@ -385,8 +478,6 @@ class AdminPage(QWidget):
         self.api_key_button.clicked.connect(self._configure_api_key)
         self.clear_api_key_button = QPushButton("清除 API Key")
         self.clear_api_key_button.clicked.connect(self._clear_api_key)
-        policy_button = QPushButton("账号策略")
-        policy_button.clicked.connect(self._edit_policy)
         refresh_button = QPushButton("刷新")
         refresh_button.clicked.connect(self._refresh_users)
         toolbar.addWidget(add_button)
@@ -395,7 +486,6 @@ class AdminPage(QWidget):
         toolbar.addWidget(reset_button)
         toolbar.addWidget(self.api_key_button)
         toolbar.addWidget(self.clear_api_key_button)
-        toolbar.addWidget(policy_button)
         toolbar.addStretch(1)
         toolbar.addWidget(refresh_button)
         layout.addLayout(toolbar)
@@ -420,6 +510,13 @@ class AdminPage(QWidget):
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
         self.user_table.horizontalHeader().setStretchLastSection(True)
+        self.user_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive
+        )
+        for column, width in enumerate(
+            (120, 130, 80, 70, 85, 120, 145, 80, 80)
+        ):
+            self.user_table.setColumnWidth(column, width)
         layout.addWidget(self.user_table, 1)
         return widget
 
@@ -433,12 +530,21 @@ class AdminPage(QWidget):
             "例如 \\\\fileserver\\AI项目"
         )
         share_layout.addRow("统一 UNC 根目录", self.share_root_edit)
+        self.internal_project_label = QLabel()
+        self.external_project_label = QLabel()
+        self.internal_project_label.setStyleSheet("color:#60708a;")
+        self.external_project_label.setStyleSheet("color:#60708a;")
+        share_layout.addRow("内部项目目录", self.internal_project_label)
+        share_layout.addRow("外部项目目录", self.external_project_label)
         share_actions = QHBoxLayout()
         save_share = QPushButton("保存共享目录")
         save_share.clicked.connect(self._save_share_root)
+        scan_projects = QPushButton("扫描项目文件夹")
+        scan_projects.clicked.connect(self._scan_shared_projects)
         test_connection = QPushButton("测试数据库连接")
         test_connection.clicked.connect(self._test_database)
         share_actions.addWidget(save_share)
+        share_actions.addWidget(scan_projects)
         share_actions.addWidget(test_connection)
         share_actions.addStretch(1)
         share_layout.addRow("", share_actions)
@@ -487,7 +593,7 @@ class AdminPage(QWidget):
         splitter = QSplitter(Qt.Orientation.Vertical)
         self.project_table = QTableWidget(0, 7)
         self.project_table.setHorizontalHeaderLabels(
-            ["任务编码", "货号", "运营", "状态", "子任务进度", "加急数", "日期"]
+            ["任务编码", "货号", "运营", "状态", "子任务进度", "加急", "日期"]
         )
         self.project_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -498,6 +604,12 @@ class AdminPage(QWidget):
         self.project_table.itemSelectionChanged.connect(
             self._admin_project_selected
         )
+        self.project_table.horizontalHeader().setStretchLastSection(True)
+        self.project_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive
+        )
+        for column, width in enumerate((230, 90, 120, 100, 110, 70, 100)):
+            self.project_table.setColumnWidth(column, width)
         splitter.addWidget(self.project_table)
         self.admin_task_table = QTableWidget(0, 6)
         self.admin_task_table.setHorizontalHeaderLabels(
@@ -509,6 +621,12 @@ class AdminPage(QWidget):
         self.admin_task_table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
+        self.admin_task_table.horizontalHeader().setStretchLastSection(True)
+        self.admin_task_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive
+        )
+        for column, width in enumerate((240, 150, 150, 120, 100, 80)):
+            self.admin_task_table.setColumnWidth(column, width)
         splitter.addWidget(self.admin_task_table)
         layout.addWidget(splitter, 1)
         actions = QHBoxLayout()
@@ -584,6 +702,13 @@ class AdminPage(QWidget):
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
         self.report_table.horizontalHeader().setStretchLastSection(True)
+        self.report_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive
+        )
+        for column, width in enumerate(
+            (220, 220, 120, 130, 150, 100, 80, 70, 90)
+        ):
+            self.report_table.setColumnWidth(column, width)
         layout.addWidget(self.report_table, 1)
         return widget
 
@@ -633,21 +758,24 @@ class AdminPage(QWidget):
         return self.users[row]
 
     def _add_user(self) -> None:
-        dialog = AddUserDialog(self)
+        try:
+            shared_projects = self.repository.list_shared_projects()
+        except Exception as exc:
+            QMessageBox.warning(self, "读取共享盘项目失败", str(exc))
+            return
+        dialog = AddUserDialog(shared_projects, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
-            user = self.repository.create_user(
+            self.repository.create_user(
                 dialog.username.text(),
                 dialog.display_name.text(),
                 dialog.role.currentData(),
                 dialog.password.text(),
-            )
-            self.repository.set_user_policies(
-                self.actor,
-                user.id,
                 urgent_quota_per_day=dialog.urgent_quota.value(),
                 max_generation_concurrency=dialog.max_concurrency.value(),
+                menu_permissions=dialog.selected_menu_permissions(),
+                project_access=dialog.selected_project_access(),
             )
         except Exception as exc:
             QMessageBox.warning(self, "新增失败", str(exc))
@@ -659,7 +787,20 @@ class AdminPage(QWidget):
         if user is None:
             QMessageBox.information(self, "未选择账号", "请先选择一个账号。")
             return
-        dialog = EditUserDialog(user, self)
+        try:
+            menus = self.repository.user_menu_permissions(user.id)
+            project_access = self.repository.user_project_access(user.id)
+            shared_projects = self.repository.list_shared_projects()
+        except Exception as exc:
+            QMessageBox.warning(self, "读取权限失败", str(exc))
+            return
+        dialog = EditUserDialog(
+            user,
+            menus,
+            project_access,
+            shared_projects,
+            self,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
@@ -672,6 +813,8 @@ class AdminPage(QWidget):
                 is_active=dialog.active.isChecked(),
                 urgent_quota_per_day=dialog.urgent_quota.value(),
                 max_generation_concurrency=dialog.max_concurrency.value(),
+                menu_permissions=dialog.selected_menu_permissions(),
+                project_access=dialog.selected_project_access(),
             )
         except Exception as exc:
             QMessageBox.warning(self, "编辑失败", str(exc))
@@ -710,14 +853,6 @@ class AdminPage(QWidget):
             QMessageBox.warning(self, "清除失败", str(exc))
             return
         self._refresh_users()
-
-    def _edit_policy(self) -> None:
-        user = self._current_user()
-        if user is None:
-            return
-        dialog = AccountPolicyDialog(self.repository, self.actor, user, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self._refresh_users()
 
     def _toggle_user(self) -> None:
         user = self._current_user()
@@ -784,6 +919,27 @@ class AdminPage(QWidget):
         except Exception:
             value = None
         self.share_root_edit.setText(value or "")
+        root = Path(value) if value else None
+        self.internal_project_label.setText(
+            str(root / "内部项目") if root else "未配置"
+        )
+        self.external_project_label.setText(
+            str(root / "外部项目") if root else "未配置"
+        )
+
+    def _scan_shared_projects(self) -> None:
+        try:
+            projects = self.repository.list_shared_projects()
+        except Exception as exc:
+            QMessageBox.warning(self, "扫描失败", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "扫描完成",
+            f"内部项目 {len(projects.get('internal', ()))} 个，"
+            f"外部项目 {len(projects.get('external', ()))} 个。"
+            "可在“编辑账号”中分配项目。",
+        )
 
     def _save_share_root(self) -> None:
         value = self.share_root_edit.text().strip()
@@ -914,10 +1070,24 @@ class AdminPage(QWidget):
 
     def _refresh_projects(self) -> None:
         try:
-            self.projects = self.repository.list_projects()
+            all_projects = self.repository.list_projects()
         except Exception as exc:
             QMessageBox.warning(self, "读取任务失败", str(exc))
             return
+        self.projects = []
+        cutoff = datetime.utcnow() - timedelta(hours=24)
+        for project in all_projects:
+            try:
+                tasks = self.repository.list_project_tasks(project.id)
+            except Exception:
+                tasks = []
+            exceptional = [
+                task
+                for task in tasks
+                if self._task_needs_admin_attention(task, cutoff)
+            ]
+            if project.status == "cancelled" or exceptional:
+                self.projects.append(project)
         self.project_table.setRowCount(0)
         self.project_filter.blockSignals(True)
         self.project_filter.clear()
@@ -931,7 +1101,7 @@ class AdminPage(QWidget):
                 project.owner_name,
                 PROJECT_STATUS_LABELS.get(project.status, project.status),
                 f"{project.approved_count}/{project.task_count}",
-                str(project.urgent_count),
+                "是" if project.is_urgent else "否",
                 project.source_date.isoformat() if project.source_date else "",
             )
             for column, value in enumerate(values):
@@ -959,6 +1129,13 @@ class AdminPage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "读取任务失败", str(exc))
             return
+        if project.status != "cancelled":
+            cutoff = datetime.utcnow() - timedelta(hours=24)
+            self.tasks = [
+                task
+                for task in self.tasks
+                if self._task_needs_admin_attention(task, cutoff)
+            ]
         self.admin_task_table.setRowCount(0)
         for task in self.tasks:
             row = self.admin_task_table.rowCount()
@@ -977,6 +1154,34 @@ class AdminPage(QWidget):
                     column,
                     QTableWidgetItem(value),
                 )
+
+    def _task_needs_admin_attention(
+        self,
+        task: ProjectTask,
+        cutoff: datetime,
+    ) -> bool:
+        if task.status == "returned":
+            return True
+        if task.status == "available" and task.created_at < cutoff:
+            return True
+        if (
+            task.status == "working"
+            and (task.updated_at or task.work_started_at or task.created_at)
+            < cutoff
+        ):
+            return True
+        try:
+            attempts = self.repository.list_attempts(task.id)
+        except Exception:
+            attempts = []
+        if not attempts:
+            return False
+        latest = attempts[0]
+        return bool(
+            latest.status == "failed"
+            and latest.created_at is not None
+            and latest.created_at >= cutoff
+        )
 
     def _current_admin_task(self) -> ProjectTask | None:
         row = self.admin_task_table.currentRow()

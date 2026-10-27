@@ -34,14 +34,38 @@ CREATE TABLE IF NOT EXISTS projects (
     pairing_mode VARCHAR(24) NOT NULL,
     source_date DATE NOT NULL,
     product_code VARCHAR(200) NOT NULL,
+    project_scope VARCHAR(24) NOT NULL DEFAULT 'internal',
+    project_name VARCHAR(200) NOT NULL DEFAULT '',
+    is_urgent TINYINT(1) NOT NULL DEFAULT 0,
+    urgent_date DATE NULL,
+    urgent_by BIGINT UNSIGNED NULL,
     source_revision INT NOT NULL DEFAULT 1,
     created_at DATETIME(6) NOT NULL,
     updated_at DATETIME(6) NOT NULL,
     completed_at DATETIME(6) NULL,
     cancelled_at DATETIME(6) NULL,
     CONSTRAINT fk_projects_owner FOREIGN KEY (owner_id) REFERENCES users(id),
+    CONSTRAINT fk_projects_urgent_by FOREIGN KEY (urgent_by)
+        REFERENCES users(id),
     INDEX idx_projects_status_deadline (status, deadline),
     INDEX idx_projects_owner_created (owner_id, created_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS user_menu_permissions (
+    user_id BIGINT UNSIGNED NOT NULL,
+    menu_key VARCHAR(64) NOT NULL,
+    PRIMARY KEY (user_id, menu_key),
+    CONSTRAINT fk_user_menu_permissions_user FOREIGN KEY (user_id)
+        REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE IF NOT EXISTS user_project_access (
+    user_id BIGINT UNSIGNED NOT NULL,
+    project_scope VARCHAR(24) NOT NULL,
+    project_name VARCHAR(200) NOT NULL,
+    PRIMARY KEY (user_id, project_scope, project_name),
+    CONSTRAINT fk_user_project_access_user FOREIGN KEY (user_id)
+        REFERENCES users(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS project_assets (
