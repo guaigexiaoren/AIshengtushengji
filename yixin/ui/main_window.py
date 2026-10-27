@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
@@ -37,7 +37,7 @@ from .batch_dress_page import BatchDressPage
 from .admin_page import AdminPage
 from .create_page import CreatePage
 from .dialogs import SettingsDialog
-from .history_page import HistoryPage
+from .history_page import HistoryTabsPage
 from .library_page import LibraryPage
 from .submission_list_page import SubmissionListPage
 from .task_center_page import TaskCenterPage
@@ -137,6 +137,8 @@ class MainWindow(QMainWindow):
         self.repository = repository
         self.resolver = resolver
         self.actor = actor
+        self._initial_data_loaded = False
+        self._initial_load_scheduled = False
         self.setWindowIcon(QApplication.instance().windowIcon())
         self.setWindowTitle(APP_NAME)
         self.resize(1480, 920)
@@ -148,6 +150,7 @@ class MainWindow(QMainWindow):
             repository,
             resolver,
             actor,
+            auto_load=False,
         )
         self.page_specs.append(("新建任务", self.new_task_page))
         self.submitted_page = SubmissionListPage(
@@ -155,18 +158,21 @@ class MainWindow(QMainWindow):
             resolver,
             actor,
             "submitted",
+            auto_load=False,
         )
         self.pending_page = SubmissionListPage(
             repository,
             resolver,
             actor,
             "pending",
+            auto_load=False,
         )
         self.completed_page = SubmissionListPage(
             repository,
             resolver,
             actor,
             "completed",
+            auto_load=False,
         )
         self.page_specs.extend(
             [
@@ -184,6 +190,7 @@ class MainWindow(QMainWindow):
             file_store,
             AppSettings(database),
             library_service,
+            auto_load=False,
         )
         self.page_specs.append(("任务中心", self.task_center_page))
         if self.actor.role in (ROLE_AI, ROLE_ADMIN):
@@ -201,7 +208,14 @@ class MainWindow(QMainWindow):
                 worker,
                 secret_store,
             )
-            self.history_page = HistoryPage(database, library_service, worker)
+            self.history_page = HistoryTabsPage(
+                database,
+                library_service,
+                worker,
+                repository,
+                resolver,
+                actor,
+            )
             self.library_page = LibraryPage(database, library_service)
             self.page_specs.extend(
                 [
@@ -212,7 +226,11 @@ class MainWindow(QMainWindow):
                 ]
             )
         if self.actor.role == ROLE_ADMIN:
-            self.admin_page = AdminPage(repository, actor)
+            self.admin_page = AdminPage(
+                repository,
+                actor,
+                auto_load=False,
+            )
             self.page_specs.append(("管理控制台", self.admin_page))
         for _, page in self.page_specs:
             self.stack.addWidget(page)
@@ -233,10 +251,11 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.setStatusBar(QStatusBar())
-        self.statusBar().showMessage(
+        self._base_status_message = (
             f"{self.actor.display_name} · {ROLE_LABELS.get(self.actor.role, self.actor.role)} · "
             f"数据目录：{self.paths.root} · 生图请求不会自动重试"
         )
+        self.statusBar().showMessage(self._base_status_message)
 
         self.nav_list.currentRowChanged.connect(self._nav_changed)
         if hasattr(self, "create_page"):
@@ -304,10 +323,32 @@ class MainWindow(QMainWindow):
         if not 0 <= index < len(self.page_specs):
             return
         self.stack.setCurrentIndex(index)
+        if not self._initial_data_loaded:
+            return
         page = self.page_specs[index][1]
+        self._refresh_page(page)
+
+    def _refresh_page(self, page: QWidget) -> None:
         refresh = getattr(page, "refresh", None)
         if callable(refresh):
+            self.statusBar().showMessage("正在加载数据…")
+            QApplication.processEvents()
             refresh()
+            self.statusBar().showMessage(self._base_status_message)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._initial_load_scheduled:
+            return
+        self._initial_load_scheduled = True
+        QTimer.singleShot(0, self._load_initial_page)
+
+    def _load_initial_page(self) -> None:
+        if self._initial_data_loaded:
+            return
+        self._initial_data_loaded = True
+        page = self.page_specs[self.nav_list.currentRow()][1]
+        self._refresh_page(page)
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.database, self)

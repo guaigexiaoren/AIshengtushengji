@@ -282,6 +282,8 @@ class AdminPage(QWidget):
         repository: MySQLCentralRepository,
         actor: AuthUser,
         parent: QWidget | None = None,
+        *,
+        auto_load: bool = True,
     ) -> None:
         super().__init__(parent)
         self.repository = repository
@@ -292,7 +294,8 @@ class AdminPage(QWidget):
         self.api_key_statuses: dict[int, dict] = {}
         self.report_data: ReportData | None = None
         self._build()
-        self.refresh_all()
+        if auto_load:
+            self.refresh_all()
 
     def _build(self) -> None:
         layout = QVBoxLayout(self)

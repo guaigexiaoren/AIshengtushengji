@@ -250,6 +250,16 @@ class MySQLIntegrationTests(unittest.TestCase):
                 ),
             )
             result_id = repository.list_results(task.id)[0].id
+            history = repository.list_project_attempt_history(admin)
+            history_row = next(
+                row for row in history if int(row["id"]) == attempt.id
+            )
+            self.assertEqual(history_row["task_code"], task.task_code)
+            self.assertEqual(int(history_row["result_count"]), 1)
+            self.assertEqual(
+                len(repository.list_attempt_results(attempt.id)),
+                1,
+            )
             repository.submit_for_acceptance(
                 task.id,
                 winner,

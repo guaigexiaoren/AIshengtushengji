@@ -2,12 +2,14 @@ from __future__ import annotations
 
 from functools import partial
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QDate, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QDateEdit,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -60,6 +62,8 @@ class SubmissionListPage(QWidget):
         actor: AuthUser,
         view_mode: str,
         parent: QWidget | None = None,
+        *,
+        auto_load: bool = True,
     ) -> None:
         super().__init__(parent)
         self.repository = repository
@@ -67,10 +71,14 @@ class SubmissionListPage(QWidget):
         self.actor = actor
         self.view_mode = view_mode
         self.projects: list[ProjectRecord] = []
+        self._projects_all: list[ProjectRecord] = []
         self.tasks: list[ProjectTask] = []
         self._all_tasks: list[ProjectTask] = []
+        self._projects_by_id: dict[int, ProjectRecord] = {}
+        self._tasks_by_id: dict[int, ProjectTask] = {}
         self._build()
-        self.refresh()
+        if auto_load:
+            self.refresh()
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
@@ -93,6 +101,22 @@ class SubmissionListPage(QWidget):
         header.addWidget(refresh)
         outer.addLayout(header)
 
+        filters = QHBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText(
+            "搜索编码、货号、运营、制作人员或备注"
+        )
+        self.start_date_edit = self._optional_date_edit("开始日期")
+        self.end_date_edit = self._optional_date_edit("结束日期")
+        reset_filter = QPushButton("重置筛选")
+        filters.addWidget(self.search_edit, 1)
+        filters.addWidget(QLabel("创建时间"))
+        filters.addWidget(self.start_date_edit)
+        filters.addWidget(QLabel("至"))
+        filters.addWidget(self.end_date_edit)
+        filters.addWidget(reset_filter)
+        outer.addLayout(filters)
+
         self.project_table = QTableWidget(0, 7)
         self.project_table.setHorizontalHeaderLabels(
             ["任务编码", "货号", "运营", "日期", "任务状态", "子任务进度", "加急"]
@@ -105,6 +129,7 @@ class SubmissionListPage(QWidget):
         )
         self.project_table.horizontalHeader().setStretchLastSection(True)
         self.project_table.setMaximumHeight(220)
+        self.project_table.setSortingEnabled(True)
         self.project_table.itemSelectionChanged.connect(self._project_selected)
         outer.addWidget(self.project_table)
 
@@ -112,7 +137,7 @@ class SubmissionListPage(QWidget):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 8, 8, 0)
-        self.task_table = QTableWidget(0, 7)
+        self.task_table = QTableWidget(0, 8)
         self.task_table.setHorizontalHeaderLabels(
             [
                 "子任务编码",
@@ -120,6 +145,7 @@ class SubmissionListPage(QWidget):
                 "制作人员",
                 "状态",
                 "加急",
+                "创建时间",
                 "更新时间",
                 "操作",
             ]
@@ -131,6 +157,7 @@ class SubmissionListPage(QWidget):
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
         self.task_table.horizontalHeader().setStretchLastSection(True)
+        self.task_table.setSortingEnabled(True)
         self.task_table.itemSelectionChanged.connect(self._task_selected)
         left_layout.addWidget(self.task_table, 1)
         self.info_line = QLabel("选择一个子任务查看详情")
@@ -169,6 +196,20 @@ class SubmissionListPage(QWidget):
         body.addWidget(self.preview_tabs)
         body.setSizes([760, 440])
         outer.addWidget(body, 1)
+        self.search_edit.textChanged.connect(self._apply_filters)
+        self.start_date_edit.dateChanged.connect(self._apply_filters)
+        self.end_date_edit.dateChanged.connect(self._apply_filters)
+        reset_filter.clicked.connect(self._reset_filters)
+
+    @staticmethod
+    def _optional_date_edit(placeholder: str) -> QDateEdit:
+        widget = QDateEdit()
+        widget.setCalendarPopup(True)
+        widget.setDisplayFormat("yyyy-MM-dd")
+        widget.setMinimumDate(QDate(2000, 1, 1))
+        widget.setSpecialValueText(placeholder)
+        widget.setDate(widget.minimumDate())
+        return widget
 
     def _build_reference_preview(self) -> QWidget:
         widget = QWidget()
@@ -204,9 +245,68 @@ class SubmissionListPage(QWidget):
             for task in self._all_tasks
             if task.status in statuses
         }
-        self.projects = [
+        self._projects_all = [
             project for project in projects if project.id in visible_ids
         ]
+        self._apply_filters()
+
+    def _reset_filters(self) -> None:
+        self.search_edit.clear()
+        self.start_date_edit.setDate(self.start_date_edit.minimumDate())
+        self.end_date_edit.setDate(self.end_date_edit.minimumDate())
+        self._apply_filters()
+
+    def _apply_filters(self, *_args) -> None:
+        statuses = set(VIEW_STATUSES[self.view_mode])
+        keyword = self.search_edit.text().strip().casefold()
+        start = (
+            self.start_date_edit.date().toPython()
+            if self.start_date_edit.date() != self.start_date_edit.minimumDate()
+            else None
+        )
+        end = (
+            self.end_date_edit.date().toPython()
+            if self.end_date_edit.date() != self.end_date_edit.minimumDate()
+            else None
+        )
+        matching_tasks: dict[int, list[ProjectTask]] = {}
+        for task in self._all_tasks:
+            if task.status not in statuses:
+                continue
+            created = utc_naive_to_local(task.created_at).date()
+            if start is not None and created < start:
+                continue
+            if end is not None and created > end:
+                continue
+            matching_tasks.setdefault(task.project_id, []).append(task)
+        filtered_projects = []
+        for project in self._projects_all:
+            project_tasks = matching_tasks.get(project.id, [])
+            project_text = " ".join(
+                (
+                    project.project_code,
+                    project.product_code or project.name,
+                    project.owner_name,
+                    project.note,
+                )
+            ).casefold()
+            task_match = any(
+                keyword in " ".join(
+                    (
+                        task.task_code,
+                        task.product_code or task.project_name,
+                        task.assignee_name,
+                    )
+                ).casefold()
+                for task in project_tasks
+            )
+            if project_tasks and (not keyword or keyword in project_text or task_match):
+                filtered_projects.append(project)
+        self.projects = filtered_projects
+        self._projects_by_id = {
+            project.id: project for project in filtered_projects
+        }
+        self.project_table.setSortingEnabled(False)
         self.project_table.setRowCount(0)
         for project in self.projects:
             row = self.project_table.rowCount()
@@ -225,6 +325,7 @@ class SubmissionListPage(QWidget):
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, project.id)
                 self.project_table.setItem(row, column, item)
+        self.project_table.setSortingEnabled(True)
         if self.projects:
             self.project_table.selectRow(0)
         else:
@@ -242,8 +343,11 @@ class SubmissionListPage(QWidget):
 
     def _current_project(self) -> ProjectRecord | None:
         row = self.project_table.currentRow()
-        if 0 <= row < len(self.projects):
-            return self.projects[row]
+        item = self.project_table.item(row, 0) if row >= 0 else None
+        if item is not None:
+            return self._projects_by_id.get(
+                int(item.data(Qt.ItemDataRole.UserRole))
+            )
         return None
 
     def _project_selected(self) -> None:
@@ -251,11 +355,26 @@ class SubmissionListPage(QWidget):
         if project is None:
             return
         statuses = set(VIEW_STATUSES[self.view_mode])
+        keyword = self.search_edit.text().strip().casefold()
+        start = (
+            self.start_date_edit.date().toPython()
+            if self.start_date_edit.date() != self.start_date_edit.minimumDate()
+            else None
+        )
+        end = (
+            self.end_date_edit.date().toPython()
+            if self.end_date_edit.date() != self.end_date_edit.minimumDate()
+            else None
+        )
         self.tasks = [
             task
             for task in self._all_tasks
-            if task.project_id == project.id and task.status in statuses
+            if task.project_id == project.id
+            and task.status in statuses
+            and self._task_matches(task, project, keyword, start, end)
         ]
+        self._tasks_by_id = {task.id: task for task in self.tasks}
+        self.task_table.setSortingEnabled(False)
         self.task_table.setRowCount(0)
         for task in self.tasks:
             row = self.task_table.rowCount()
@@ -266,6 +385,9 @@ class SubmissionListPage(QWidget):
                 task.assignee_name or "未分配",
                 TASK_STATUS_LABELS.get(task.status, task.status),
                 "是" if task.is_urgent else "否",
+                utc_naive_to_local(
+                    task.created_at
+                ).strftime("%Y-%m-%d %H:%M"),
                 utc_naive_to_local(
                     task.submitted_at or task.returned_at or task.created_at
                 ).strftime("%Y-%m-%d %H:%M"),
@@ -279,11 +401,12 @@ class SubmissionListPage(QWidget):
                 edit = QPushButton("修改素材与配对")
                 edit.setEnabled(self._can_edit_task(task))
                 edit.clicked.connect(partial(self._edit_task, task))
-                self.task_table.setCellWidget(row, 6, edit)
+                self.task_table.setCellWidget(row, 7, edit)
             else:
                 self.task_table.setItem(
-                    row, 6, QTableWidgetItem("")
+                    row, 7, QTableWidgetItem("")
                 )
+        self.task_table.setSortingEnabled(True)
         if self.tasks:
             self.task_table.selectRow(0)
             self._task_selected()
@@ -295,10 +418,41 @@ class SubmissionListPage(QWidget):
             )
         self._update_actions()
 
+    @staticmethod
+    def _task_matches(
+        task: ProjectTask,
+        project: ProjectRecord,
+        keyword: str,
+        start,
+        end,
+    ) -> bool:
+        created = utc_naive_to_local(task.created_at).date()
+        if start is not None and created < start:
+            return False
+        if end is not None and created > end:
+            return False
+        if not keyword:
+            return True
+        searchable = " ".join(
+            (
+                task.task_code,
+                task.product_code or task.project_name,
+                task.assignee_name,
+                project.project_code,
+                project.product_code or project.name,
+                project.owner_name,
+                project.note,
+            )
+        ).casefold()
+        return keyword in searchable
+
     def _current_task(self) -> ProjectTask | None:
         row = self.task_table.currentRow()
-        if 0 <= row < len(self.tasks):
-            return self.tasks[row]
+        item = self.task_table.item(row, 0) if row >= 0 else None
+        if item is not None:
+            return self._tasks_by_id.get(
+                int(item.data(Qt.ItemDataRole.UserRole))
+            )
         return None
 
     def _can_manage(self, project: ProjectRecord | None) -> bool:

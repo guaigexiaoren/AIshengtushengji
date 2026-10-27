@@ -2213,6 +2213,52 @@ class MySQLCentralRepository:
                 )
                 return [_generation_attempt(row) for row in cursor.fetchall()]
 
+    def list_project_attempt_history(
+        self,
+        actor: AuthUser,
+        *,
+        limit: int = 5000,
+    ) -> list[dict[str, Any]]:
+        if actor.role not in (ROLE_AI, ROLE_ADMIN):
+            raise PermissionDeniedError("当前角色不能查看项目生成历史")
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT ga.*, u.display_name AS operator_name,
+                           t.task_code, t.project_id,
+                           p.project_code, p.product_code,
+                           p.name AS project_name,
+                           COUNT(gr.id) AS result_count
+                    FROM generation_attempts ga
+                    JOIN project_tasks t ON t.id = ga.task_id
+                    JOIN projects p ON p.id = t.project_id
+                    JOIN users u ON u.id = ga.operator_id
+                    LEFT JOIN generation_results gr ON gr.attempt_id = ga.id
+                    GROUP BY ga.id, u.display_name, t.task_code,
+                             t.project_id, p.project_code, p.product_code,
+                             p.name
+                    ORDER BY ga.created_at DESC, ga.id DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                return [dict(row) for row in cursor.fetchall()]
+
+    def list_attempt_results(self, attempt_id: int) -> list[GenerationResult]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT *
+                    FROM generation_results
+                    WHERE attempt_id = %s
+                    ORDER BY result_index
+                    """,
+                    (attempt_id,),
+                )
+                return [_generation_result(row) for row in cursor.fetchall()]
+
     def recover_stale_generation_attempts(self, hours: int = 24) -> int:
         cutoff = utc_now() - timedelta(hours=hours)
         with self.connection() as connection:

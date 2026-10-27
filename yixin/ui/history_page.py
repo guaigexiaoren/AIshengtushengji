@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -28,6 +29,9 @@ from ..constants import (
     TASK_RUNNING,
     TASK_SUCCESS,
 )
+from ..collaboration.repository import MySQLCentralRepository
+from ..collaboration.shared_paths import SharedPathResolver
+from ..collaboration.types import AuthUser
 from ..database import Database
 from ..library import LibraryService
 from ..local_export import LocalImageExporter
@@ -35,9 +39,55 @@ from ..settings import AUTO_STRATEGY_LABELS, AppSettings
 from ..time_utils import format_task_elapsed
 from ..worker import TaskWorker
 from .save_helpers import LocalSaveController, show_saved_path, show_saved_toast
+from .project_history_page import ProjectHistoryPage
 from .widgets import ImageStrip, ImageView, TaskImageAsset, build_task_assets
 
 TASK_DATA_ROLE = int(Qt.ItemDataRole.UserRole) + 1
+
+
+class HistoryTabsPage(QWidget):
+    library_changed = Signal()
+    retry_requested = Signal(int)
+
+    def __init__(
+        self,
+        database: Database,
+        library_service: LibraryService,
+        worker: TaskWorker,
+        repository: MySQLCentralRepository,
+        resolver: SharedPathResolver,
+        actor: AuthUser,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.tabs = QTabWidget()
+        self.ordinary_page = HistoryPage(
+            database,
+            library_service,
+            worker,
+            auto_load=False,
+        )
+        self.project_page = ProjectHistoryPage(
+            repository,
+            resolver,
+            actor,
+            auto_load=False,
+        )
+        self.tabs.addTab(self.ordinary_page, "普通创作")
+        self.tabs.addTab(self.project_page, "项目任务")
+        layout.addWidget(self.tabs)
+        self.ordinary_page.library_changed.connect(
+            self.library_changed.emit
+        )
+        self.ordinary_page.retry_requested.connect(
+            self.retry_requested.emit
+        )
+
+    def refresh(self) -> None:
+        self.ordinary_page.refresh()
+        self.project_page.refresh()
 
 
 class HistoryPage(QWidget):
@@ -50,6 +100,8 @@ class HistoryPage(QWidget):
         library_service: LibraryService,
         worker: TaskWorker,
         parent: QWidget | None = None,
+        *,
+        auto_load: bool = True,
     ) -> None:
         super().__init__(parent)
         self.database = database
@@ -169,7 +221,8 @@ class HistoryPage(QWidget):
         self.save_library_button.clicked.connect(self._save_library_result)
         self.worker.signals.task_changed.connect(self._on_worker_task_changed)
         self._set_actions(False)
-        self.refresh()
+        if auto_load:
+            self.refresh()
         self.elapsed_timer = QTimer(self)
         self.elapsed_timer.setInterval(1000)
         self.elapsed_timer.timeout.connect(self._update_elapsed_displays)

@@ -1,21 +1,23 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDateEdit,
     QFileDialog,
-    QFormLayout,
     QGridLayout,
     QGroupBox,
     QHeaderView,
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -40,6 +42,9 @@ from ..collaboration.types import (
     ROLE_ADMIN,
     ROLE_AI,
     TASK_AVAILABLE,
+    TASK_APPROVED,
+    TASK_AWAITING_ACCEPTANCE,
+    TASK_CANCELLED,
     TASK_CLAIMED,
     TASK_RETURNED,
     TASK_STATUS_LABELS,
@@ -50,6 +55,7 @@ from ..collaboration.types import (
 from ..collaboration.worker import ProjectGenerationWorker
 from ..constants import (
     ASPECT_RATIOS,
+    BUILTIN_PROMPT_TEMPLATES,
     MODEL_LABELS,
     MODEL_SELECTION_OPTIONS,
     RESOLUTIONS,
@@ -69,7 +75,7 @@ from .crop import CropDialog
 from .dialogs import CompareDialog, LibraryPickerDialog
 from .result_gallery import ResultGallery
 from .save_helpers import show_saved_toast
-from .widgets import ImageStrip, ImageView, scan_image_inputs
+from .widgets import ImageStrip, scan_image_inputs
 
 
 ATTEMPT_LABELS = {
@@ -79,6 +85,16 @@ ATTEMPT_LABELS = {
     ATTEMPT_FAILED: "失败",
     "manual_ps": "PS成品",
 }
+
+
+@dataclass(frozen=True)
+class ProjectTaskGroup:
+    project_id: int
+    project_code: str
+    product_code: str
+    tasks: tuple[ProjectTask, ...]
+    created_at: object
+    status: str
 
 
 class TaskCenterPage(QWidget):
@@ -93,6 +109,8 @@ class TaskCenterPage(QWidget):
         app_settings: AppSettings,
         library_service: LibraryService | None = None,
         parent: QWidget | None = None,
+        *,
+        auto_load: bool = True,
     ) -> None:
         super().__init__(parent)
         self.repository = repository
@@ -104,18 +122,23 @@ class TaskCenterPage(QWidget):
         self.app_settings = app_settings
         self.library_service = library_service
         self.tasks: list[ProjectTask] = []
+        self.project_groups: list[ProjectTaskGroup] = []
+        self.visible_project_tasks: list[ProjectTask] = []
+        self.current_project_id: int | None = None
         self.current_task: ProjectTask | None = None
+        self._groups_by_id: dict[int, ProjectTaskGroup] = {}
+        self._tasks_by_id: dict[int, ProjectTask] = {}
         self.local_store: LocalTaskSourceStore | None = None
         self.local_state: LocalSourceState | None = None
         self.active_workers: set[ProjectGenerationWorker] = set()
         self.waiting_jobs: deque[dict] = deque()
-        self._syncing_splitters = False
         self._build()
         self.queue_timer = QTimer(self)
         self.queue_timer.setInterval(1200)
         self.queue_timer.timeout.connect(self._refresh_queue)
         self.queue_timer.start()
-        self.refresh()
+        if auto_load:
+            self.refresh()
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
@@ -129,37 +152,104 @@ class TaskCenterPage(QWidget):
         title_box.addWidget(subtitle)
         header.addLayout(title_box, 1)
         self.include_finished = QCheckBox("显示已完成")
-        self.include_finished.toggled.connect(self.refresh)
         refresh = QPushButton("刷新")
         refresh.clicked.connect(self.refresh)
         header.addWidget(self.include_finished)
         header.addWidget(refresh)
         outer.addLayout(header)
 
+        filters = QHBoxLayout()
+        self.project_filter_combo = QComboBox()
+        self.project_filter_combo.addItem("全部任务", None)
+        self.product_search = QLineEdit()
+        self.product_search.setPlaceholderText("搜索货号")
+        self.center_start_date = self._optional_date_edit("开始日期")
+        self.center_end_date = self._optional_date_edit("结束日期")
+        reset_filter = QPushButton("重置筛选")
+        filters.addWidget(QLabel("任务"))
+        filters.addWidget(self.project_filter_combo, 1)
+        filters.addWidget(self.product_search, 1)
+        filters.addWidget(QLabel("创建时间"))
+        filters.addWidget(self.center_start_date)
+        filters.addWidget(QLabel("至"))
+        filters.addWidget(self.center_end_date)
+        filters.addWidget(reset_filter)
+        outer.addLayout(filters)
+        self.project_filter_combo.currentIndexChanged.connect(
+            self._apply_task_filters
+        )
+        self.product_search.textChanged.connect(self._apply_task_filters)
+        self.center_start_date.dateChanged.connect(self._apply_task_filters)
+        self.center_end_date.dateChanged.connect(self._apply_task_filters)
+        reset_filter.clicked.connect(self._reset_filters)
+        self.include_finished.toggled.connect(self._apply_task_filters)
+
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_task_panel())
         splitter.addWidget(self._build_generation_panel())
         splitter.addWidget(self._build_candidate_panel())
-        splitter.setSizes([330, 520, 500])
+        splitter.setSizes([390, 610, 500])
         outer.addWidget(splitter, 1)
-        self.task_splitter.splitterMoved.connect(
-            self._sync_generation_splitter
-        )
-        self.generation_splitter.splitterMoved.connect(
-            self._sync_task_splitter
-        )
-        QTimer.singleShot(0, self._sync_generation_splitter)
+
+    @staticmethod
+    def _optional_date_edit(placeholder: str) -> QDateEdit:
+        widget = QDateEdit()
+        widget.setCalendarPopup(True)
+        widget.setDisplayFormat("yyyy-MM-dd")
+        widget.setMinimumDate(QDate(2000, 1, 1))
+        widget.setSpecialValueText(placeholder)
+        widget.setDate(widget.minimumDate())
+        return widget
 
     def _build_task_panel(self) -> QWidget:
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 8, 0)
-        title = QLabel("任务列表")
-        title.setStyleSheet("font-size:16px;font-weight:700;")
-        self.task_table = QTableWidget(0, 4)
-        self.task_table.setHorizontalHeaderLabels(
-            ["子任务", "货号", "状态", "制作人员"]
+        self.task_splitter = QSplitter(Qt.Orientation.Vertical)
+        project_host = QWidget()
+        project_layout = QVBoxLayout(project_host)
+        project_layout.setContentsMargins(0, 0, 0, 0)
+        project_title = QLabel("任务列表")
+        project_title.setStyleSheet("font-size:16px;font-weight:700;")
+        project_layout.addWidget(project_title)
+        self.project_table = QTableWidget(0, 5)
+        self.project_table.setHorizontalHeaderLabels(
+            ["任务编码", "货号", "子任务进度", "状态", "创建时间"]
         )
+        self.project_table.verticalHeader().setVisible(False)
+        self.project_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.project_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.project_table.horizontalHeader().setStretchLastSection(True)
+        self.project_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        for column in range(5):
+            self.project_table.horizontalHeader().setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.Stretch,
+            )
+        self.project_table.setSortingEnabled(True)
+        self.project_table.itemSelectionChanged.connect(
+            self._project_selected
+        )
+        project_layout.addWidget(self.project_table, 1)
+        self.task_splitter.addWidget(project_host)
+
+        subtask_host = QWidget()
+        subtask_layout = QVBoxLayout(subtask_host)
+        subtask_layout.setContentsMargins(0, 0, 0, 0)
+        subtask_title = QLabel("子任务明细")
+        subtask_title.setStyleSheet("font-size:16px;font-weight:700;")
+        subtask_layout.addWidget(subtask_title)
+        self.task_table = QTableWidget(0, 5)
+        self.task_table.setHorizontalHeaderLabels(
+            ["子任务编码", "制作人员", "状态", "加急", "创建时间"]
+        )
+        self.task_table.verticalHeader().setVisible(False)
         self.task_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
@@ -167,69 +257,21 @@ class TaskCenterPage(QWidget):
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
         self.task_table.horizontalHeader().setStretchLastSection(True)
-        self.task_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
+        self.task_table.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
+        for column in range(5):
+            self.task_table.horizontalHeader().setSectionResizeMode(
+                column,
+                QHeaderView.ResizeMode.Stretch,
+            )
+        self.task_table.setSortingEnabled(True)
         self.task_table.itemSelectionChanged.connect(self._task_selected)
-        self.task_splitter = QSplitter(Qt.Orientation.Vertical)
-        task_host = QWidget()
-        task_layout = QVBoxLayout(task_host)
-        task_layout.setContentsMargins(0, 0, 0, 0)
-        task_layout.addWidget(title)
-        task_layout.addWidget(self.task_table, 1)
-        self.task_splitter.addWidget(task_host)
-        queue_card = QGroupBox("生成任务队列")
-        queue_layout = QVBoxLayout(queue_card)
-        self.queue_table = QTableWidget(0, 4)
-        self.queue_table.setHorizontalHeaderLabels(
-            ["轮次", "操作人员", "状态", "时间"]
-        )
-        self.queue_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        self.queue_table.horizontalHeader().setStretchLastSection(True)
-        queue_layout.addWidget(self.queue_table)
-        self.queue_hint = QLabel()
-        self.queue_hint.setStyleSheet("color:#60708a;")
-        queue_layout.addWidget(self.queue_hint)
-        self.task_splitter.addWidget(queue_card)
-        self.task_splitter.setSizes([520, 300])
+        subtask_layout.addWidget(self.task_table, 1)
+        self.task_splitter.addWidget(subtask_host)
+        self.task_splitter.setSizes([420, 400])
         layout.addWidget(self.task_splitter, 1)
         return panel
-
-    def _sync_generation_splitter(self, *_args) -> None:
-        if self._syncing_splitters:
-            return
-        source = self.task_splitter.sizes()
-        if len(source) == 2:
-            self._align_splitters(source[0])
-
-    def _sync_task_splitter(self, *_args) -> None:
-        if self._syncing_splitters:
-            return
-        source = self.generation_splitter.sizes()
-        if len(source) == 2:
-            self._align_splitters(source[0])
-
-    def _align_splitters(self, requested_top: int) -> None:
-        self._syncing_splitters = True
-        try:
-            totals = (
-                sum(self.task_splitter.sizes()),
-                sum(self.generation_splitter.sizes()),
-            )
-            target_total = min(value for value in totals if value > 0)
-            if target_total:
-                top = max(0, min(int(requested_top), target_total))
-                self.task_splitter.setSizes([top, target_total - top])
-                self.generation_splitter.setSizes([top, target_total - top])
-                task_top = self.task_splitter.sizes()[0]
-                generation_top = self.generation_splitter.sizes()[0]
-                top = min(task_top, generation_top)
-                self.task_splitter.setSizes([top, target_total - top])
-                self.generation_splitter.setSizes([top, target_total - top])
-        finally:
-            self._syncing_splitters = False
 
     def _build_generation_panel(self) -> QWidget:
         self.generation_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -246,14 +288,8 @@ class TaskCenterPage(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         top_layout.addWidget(self.task_detail)
-        source_tools = QGridLayout()
-        source_tools.setHorizontalSpacing(6)
-        source_tools.setVerticalSpacing(4)
-        self.source_role_combo = QComboBox()
-        self.source_role_combo.addItem("衣服图", "garment")
-        self.source_role_combo.addItem("模特图", "model")
-        source_tools.addWidget(QLabel("当前素材"), 0, 0)
-        source_tools.addWidget(self.source_role_combo, 0, 1)
+        source_tools = QHBoxLayout()
+        source_tools.setSpacing(4)
         self.add_source_files_button = QPushButton("添加图片")
         self.add_source_folder_button = QPushButton("添加文件夹")
         self.add_source_library_button = QPushButton("从作品库添加")
@@ -261,40 +297,27 @@ class TaskCenterPage(QWidget):
         self.restore_source_button = QPushButton("恢复")
         self.remove_source_button = QPushButton("移除所选")
         self.clear_sources_button = QPushButton("清空")
-        add_buttons = (
+        for button in (
             self.add_source_files_button,
             self.add_source_folder_button,
             self.add_source_library_button,
-        )
-        edit_buttons = (
             self.crop_source_button,
             self.restore_source_button,
             self.remove_source_button,
             self.clear_sources_button,
-        )
-        for column, button in enumerate(add_buttons, start=2):
-            source_tools.addWidget(button, 0, column)
-        for column, button in enumerate(edit_buttons, start=2):
-            source_tools.addWidget(button, 1, column)
-        source_tools.setColumnStretch(9, 1)
+        ):
+            button.setStyleSheet("padding:5px 7px;")
+            source_tools.addWidget(button)
+        source_tools.addStretch(1)
         top_layout.addLayout(source_tools)
-        self.local_source_hint = QLabel(
-            "当前使用共享盘素材；本机修改仅影响当前账号和本机生成"
-        )
-        self.local_source_hint.setStyleSheet("color:#9a5b22;")
+        self.local_source_hint = QLabel()
+        self.local_source_hint.hide()
         top_layout.addWidget(self.local_source_hint)
-        self.source_strip = ImageStrip(icon_size=96)
+        self.source_strip = ImageStrip(icon_size=82)
         self.source_strip.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
-        self.source_strip.currentRowChanged.connect(
-            self._show_source_image
-        )
-        self.source_preview = ImageView()
-        self.source_preview.set_placeholder("选择参考图查看大图")
-        self.source_preview.setMinimumHeight(100)
         top_layout.addWidget(self.source_strip)
-        top_layout.addWidget(self.source_preview, 1)
         self.add_source_files_button.clicked.connect(
             self._add_source_files
         )
@@ -310,8 +333,8 @@ class TaskCenterPage(QWidget):
         self.clear_sources_button.clicked.connect(self._clear_sources)
         self.generation_splitter.addWidget(top)
 
-        bottom = QWidget()
-        layout = QVBoxLayout(bottom)
+        middle = QWidget()
+        layout = QVBoxLayout(middle)
         layout.setContentsMargins(8, 0, 8, 0)
         prompt_card = QGroupBox("提示词与参数")
         prompt_layout = QVBoxLayout(prompt_card)
@@ -330,7 +353,7 @@ class TaskCenterPage(QWidget):
         )
         self.prompt_edit.setMinimumHeight(120)
         prompt_layout.addWidget(self.prompt_edit)
-        form = QFormLayout()
+        form = QGridLayout()
         self.model_combo = QComboBox()
         for label, model_id in MODEL_SELECTION_OPTIONS:
             self.model_combo.addItem(label, model_id)
@@ -348,10 +371,17 @@ class TaskCenterPage(QWidget):
         self.count_spin = QSpinBox()
         self.count_spin.setRange(1, 4)
         self.count_spin.setValue(1)
-        form.addRow("模型", self.model_combo)
-        form.addRow("宽高比", self.aspect_combo)
-        form.addRow("分辨率", self.resolution_combo)
-        form.addRow("每次数量", self.count_spin)
+        self.parameters_grid = form
+        form.addWidget(QLabel("模型"), 0, 0)
+        form.addWidget(self.model_combo, 0, 1)
+        form.addWidget(QLabel("宽高比"), 0, 2)
+        form.addWidget(self.aspect_combo, 0, 3)
+        form.addWidget(QLabel("分辨率"), 1, 0)
+        form.addWidget(self.resolution_combo, 1, 1)
+        form.addWidget(QLabel("每次数量"), 1, 2)
+        form.addWidget(self.count_spin, 1, 3)
+        form.setColumnStretch(1, 1)
+        form.setColumnStretch(3, 1)
         prompt_layout.addLayout(form)
         action_row = QHBoxLayout()
         self.generate_button = QPushButton("加入生成队列")
@@ -361,8 +391,25 @@ class TaskCenterPage(QWidget):
         action_row.addWidget(self.generate_button)
         prompt_layout.addLayout(action_row)
         layout.addWidget(prompt_card)
-        self.generation_splitter.addWidget(bottom)
-        self.generation_splitter.setSizes([520, 300])
+        self.generation_splitter.addWidget(middle)
+
+        queue_card = QGroupBox("生成任务队列")
+        queue_layout = QVBoxLayout(queue_card)
+        self.queue_table = QTableWidget(0, 5)
+        self.queue_table.setHorizontalHeaderLabels(
+            ["轮次", "操作人员", "状态", "创建时间", "结果数"]
+        )
+        self.queue_table.verticalHeader().setVisible(False)
+        self.queue_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.queue_table.horizontalHeader().setStretchLastSection(True)
+        queue_layout.addWidget(self.queue_table)
+        self.queue_hint = QLabel()
+        self.queue_hint.setStyleSheet("color:#60708a;")
+        queue_layout.addWidget(self.queue_hint)
+        self.generation_splitter.addWidget(queue_card)
+        self.generation_splitter.setSizes([220, 380, 260])
         return self.generation_splitter
 
     def _build_candidate_panel(self) -> QWidget:
@@ -410,23 +457,196 @@ class TaskCenterPage(QWidget):
                 self.resolver = SharedPathResolver(shared_root)
             self.tasks = self.repository.list_board_tasks(
                 self.actor,
-                include_finished=self.include_finished.isChecked(),
+                include_finished=True,
                 limit=10000,
             )
         except Exception as exc:
             QMessageBox.warning(self, "读取任务失败", str(exc))
             return
         self._refresh_templates()
-        selected_id = self.current_task.id if self.current_task else None
+        self._build_project_groups()
+        self._populate_project_filter()
+        self._apply_task_filters()
+        self._resume_queued_jobs()
+        self._pump_queue()
+        self._update_controls()
+
+    @staticmethod
+    def _group_status(tasks: tuple[ProjectTask, ...]) -> str:
+        statuses = {task.status for task in tasks}
+        if statuses and statuses <= {TASK_APPROVED}:
+            return "已完成"
+        if TASK_AWAITING_ACCEPTANCE in statuses:
+            return "待审核"
+        if statuses <= {TASK_AVAILABLE}:
+            return "已提交"
+        if statuses <= {TASK_CANCELLED}:
+            return "已取消"
+        return "制作中"
+
+    def _build_project_groups(self) -> None:
+        grouped: dict[int, list[ProjectTask]] = {}
+        for task in self.tasks:
+            grouped.setdefault(task.project_id, []).append(task)
+        self.project_groups = [
+            ProjectTaskGroup(
+                project_id=project_id,
+                project_code=project_tasks[0].project_code,
+                product_code=(
+                    project_tasks[0].product_code
+                    or project_tasks[0].project_name
+                ),
+                tasks=tuple(project_tasks),
+                created_at=min(task.created_at for task in project_tasks),
+                status=self._group_status(tuple(project_tasks)),
+            )
+            for project_id, project_tasks in grouped.items()
+        ]
+        self.project_groups.sort(
+            key=lambda group: group.created_at,
+            reverse=True,
+        )
+        self._groups_by_id = {
+            group.project_id: group for group in self.project_groups
+        }
+
+    def _populate_project_filter(self) -> None:
+        selected = self.project_filter_combo.currentData()
+        self.project_filter_combo.blockSignals(True)
+        self.project_filter_combo.clear()
+        self.project_filter_combo.addItem("全部任务", None)
+        for group in self.project_groups:
+            self.project_filter_combo.addItem(
+                f"{group.project_code} · {group.product_code}",
+                group.project_id,
+            )
+        index = self.project_filter_combo.findData(selected)
+        self.project_filter_combo.setCurrentIndex(max(0, index))
+        self.project_filter_combo.blockSignals(False)
+
+    def _reset_filters(self) -> None:
+        self.project_filter_combo.setCurrentIndex(0)
+        self.product_search.clear()
+        self.center_start_date.setDate(self.center_start_date.minimumDate())
+        self.center_end_date.setDate(self.center_end_date.minimumDate())
+        self._apply_task_filters()
+
+    def _apply_task_filters(self, *_args) -> None:
+        keyword = self.product_search.text().strip().casefold()
+        project_id = self.project_filter_combo.currentData()
+        start = (
+            self.center_start_date.date().toPython()
+            if self.center_start_date.date()
+            != self.center_start_date.minimumDate()
+            else None
+        )
+        end = (
+            self.center_end_date.date().toPython()
+            if self.center_end_date.date() != self.center_end_date.minimumDate()
+            else None
+        )
+        include_finished = self.include_finished.isChecked()
+
+        def task_visible(task: ProjectTask) -> bool:
+            return include_finished or task.status not in (
+                TASK_APPROVED,
+                TASK_CANCELLED,
+            )
+
+        visible_groups = []
+        for group in self.project_groups:
+            created = utc_naive_to_local(group.created_at).date()
+            if project_id is not None and group.project_id != project_id:
+                continue
+            if keyword and keyword not in group.product_code.casefold():
+                continue
+            if start is not None and created < start:
+                continue
+            if end is not None and created > end:
+                continue
+            if not any(task_visible(task) for task in group.tasks):
+                continue
+            visible_groups.append(group)
+        self.project_table.setSortingEnabled(False)
+        self.project_table.setRowCount(0)
+        for group in visible_groups:
+            row = self.project_table.rowCount()
+            self.project_table.insertRow(row)
+            approved = sum(
+                task.status == TASK_APPROVED for task in group.tasks
+            )
+            values = (
+                group.project_code,
+                group.product_code,
+                f"{approved}/{len(group.tasks)}",
+                group.status,
+                utc_naive_to_local(group.created_at).strftime(
+                    "%Y-%m-%d %H:%M"
+                ),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(
+                        Qt.ItemDataRole.UserRole,
+                        group.project_id,
+                    )
+                self.project_table.setItem(row, column, item)
+        self.project_table.setSortingEnabled(True)
+        if not self.project_table.rowCount():
+            self.current_project_id = None
+            self.current_task = None
+            self.task_table.setRowCount(0)
+            self.source_strip.clear()
+            self.gallery.clear()
+            return
+        target_row = 0
+        for row in range(self.project_table.rowCount()):
+            item = self.project_table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == (
+                self.current_project_id
+            ):
+                target_row = row
+                break
+        self.project_table.selectRow(target_row)
+        self._project_selected()
+
+    def _project_selected(self) -> None:
+        row = self.project_table.currentRow()
+        item = self.project_table.item(row, 0) if row >= 0 else None
+        project_id = (
+            int(item.data(Qt.ItemDataRole.UserRole))
+            if item is not None
+            else None
+        )
+        group = self._groups_by_id.get(project_id)
+        if group is None:
+            return
+        self.current_project_id = group.project_id
+        include_finished = self.include_finished.isChecked()
+        self.visible_project_tasks = [
+            task
+            for task in group.tasks
+            if include_finished
+            or task.status not in (TASK_APPROVED, TASK_CANCELLED)
+        ]
+        self._tasks_by_id = {
+            task.id: task for task in self.visible_project_tasks
+        }
+        selected_task_id = self.current_task.id if self.current_task else None
+        self.task_table.setSortingEnabled(False)
         self.task_table.setRowCount(0)
-        selected_row = -1
-        for row, task in enumerate(self.tasks):
+        for task in self.visible_project_tasks:
+            row = self.task_table.rowCount()
             self.task_table.insertRow(row)
             values = (
                 task.task_code,
-                task.product_code or task.project_name,
-                TASK_STATUS_LABELS.get(task.status, task.status),
                 task.assignee_name or "未分配",
+                TASK_STATUS_LABELS.get(task.status, task.status),
+                "是" if task.is_urgent else "否",
+                utc_naive_to_local(task.created_at).strftime(
+                    "%Y-%m-%d %H:%M"
+                ),
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -435,35 +655,39 @@ class TaskCenterPage(QWidget):
                 if task.is_urgent:
                     item.setBackground(Qt.GlobalColor.yellow)
                 self.task_table.setItem(row, column, item)
-            if task.id == selected_id:
-                selected_row = row
-        if selected_row >= 0:
-            self.task_table.selectRow(selected_row)
-        elif self.tasks:
-            self.task_table.selectRow(0)
-        else:
+        self.task_table.setSortingEnabled(True)
+        if not self.task_table.rowCount():
             self.current_task = None
-            self.task_detail.setText("当前没有可查看的任务")
             self.source_strip.clear()
-            self.source_preview.set_image(None)
-            self.source_preview.set_placeholder("当前没有参考图")
             self.gallery.clear()
-        self._resume_queued_jobs()
-        self._pump_queue()
-        self._update_controls()
+            self.task_detail.setText("该任务当前没有可显示的子任务")
+            self._update_controls()
+            return
+        target_row = 0
+        for row in range(self.task_table.rowCount()):
+            item = self.task_table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == (
+                selected_task_id
+            ):
+                target_row = row
+                break
+        self.task_table.selectRow(target_row)
+        self._task_selected()
 
     def _task_selected(self) -> None:
         row = self.task_table.currentRow()
-        self.current_task = (
-            self.tasks[row] if 0 <= row < len(self.tasks) else None
+        item = self.task_table.item(row, 0) if row >= 0 else None
+        task_id = (
+            int(item.data(Qt.ItemDataRole.UserRole))
+            if item is not None
+            else None
         )
+        self.current_task = self._tasks_by_id.get(task_id)
         task = self.current_task
         self.source_strip.clear()
-        self.source_preview.set_image(None)
         if task is None:
             self.local_store = None
             self.local_state = None
-            self.local_source_hint.setText("尚未选择任务")
             self.gallery.clear()
             self._update_controls()
             return
@@ -480,7 +704,30 @@ class TaskCenterPage(QWidget):
             self.local_state = None
             self.local_source_hint.setText(f"本机素材加载失败：{exc}")
         self._refresh_local_sources(select_model=True)
-        self.prompt_edit.setPlainText(task.prompt_text)
+        prompt = task.prompt_text.strip()
+        if not prompt:
+            prompt = BUILTIN_PROMPT_TEMPLATES[0][1]
+            template_index = next(
+                (
+                    index
+                    for index in range(self.template_combo.count())
+                    if (
+                        self.template_combo.itemData(index)
+                        and self.template_combo.itemData(index).get("name")
+                        == BUILTIN_PROMPT_TEMPLATES[0][0]
+                    )
+                ),
+                -1,
+            )
+            if template_index >= 0:
+                self.template_combo.blockSignals(True)
+                self.template_combo.setCurrentIndex(template_index)
+                self.template_combo.blockSignals(False)
+        else:
+            self.template_combo.blockSignals(True)
+            self.template_combo.setCurrentIndex(0)
+            self.template_combo.blockSignals(False)
+        self.prompt_edit.setPlainText(prompt)
         if task.model in MODEL_LABELS:
             self.model_combo.setCurrentIndex(self.model_combo.findData(task.model))
         if task.aspect_ratio:
@@ -498,7 +745,6 @@ class TaskCenterPage(QWidget):
         state = self.local_state
         if state is None:
             self.source_strip.clear()
-            self.source_preview.set_image(None)
             return
         items = []
         for index, image in enumerate(state.garments):
@@ -516,26 +762,8 @@ class TaskCenterPage(QWidget):
             self.source_strip.setCurrentRow(
                 len(items) - 1 if select_model else 0
             )
-        else:
-            self.source_preview.set_placeholder("当前没有参考图")
-            self.source_preview.set_image(None)
         self._update_local_source_hint()
         self._update_task_detail()
-
-    def _show_source_image(self, row: int) -> None:
-        if 0 <= row < self.source_strip.count():
-            item = self.source_strip.item(row)
-            position = item.data(Qt.ItemDataRole.UserRole)
-            if not isinstance(position, tuple):
-                self.source_preview.set_image(None)
-                return
-            role, index = position
-            image = (
-                self.local_store.image_at(role, index)
-                if self.local_store is not None
-                else None
-            )
-            self.source_preview.set_image(image.path if image else None)
 
     def _update_task_detail(self) -> None:
         task = self.current_task
@@ -621,10 +849,23 @@ class TaskCenterPage(QWidget):
             )
         ]
 
+    def _selected_source_role(self) -> str | None:
+        position = self._current_source_position()
+        if position is None:
+            QMessageBox.information(
+                self,
+                "请选择参考图",
+                "请先选择一张“衣服”或“模特”缩略图，新图片会加入同一类型。",
+            )
+            return None
+        return position[0]
+
     def _add_source_files(self) -> None:
         if not self._can_edit_local_sources():
             return
-        role = self.source_role_combo.currentData()
+        role = self._selected_source_role()
+        if role is None:
+            return
         paths, _ = QFileDialog.getOpenFileNames(
             self,
             "选择衣服图" if role == "garment" else "选择模特图",
@@ -635,6 +876,9 @@ class TaskCenterPage(QWidget):
 
     def _add_source_folder(self) -> None:
         if not self._can_edit_local_sources():
+            return
+        role = self._selected_source_role()
+        if role is None:
             return
         folder = QFileDialog.getExistingDirectory(
             self,
@@ -650,7 +894,7 @@ class TaskCenterPage(QWidget):
                 "\n".join(errors[:8]),
             )
         self._add_local_paths(
-            self.source_role_combo.currentData(),
+            role,
             paths,
         )
 
@@ -664,7 +908,9 @@ class TaskCenterPage(QWidget):
                 "当前环境没有加载作品库。",
             )
             return
-        role = self.source_role_combo.currentData()
+        role = self._selected_source_role()
+        if role is None:
+            return
         current = (
             len(self.local_state.garments)
             if role == "garment"
@@ -843,7 +1089,6 @@ class TaskCenterPage(QWidget):
             self.clear_sources_button,
         ):
             button.setEnabled(can_edit_sources)
-        self.source_role_combo.setEnabled(can_edit_sources)
         self.queue_hint.setText(
             f"正在执行 {len(self.active_workers)} 个，等待 {len(self.waiting_jobs)} 个"
         )
@@ -1042,8 +1287,11 @@ class TaskCenterPage(QWidget):
                 attempt.operator_name or str(attempt.operator_id),
                 label,
                 utc_naive_to_local(
-                    attempt.finished_at or attempt.created_at
-                ).strftime("%H:%M:%S") if attempt.created_at else "",
+                    attempt.created_at
+                ).strftime("%Y-%m-%d %H:%M")
+                if attempt.created_at
+                else "",
+                str(attempt.generated_image_count),
             )
             for column, value in enumerate(values):
                 self.queue_table.setItem(row, column, QTableWidgetItem(value))

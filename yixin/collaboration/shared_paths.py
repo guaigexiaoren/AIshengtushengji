@@ -68,7 +68,6 @@ class SharedPathResolver:
         return (
             project_root
             / "AI成品"
-            / safe_path_component(task.project_code)
             / safe_path_component(task.task_code)
             / f"attempt_{attempt_no:03d}"
         )

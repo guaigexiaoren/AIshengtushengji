@@ -266,6 +266,8 @@ class TaskCreatePage(QWidget):
         resolver: SharedPathResolver,
         actor: AuthUser,
         parent: QWidget | None = None,
+        *,
+        auto_load: bool = True,
     ) -> None:
         super().__init__(parent)
         self.repository = repository
@@ -277,7 +279,8 @@ class TaskCreatePage(QWidget):
         self.pair_cards: list[PairPreviewCard] = []
         self.selected_pair_model_index: int | None = None
         self._build()
-        self.refresh()
+        if auto_load:
+            self.refresh()
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)

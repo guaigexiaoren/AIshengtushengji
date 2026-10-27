@@ -146,27 +146,32 @@ class LoginDialog(QDialog):
         form.addRow("密码", self.password)
         layout.addLayout(form)
         actions = QHBoxLayout()
-        login_button = QPushButton("登录")
-        login_button.setObjectName("PrimaryButton")
-        login_button.clicked.connect(self._login)
-        cancel_button = QPushButton("退出")
-        cancel_button.clicked.connect(self.reject)
+        self.login_button = QPushButton("登录")
+        self.login_button.setObjectName("PrimaryButton")
+        self.login_button.setAutoDefault(True)
+        self.login_button.setDefault(True)
+        self.login_button.clicked.connect(self._login)
+        self.cancel_button = QPushButton("退出")
+        self.cancel_button.setAutoDefault(False)
+        self.cancel_button.clicked.connect(self.reject)
         actions.addStretch(1)
-        actions.addWidget(cancel_button)
-        actions.addWidget(login_button)
+        actions.addWidget(self.cancel_button)
+        actions.addWidget(self.login_button)
         layout.addLayout(actions)
-        self.password.returnPressed.connect(self._login)
 
     def _login(self) -> None:
         username = self.username.text().strip()
         password = self.password.text()
         if not username or not password:
             QMessageBox.warning(self, "信息不完整", "请输入账号和密码。")
+            self.password.setFocus()
             return
         try:
             user = self.repository.authenticate_user(username, password)
         except Exception as exc:
             QMessageBox.warning(self, "登录失败", str(exc))
+            self.password.clear()
+            self.password.setFocus()
             return
         if user.must_change_password:
             dialog = ChangePasswordDialog(
