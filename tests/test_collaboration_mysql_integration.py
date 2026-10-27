@@ -175,6 +175,29 @@ class MySQLIntegrationTests(unittest.TestCase):
                 all(len(task.garment_assets) == 3 for task in project_tasks)
             )
             task = project_tasks[0]
+            repository.update_subtask_sources(
+                task.id,
+                operator,
+                garment_paths=(
+                    *(asset.relative_path for asset in task.garment_assets),
+                    "衣服图/G004.png",
+                ),
+                model_path=task.model_path,
+                new_assets=(
+                    ProjectAssetInput(
+                        "garment",
+                        "衣服图/G004.png",
+                        "G004.png",
+                        "0" * 64,
+                        "image/png",
+                        10,
+                        10,
+                    ),
+                ),
+            )
+            task = repository.get_task(task.id)
+            self.assertEqual(len(task.garment_assets), 4)
+            self.assertGreater(task.source_revision, 1)
             queued_task = project_tasks[1]
             outcomes = []
 

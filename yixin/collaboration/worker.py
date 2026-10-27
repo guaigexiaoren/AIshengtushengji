@@ -44,6 +44,7 @@ class ProjectGenerationWorker:
         aspect_ratio: str,
         resolution: str | None,
         n: int,
+        local_references: tuple[StoredImage, ...] | None = None,
         reserved_attempt: GenerationAttempt | None = None,
     ) -> None:
         self.repository = repository
@@ -57,6 +58,7 @@ class ProjectGenerationWorker:
         self.aspect_ratio = aspect_ratio
         self.resolution = resolution
         self.n = n
+        self.local_references = local_references
         self.reserved_attempt = reserved_attempt
         self.signals = GenerationWorkerSignals()
         self._thread: threading.Thread | None = None
@@ -103,23 +105,30 @@ class ProjectGenerationWorker:
             project_root = self.resolver.project_root(
                 self.task.project_relative_root
             )
-            garment_assets = self.task.garment_assets
-            if len(garment_assets) > 13:
-                raise ValueError("每个子任务最多支持 13 张衣服图和 1 张模特图")
-            references = tuple(
-                self._stored_reference(
-                    asset.relative_path,
-                    asset.original_name,
-                    asset.content_hash,
+            if self.local_references is not None:
+                references = self.local_references
+                if not 2 <= len(references) <= 14:
+                    raise ValueError(
+                        "本机素材必须至少包含一张衣服图和一张模特图"
+                    )
+            else:
+                garment_assets = self.task.garment_assets
+                if len(garment_assets) > 13:
+                    raise ValueError("每个子任务最多支持 13 张衣服图和 1 张模特图")
+                references = tuple(
+                    self._stored_reference(
+                        asset.relative_path,
+                        asset.original_name,
+                        asset.content_hash,
+                    )
+                    for asset in garment_assets
+                ) + (
+                    self._stored_reference(
+                        self.task.model_path,
+                        self.task.model_name,
+                        self.task.model_hash,
+                    ),
                 )
-                for asset in garment_assets
-            ) + (
-                self._stored_reference(
-                    self.task.model_path,
-                    self.task.model_name,
-                    self.task.model_hash,
-                ),
-            )
             request = ImageRequest(
                 model=self.model,
                 prompt=self.prompt,

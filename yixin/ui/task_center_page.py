@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHeaderView,
     QHBoxLayout,
@@ -27,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..api import NanoBananaClient
+from ..collaboration.local_sources import LocalSourceState, LocalTaskSourceStore
 from ..collaboration.manual_upload import upload_manual_candidates
 from ..collaboration.repository import MySQLCentralRepository
 from ..collaboration.shared_paths import SharedPathResolver
@@ -52,6 +54,7 @@ from ..constants import (
     MODEL_SELECTION_OPTIONS,
     RESOLUTIONS,
 )
+from ..library import LibraryService
 from ..model_router import choose_model
 from ..local_export import export_original_image
 from ..settings import (
@@ -62,10 +65,11 @@ from ..settings import (
 )
 from ..storage import FileStore
 from ..time_utils import utc_naive_to_local
-from .dialogs import CompareDialog
+from .crop import CropDialog
+from .dialogs import CompareDialog, LibraryPickerDialog
 from .result_gallery import ResultGallery
 from .save_helpers import show_saved_toast
-from .widgets import ImageStrip, ImageView
+from .widgets import ImageStrip, ImageView, scan_image_inputs
 
 
 ATTEMPT_LABELS = {
@@ -87,6 +91,7 @@ class TaskCenterPage(QWidget):
         key_store,
         file_store: FileStore,
         app_settings: AppSettings,
+        library_service: LibraryService | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -97,10 +102,14 @@ class TaskCenterPage(QWidget):
         self.key_store = key_store
         self.file_store = file_store
         self.app_settings = app_settings
+        self.library_service = library_service
         self.tasks: list[ProjectTask] = []
         self.current_task: ProjectTask | None = None
+        self.local_store: LocalTaskSourceStore | None = None
+        self.local_state: LocalSourceState | None = None
         self.active_workers: set[ProjectGenerationWorker] = set()
         self.waiting_jobs: deque[dict] = deque()
+        self._syncing_splitters = False
         self._build()
         self.queue_timer = QTimer(self)
         self.queue_timer.setInterval(1200)
@@ -133,6 +142,13 @@ class TaskCenterPage(QWidget):
         splitter.addWidget(self._build_candidate_panel())
         splitter.setSizes([330, 520, 500])
         outer.addWidget(splitter, 1)
+        self.task_splitter.splitterMoved.connect(
+            self._sync_generation_splitter
+        )
+        self.generation_splitter.splitterMoved.connect(
+            self._sync_task_splitter
+        )
+        QTimer.singleShot(0, self._sync_generation_splitter)
 
     def _build_task_panel(self) -> QWidget:
         panel = QWidget()
@@ -140,7 +156,6 @@ class TaskCenterPage(QWidget):
         layout.setContentsMargins(0, 0, 8, 0)
         title = QLabel("任务列表")
         title.setStyleSheet("font-size:16px;font-weight:700;")
-        layout.addWidget(title)
         self.task_table = QTableWidget(0, 4)
         self.task_table.setHorizontalHeaderLabels(
             ["子任务", "货号", "状态", "制作人员"]
@@ -156,12 +171,13 @@ class TaskCenterPage(QWidget):
             QHeaderView.ResizeMode.Stretch
         )
         self.task_table.itemSelectionChanged.connect(self._task_selected)
-        vertical = QSplitter(Qt.Orientation.Vertical)
+        self.task_splitter = QSplitter(Qt.Orientation.Vertical)
         task_host = QWidget()
         task_layout = QVBoxLayout(task_host)
         task_layout.setContentsMargins(0, 0, 0, 0)
+        task_layout.addWidget(title)
         task_layout.addWidget(self.task_table, 1)
-        vertical.addWidget(task_host)
+        self.task_splitter.addWidget(task_host)
         queue_card = QGroupBox("生成任务队列")
         queue_layout = QVBoxLayout(queue_card)
         self.queue_table = QTableWidget(0, 4)
@@ -176,13 +192,47 @@ class TaskCenterPage(QWidget):
         self.queue_hint = QLabel()
         self.queue_hint.setStyleSheet("color:#60708a;")
         queue_layout.addWidget(self.queue_hint)
-        vertical.addWidget(queue_card)
-        vertical.setSizes([360, 260])
-        layout.addWidget(vertical, 1)
+        self.task_splitter.addWidget(queue_card)
+        self.task_splitter.setSizes([520, 300])
+        layout.addWidget(self.task_splitter, 1)
         return panel
 
+    def _sync_generation_splitter(self, *_args) -> None:
+        if self._syncing_splitters:
+            return
+        source = self.task_splitter.sizes()
+        if len(source) == 2:
+            self._align_splitters(source[0])
+
+    def _sync_task_splitter(self, *_args) -> None:
+        if self._syncing_splitters:
+            return
+        source = self.generation_splitter.sizes()
+        if len(source) == 2:
+            self._align_splitters(source[0])
+
+    def _align_splitters(self, requested_top: int) -> None:
+        self._syncing_splitters = True
+        try:
+            totals = (
+                sum(self.task_splitter.sizes()),
+                sum(self.generation_splitter.sizes()),
+            )
+            target_total = min(value for value in totals if value > 0)
+            if target_total:
+                top = max(0, min(int(requested_top), target_total))
+                self.task_splitter.setSizes([top, target_total - top])
+                self.generation_splitter.setSizes([top, target_total - top])
+                task_top = self.task_splitter.sizes()[0]
+                generation_top = self.generation_splitter.sizes()[0]
+                top = min(task_top, generation_top)
+                self.task_splitter.setSizes([top, target_total - top])
+                self.generation_splitter.setSizes([top, target_total - top])
+        finally:
+            self._syncing_splitters = False
+
     def _build_generation_panel(self) -> QWidget:
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        self.generation_splitter = QSplitter(Qt.Orientation.Vertical)
         top = QWidget()
         top_layout = QVBoxLayout(top)
         top_layout.setContentsMargins(8, 0, 8, 0)
@@ -196,16 +246,69 @@ class TaskCenterPage(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         top_layout.addWidget(self.task_detail)
+        source_tools = QGridLayout()
+        source_tools.setHorizontalSpacing(6)
+        source_tools.setVerticalSpacing(4)
+        self.source_role_combo = QComboBox()
+        self.source_role_combo.addItem("衣服图", "garment")
+        self.source_role_combo.addItem("模特图", "model")
+        source_tools.addWidget(QLabel("当前素材"), 0, 0)
+        source_tools.addWidget(self.source_role_combo, 0, 1)
+        self.add_source_files_button = QPushButton("添加图片")
+        self.add_source_folder_button = QPushButton("添加文件夹")
+        self.add_source_library_button = QPushButton("从作品库添加")
+        self.crop_source_button = QPushButton("裁剪")
+        self.restore_source_button = QPushButton("恢复")
+        self.remove_source_button = QPushButton("移除所选")
+        self.clear_sources_button = QPushButton("清空")
+        add_buttons = (
+            self.add_source_files_button,
+            self.add_source_folder_button,
+            self.add_source_library_button,
+        )
+        edit_buttons = (
+            self.crop_source_button,
+            self.restore_source_button,
+            self.remove_source_button,
+            self.clear_sources_button,
+        )
+        for column, button in enumerate(add_buttons, start=2):
+            source_tools.addWidget(button, 0, column)
+        for column, button in enumerate(edit_buttons, start=2):
+            source_tools.addWidget(button, 1, column)
+        source_tools.setColumnStretch(9, 1)
+        top_layout.addLayout(source_tools)
+        self.local_source_hint = QLabel(
+            "当前使用共享盘素材；本机修改仅影响当前账号和本机生成"
+        )
+        self.local_source_hint.setStyleSheet("color:#9a5b22;")
+        top_layout.addWidget(self.local_source_hint)
         self.source_strip = ImageStrip(icon_size=96)
+        self.source_strip.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
         self.source_strip.currentRowChanged.connect(
             self._show_source_image
         )
         self.source_preview = ImageView()
         self.source_preview.set_placeholder("选择参考图查看大图")
-        self.source_preview.setMinimumHeight(260)
+        self.source_preview.setMinimumHeight(100)
         top_layout.addWidget(self.source_strip)
         top_layout.addWidget(self.source_preview, 1)
-        splitter.addWidget(top)
+        self.add_source_files_button.clicked.connect(
+            self._add_source_files
+        )
+        self.add_source_folder_button.clicked.connect(
+            self._add_source_folder
+        )
+        self.add_source_library_button.clicked.connect(
+            self._add_source_library
+        )
+        self.crop_source_button.clicked.connect(self._crop_source)
+        self.restore_source_button.clicked.connect(self._restore_source)
+        self.remove_source_button.clicked.connect(self._remove_sources)
+        self.clear_sources_button.clicked.connect(self._clear_sources)
+        self.generation_splitter.addWidget(top)
 
         bottom = QWidget()
         layout = QVBoxLayout(bottom)
@@ -258,9 +361,9 @@ class TaskCenterPage(QWidget):
         action_row.addWidget(self.generate_button)
         prompt_layout.addLayout(action_row)
         layout.addWidget(prompt_card)
-        splitter.addWidget(bottom)
-        splitter.setSizes([520, 300])
-        return splitter
+        self.generation_splitter.addWidget(bottom)
+        self.generation_splitter.setSizes([520, 300])
+        return self.generation_splitter
 
     def _build_candidate_panel(self) -> QWidget:
         panel = QWidget()
@@ -358,17 +461,25 @@ class TaskCenterPage(QWidget):
         self.source_strip.clear()
         self.source_preview.set_image(None)
         if task is None:
+            self.local_store = None
+            self.local_state = None
+            self.local_source_hint.setText("尚未选择任务")
             self.gallery.clear()
             self._update_controls()
             return
-        self.task_detail.setText(
-            f"{task.task_code} · 货号 "
-            f"{task.product_code or task.project_name} · 制作 "
-            f"{task.assignee_name or '未分配'} · "
-            f"{TASK_STATUS_LABELS.get(task.status, task.status)} · "
-            f"衣服 {len(task.garment_assets)} 张"
-        )
-        self._load_source_images(task)
+        try:
+            self.local_store = LocalTaskSourceStore(
+                self.file_store.paths.root / "local_sources",
+                self.actor.id,
+                task,
+                self.resolver,
+            )
+            self.local_state = self.local_store.state
+        except Exception as exc:
+            self.local_store = None
+            self.local_state = None
+            self.local_source_hint.setText(f"本机素材加载失败：{exc}")
+        self._refresh_local_sources(select_model=True)
         self.prompt_edit.setPlainText(task.prompt_text)
         if task.model in MODEL_LABELS:
             self.model_combo.setCurrentIndex(self.model_combo.findData(task.model))
@@ -383,31 +494,295 @@ class TaskCenterPage(QWidget):
         self._refresh_queue()
         self._update_controls()
 
-    def _load_source_images(self, task: ProjectTask) -> None:
+    def _refresh_local_sources(self, *, select_model: bool = False) -> None:
+        state = self.local_state
+        if state is None:
+            self.source_strip.clear()
+            self.source_preview.set_image(None)
+            return
         items = []
-        for index, asset in enumerate(task.garment_assets, start=1):
-            path = self.resolver.resolve_project_path(
-                task.project_relative_root,
-                asset.relative_path,
+        for index, image in enumerate(state.garments):
+            items.append(
+                (
+                    image.path,
+                    f"衣服 {index + 1}",
+                    ("garment", index),
+                )
             )
-            items.append((path, f"衣服 {index}", path))
-        model_path = self.resolver.resolve_project_path(
-            task.project_relative_root,
-            task.model_path,
-        )
-        items.append((model_path, "模特", model_path))
+        if state.model is not None:
+            items.append((state.model.path, "模特", ("model", 0)))
         self.source_strip.set_images(items)
-        self.source_strip.setCurrentRow(len(items) - 1)
+        if items:
+            self.source_strip.setCurrentRow(
+                len(items) - 1 if select_model else 0
+            )
+        else:
+            self.source_preview.set_placeholder("当前没有参考图")
+            self.source_preview.set_image(None)
+        self._update_local_source_hint()
+        self._update_task_detail()
 
     def _show_source_image(self, row: int) -> None:
         if 0 <= row < self.source_strip.count():
             item = self.source_strip.item(row)
-            self.source_preview.set_image(
-                item.data(Qt.ItemDataRole.UserRole)
+            position = item.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(position, tuple):
+                self.source_preview.set_image(None)
+                return
+            role, index = position
+            image = (
+                self.local_store.image_at(role, index)
+                if self.local_store is not None
+                else None
             )
+            self.source_preview.set_image(image.path if image else None)
+
+    def _update_task_detail(self) -> None:
+        task = self.current_task
+        if task is None:
+            return
+        garment_count = (
+            len(self.local_state.garments)
+            if self.local_state is not None
+            else len(task.garment_assets)
+        )
+        self.task_detail.setText(
+            f"{task.task_code} · 货号 "
+            f"{task.product_code or task.project_name} · 制作 "
+            f"{task.assignee_name or '未分配'} · "
+            f"{TASK_STATUS_LABELS.get(task.status, task.status)} · "
+            f"衣服 {garment_count} 张"
+        )
+
+    def _update_local_source_hint(self) -> None:
+        state = self.local_state
+        if state is None:
+            self.local_source_hint.setText("尚未加载本机参考素材")
+            return
+        if not state.garments or state.model is None:
+            self.local_source_hint.setText(
+                "本机素材不完整：至少需要一张衣服图和一张模特图"
+            )
+            return
+        shared_garments = tuple(
+            asset.content_hash for asset in self.current_task.garment_assets
+        ) if self.current_task else ()
+        local_garments = tuple(
+            image.content_hash for image in state.garments
+        )
+        customized = (
+            local_garments != shared_garments
+            or (
+                self.current_task is not None
+                and state.model.content_hash != self.current_task.model_hash
+            )
+        )
+        self.local_source_hint.setText(
+            "本机素材已修改，仅影响当前账号和本机生成"
+            if customized
+            else "当前使用共享盘素材；本机修改仅影响当前账号和本机生成"
+        )
 
     def _is_assignee(self, task: ProjectTask | None) -> bool:
         return bool(task and task.assignee_id == self.actor.id)
+
+    def _can_edit_local_sources(self) -> bool:
+        task = self.current_task
+        return bool(
+            task
+            and self.local_store is not None
+            and task.status not in (
+                "awaiting_acceptance",
+                "approved",
+                "cancelled",
+            )
+            and (
+                self.actor.role == ROLE_ADMIN
+                or self._is_assignee(task)
+            )
+        )
+
+    def _current_source_position(self) -> tuple[str, int] | None:
+        item = self.source_strip.currentItem()
+        position = (
+            item.data(Qt.ItemDataRole.UserRole)
+            if item is not None
+            else None
+        )
+        return position if isinstance(position, tuple) else None
+
+    def _selected_source_positions(self) -> list[tuple[str, int]]:
+        return [
+            position
+            for item in self.source_strip.selectedItems()
+            if isinstance(
+                position := item.data(Qt.ItemDataRole.UserRole),
+                tuple,
+            )
+        ]
+
+    def _add_source_files(self) -> None:
+        if not self._can_edit_local_sources():
+            return
+        role = self.source_role_combo.currentData()
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择衣服图" if role == "garment" else "选择模特图",
+            "",
+            "图片 (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)",
+        )
+        self._add_local_paths(role, [Path(path) for path in paths])
+
+    def _add_source_folder(self) -> None:
+        if not self._can_edit_local_sources():
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "选择参考图片文件夹",
+        )
+        if not folder:
+            return
+        paths, errors = scan_image_inputs([Path(folder)])
+        if errors:
+            QMessageBox.warning(
+                self,
+                "部分图片未导入",
+                "\n".join(errors[:8]),
+            )
+        self._add_local_paths(
+            self.source_role_combo.currentData(),
+            paths,
+        )
+
+    def _add_source_library(self) -> None:
+        if not self._can_edit_local_sources():
+            return
+        if self.library_service is None:
+            QMessageBox.information(
+                self,
+                "作品库不可用",
+                "当前环境没有加载作品库。",
+            )
+            return
+        role = self.source_role_combo.currentData()
+        current = (
+            len(self.local_state.garments)
+            if role == "garment"
+            else (1 if self.local_state.model is not None else 0)
+        )
+        remaining = 13 - current if role == "garment" else 1
+        if remaining <= 0:
+            QMessageBox.information(
+                self,
+                "已达到上限",
+                "衣服图最多 13 张，模特图最多 1 张。",
+            )
+            return
+        dialog = LibraryPickerDialog(
+            self.library_service.database,
+            remaining,
+            self,
+        )
+        if dialog.exec() == dialog.DialogCode.Accepted:
+            self._add_local_paths(role, dialog.selected_paths())
+
+    def _add_local_paths(self, role: str, paths: list[Path]) -> None:
+        if not paths or self.local_store is None:
+            return
+        if role == "model":
+            paths = paths[:1]
+        try:
+            self.local_state = self.local_store.add_paths(role, paths)
+        except Exception as exc:
+            QMessageBox.warning(self, "添加失败", str(exc))
+            return
+        self._refresh_local_sources(select_model=role == "model")
+        self._update_controls()
+
+    def _crop_source(self) -> None:
+        if not self._can_edit_local_sources():
+            return
+        position = self._current_source_position()
+        if position is None or self.local_store is None:
+            return
+        role, index = position
+        image = self.local_store.image_at(role, index)
+        if image is None:
+            return
+        dialog = CropDialog(image.path, self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        crop_box = dialog.crop_box()
+        if crop_box is None:
+            return
+        try:
+            cropped = self.file_store.save_cropped_reference(
+                image,
+                crop_box,
+            )
+            self.local_state = self.local_store.replace_image(
+                role,
+                index,
+                cropped,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "裁剪失败", str(exc))
+            return
+        self._refresh_local_sources()
+        self._update_controls()
+
+    def _restore_source(self) -> None:
+        if not self._can_edit_local_sources():
+            return
+        position = self._current_source_position()
+        if position is None or self.local_store is None:
+            return
+        try:
+            self.local_state = self.local_store.restore_image(*position)
+        except Exception as exc:
+            QMessageBox.warning(self, "恢复失败", str(exc))
+            return
+        self._refresh_local_sources()
+        self._update_controls()
+
+    def _remove_sources(self) -> None:
+        if not self._can_edit_local_sources() or self.local_store is None:
+            return
+        selected = self._selected_source_positions()
+        if not selected:
+            QMessageBox.information(
+                self,
+                "未选择图片",
+                "请先选择要移除的参考图。",
+            )
+            return
+        for role in ("garment", "model"):
+            indexes = [
+                index
+                for item_role, index in selected
+                if item_role == role
+            ]
+            if indexes:
+                self.local_state = self.local_store.remove_images(
+                    role,
+                    indexes,
+                )
+        self._refresh_local_sources()
+        self._update_controls()
+
+    def _clear_sources(self) -> None:
+        if not self._can_edit_local_sources() or self.local_store is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "清空本机素材",
+            "确认清空当前任务的全部本机参考图吗？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.local_state = self.local_store.clear()
+        self._refresh_local_sources()
+        self._update_controls()
 
     def _update_controls(self) -> None:
         task = self.current_task
@@ -442,7 +817,15 @@ class TaskCenterPage(QWidget):
                 TASK_RETURNED,
             )
         )
-        self.generate_button.setEnabled(can_claim or can_work)
+        local_ready = bool(
+            self.local_state
+            and self.local_state.garments
+            and self.local_state.model is not None
+        )
+        can_edit_sources = self._can_edit_local_sources()
+        self.generate_button.setEnabled(
+            (can_claim or can_work) and local_ready
+        )
         self.upload_button.setEnabled(can_work and not task_busy)
         self.submit_button.setEnabled(
             can_work and not task_busy and bool(self.gallery.selected_result_ids())
@@ -450,6 +833,17 @@ class TaskCenterPage(QWidget):
         self.retry_button.setEnabled(can_work)
         self.save_button.setEnabled(self.gallery.current_path() is not None)
         self.compare_button.setEnabled(self.gallery.current_path() is not None)
+        for button in (
+            self.add_source_files_button,
+            self.add_source_folder_button,
+            self.add_source_library_button,
+            self.crop_source_button,
+            self.restore_source_button,
+            self.remove_source_button,
+            self.clear_sources_button,
+        ):
+            button.setEnabled(can_edit_sources)
+        self.source_role_combo.setEnabled(can_edit_sources)
         self.queue_hint.setText(
             f"正在执行 {len(self.active_workers)} 个，等待 {len(self.waiting_jobs)} 个"
         )
@@ -457,6 +851,17 @@ class TaskCenterPage(QWidget):
     def _enqueue_generation(self) -> None:
         task = self.current_task
         if task is None:
+            return
+        if (
+            self.local_state is None
+            or not self.local_state.garments
+            or self.local_state.model is None
+        ):
+            QMessageBox.warning(
+                self,
+                "本机素材不完整",
+                "请至少添加一张衣服图和一张模特图。",
+            )
             return
         try:
             if not self.key_store.load():
@@ -473,7 +878,7 @@ class TaskCenterPage(QWidget):
             model_id = choose_model(
                 prompt=prompt,
                 mode="dress_up",
-                reference_count=len(task.garment_assets) + 1,
+                reference_count=len(self.local_state.references()),
                 strategy=AUTO_STRATEGY_QUALITY,
             ).model
         resolution = self.resolution_combo.currentData()
@@ -491,7 +896,33 @@ class TaskCenterPage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "加入队列失败", str(exc))
             return
-        self.waiting_jobs.append({"task": task, "attempt": attempt})
+        local_references = self.local_state.references()
+        if self.local_store is not None:
+            try:
+                self.local_store.save_attempt_snapshot(attempt.id)
+            except Exception as exc:
+                try:
+                    self.repository.fail_generation_attempt(
+                        attempt.id,
+                        self.actor,
+                        error_code="local_source_snapshot",
+                        error_message=str(exc),
+                    )
+                except Exception:
+                    pass
+                QMessageBox.warning(
+                    self,
+                    "本机素材保存失败",
+                    str(exc),
+                )
+                return
+        self.waiting_jobs.append(
+            {
+                "task": task,
+                "attempt": attempt,
+                "local_references": local_references,
+            }
+        )
         self.refresh()
 
     def _resume_queued_jobs(self) -> None:
@@ -511,7 +942,13 @@ class TaskCenterPage(QWidget):
             task = self.repository.get_task(attempt.task_id)
             if task is None:
                 continue
-            self.waiting_jobs.append({"task": task, "attempt": attempt})
+            self.waiting_jobs.append(
+                {
+                    "task": task,
+                    "attempt": attempt,
+                    "local_references": None,
+                }
+            )
 
     def _pump_queue(self) -> None:
         try:
@@ -523,6 +960,17 @@ class TaskCenterPage(QWidget):
         while self.waiting_jobs and len(self.active_workers) < limit:
             job = self.waiting_jobs.popleft()
             attempt = job["attempt"]
+            local_references = job.get("local_references")
+            if local_references is None:
+                source_store = LocalTaskSourceStore(
+                    self.file_store.paths.root / "local_sources",
+                    self.actor.id,
+                    job["task"],
+                    self.resolver,
+                )
+                local_references = source_store.load_attempt_snapshot(
+                    attempt.id
+                )
             worker = ProjectGenerationWorker(
                 repository=self.repository,
                 client=self.client,
@@ -535,6 +983,7 @@ class TaskCenterPage(QWidget):
                 aspect_ratio=attempt.aspect_ratio,
                 resolution=attempt.resolution,
                 n=attempt.n,
+                local_references=local_references,
                 reserved_attempt=attempt,
             )
             worker.signals.finished.connect(

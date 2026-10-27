@@ -183,6 +183,7 @@ class MainWindow(QMainWindow):
             secret_store,
             file_store,
             AppSettings(database),
+            library_service,
         )
         self.page_specs.append(("任务中心", self.task_center_page))
         if self.actor.role in (ROLE_AI, ROLE_ADMIN):

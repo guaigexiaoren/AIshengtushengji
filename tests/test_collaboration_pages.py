@@ -47,6 +47,7 @@ if HAS_PYSIDE:
     from yixin.ui.dialogs import SettingsDialog
     from yixin.ui.main_window import MainWindow, SidebarNav
     from yixin.ui.submission_list_page import SubmissionListPage
+    from yixin.ui.subtask_source_dialog import SubtaskSourceDialog
     from yixin.ui.task_center_page import TaskCenterPage
     from yixin.ui.task_create_page import (
         CheckableHeaderView,
@@ -61,10 +62,14 @@ class FakeCentralRepository:
     def __init__(self) -> None:
         self.created_drafts = []
         self.generation_requests = []
+        self.source_updates = []
 
     def create_project(self, _actor, draft):
         self.created_drafts.append(draft)
         return 99
+
+    def update_subtask_sources(self, task_id, actor, **kwargs):
+        self.source_updates.append((task_id, actor, kwargs))
 
     def find_tasks_by_product(self, *_args):
         return []
@@ -388,6 +393,7 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertNotIn("模特1.png", labels)
         self.assertIn("衣服 7 张 · 1 个子任务", labels)
         self.assertEqual(len(card.garment_thumbnails), 7)
+        self.assertEqual(card.thumbnail_layout.count(), 8)
         card.close()
         card.deleteLater()
 
@@ -426,11 +432,17 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertFalse(hasattr(page, "select_new_button"))
         self.assertEqual(
             page.product_table.horizontalHeaderItem(0).text(),
-            "选择",
+            "状态",
         )
+        self.assertEqual(
+            page.product_table.horizontalHeaderItem(1).text(),
+            "",
+        )
+        self.assertFalse(page.product_table.verticalHeader().isVisible())
+        self.assertEqual(page.product_table.columnWidth(1), 42)
         states = {
-            page.product_table.item(row, 1).text():
-            page.product_table.item(row, 0)
+            page.product_table.item(row, 2).text():
+            page.product_table.item(row, 1)
             for row in range(page.product_table.rowCount())
         }
         self.assertTrue(
@@ -461,7 +473,10 @@ class CollaborationPageTests(unittest.TestCase):
         QTest.mouseClick(
             header.viewport(),
             Qt.MouseButton.LeftButton,
-            pos=QPoint(12, header.height() // 2),
+            pos=QPoint(
+                header.sectionViewportPosition(1) + 12,
+                header.height() // 2,
+            ),
         )
         self.assertEqual(
             header.check_state(),
@@ -574,8 +589,8 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.assertEqual(page.product_table.rowCount(), 1)
         page.product_table.selectRow(0)
-        page.product_table.item(0, 0).setCheckState(
-            page.product_table.item(0, 0).checkState()
+        page.product_table.item(0, 1).setCheckState(
+            page.product_table.item(0, 1).checkState()
         )
         with (
             patch(
@@ -591,6 +606,66 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(draft.project_code, "")
         self.assertEqual(len(draft.pairs), 6)
         page.deleteLater()
+
+    def test_subtask_source_dialog_adds_files_for_both_roles(self) -> None:
+        write_task_images(self.root)
+        task = make_task("claimed")
+        product_root = self.root / task.project_relative_root
+        assets = (
+            ProjectAssetInput(
+                "garment",
+                "衣服图/衣服1.png",
+                "衣服1.png",
+                "a" * 64,
+                "image/png",
+                20,
+                20,
+            ),
+            ProjectAssetInput(
+                "model",
+                "模特图/模特1.png",
+                "模特1.png",
+                "c" * 64,
+                "image/png",
+                20,
+                20,
+            ),
+        )
+        external = self.root / "外部素材"
+        external.mkdir()
+        new_garment = external / "新增衣服.png"
+        new_model = external / "新增模特.png"
+        Image.new("RGB", (30, 40), "yellow").save(new_garment)
+        Image.new("RGB", (30, 40), "cyan").save(new_model)
+        dialog = SubtaskSourceDialog(
+            self.repository,
+            self.resolver,
+            self.actor,
+            task,
+            assets,
+        )
+        dialog._stage_sources("garment", [new_garment])
+        dialog._stage_sources("model", [new_model])
+        dialog.garment_list.clearSelection()
+        dialog.model_list.clearSelection()
+        dialog.garment_list.item(dialog.garment_list.count() - 1).setSelected(
+            True
+        )
+        dialog.model_list.item(dialog.model_list.count() - 1).setSelected(
+            True
+        )
+        dialog._save()
+        self.assertEqual(len(self.repository.source_updates), 1)
+        update = self.repository.source_updates[0][2]
+        roles = {asset.role for asset in update["new_assets"]}
+        self.assertEqual(roles, {"garment", "model"})
+        self.assertTrue(
+            (product_root / "衣服图" / "新增衣服.png").is_file()
+        )
+        self.assertTrue(
+            (product_root / "模特图" / "新增模特.png").is_file()
+        )
+        dialog.deleteLater()
 
     def test_operations_main_window_has_new_task_navigation(self) -> None:
         paths = AppPaths(self.root / "data")
@@ -678,7 +753,8 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertIsInstance(edit, QPushButton)
         self.assertEqual(edit.text(), "修改素材与配对")
         self.assertTrue(submitted.urgent_button.isVisible())
-        self.assertFalse(submitted.preview_tabs.isTabVisible(1))
+        self.assertTrue(submitted.preview_tabs.isTabVisible(1))
+        self.assertFalse(submitted.preview_tabs.isTabVisible(0))
         self.assertEqual(submitted.reference_strip.count(), 3)
         self.assertEqual(submitted.reference_strip.currentRow(), 2)
         self.assertEqual(submitted.reference_strip.item(2).text(), "模特")
@@ -721,7 +797,9 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(pending.return_button.isVisible())
         self.assertTrue(pending.approve_button.isVisible())
         self.assertIsNone(pending.task_table.cellWidget(0, 6))
+        self.assertTrue(pending.preview_tabs.isTabVisible(0))
         self.assertTrue(pending.preview_tabs.isTabVisible(1))
+        self.assertEqual(pending.preview_tabs.currentIndex(), 0)
         self.assertEqual(pending.result_gallery.list_widget.count(), 1)
         self.assertEqual(
             pending.result_gallery.preview.current_path,
@@ -730,10 +808,11 @@ class CollaborationPageTests(unittest.TestCase):
         pending.close()
         pending.deleteLater()
 
-        completed_project = make_project("completed")
+        completed_project = make_project("in_progress")
         self.repository.list_projects = lambda **_: [completed_project]
         self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            completed_task
+            completed_task,
+            pending_task,
         ]
         completed = SubmissionListPage(
             self.repository,
@@ -747,10 +826,18 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertFalse(completed.view_results.isVisible())
         self.assertFalse(completed.return_button.isVisible())
         self.assertFalse(completed.approve_button.isVisible())
+        self.assertEqual(completed.project_table.rowCount(), 1)
+        self.assertEqual(completed.task_table.rowCount(), 1)
+        self.assertEqual(
+            completed.task_table.item(0, 3).text(),
+            "已完成",
+        )
         completed.close()
         completed.deleteLater()
 
     def test_task_center_layout_retry_and_atomic_queue_action(self) -> None:
+        write_task_images(self.root)
+
         class KeyStore:
             @staticmethod
             def load():
@@ -783,7 +870,9 @@ class CollaborationPageTests(unittest.TestCase):
             ],
         )
         task = make_task("available")
-        center.current_task = task
+        self.repository.list_board_tasks = lambda *_args, **_kwargs: [task]
+        center.refresh()
+        self.assertEqual(center.current_task.id, task.id)
         center.prompt_edit.setPlainText("临时修改")
         with patch.object(center.prompt_edit, "setFocus") as set_focus:
             center._retry_task()
@@ -797,6 +886,9 @@ class CollaborationPageTests(unittest.TestCase):
             self.repository.generation_requests[0][0],
             task.id,
         )
+        snapshot = center.local_store.load_attempt_snapshot(7)
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(len(snapshot), 3)
         center.deleteLater()
 
     def test_task_center_uses_source_strip_and_current_results(self) -> None:
@@ -831,6 +923,13 @@ class CollaborationPageTests(unittest.TestCase):
             task
         ]
         self.repository.list_results = lambda _task_id: [result]
+        self.repository.list_templates = lambda _actor: [
+            {
+                "scope": "shared",
+                "name": "内置·基础服装替换",
+                "prompt": "内置基础提示词",
+            }
+        ]
         center = TaskCenterPage(
             self.repository,
             self.resolver,
@@ -858,20 +957,99 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.assertEqual(
             center.source_preview.current_path,
-            (product_root / "模特图" / "模特1.png").resolve(),
+            center.local_state.model.path,
+        )
+        self.assertEqual(
+            center.source_preview.current_path.read_bytes(),
+            (product_root / "模特图" / "模特1.png").read_bytes(),
         )
         center.source_strip.setCurrentRow(0)
         self.app.processEvents()
         self.assertEqual(
             center.source_preview.current_path,
-            (product_root / "衣服图" / "衣服1.png").resolve(),
+            center.local_state.garments[0].path,
+        )
+        self.assertEqual(
+            center.source_preview.current_path.read_bytes(),
+            (product_root / "衣服图" / "衣服1.png").read_bytes(),
         )
         self.assertEqual(center.result_title.text(), "当前任务生成结果")
+        self.assertEqual(
+            [
+                center.add_source_files_button.text(),
+                center.add_source_folder_button.text(),
+                center.add_source_library_button.text(),
+                center.crop_source_button.text(),
+                center.restore_source_button.text(),
+                center.remove_source_button.text(),
+                center.clear_sources_button.text(),
+            ],
+            [
+                "添加图片",
+                "添加文件夹",
+                "从作品库添加",
+                "裁剪",
+                "恢复",
+                "移除所选",
+                "清空",
+            ],
+        )
+        self.assertIsNone(center.template_combo.currentData())
+        self.assertEqual(
+            center.prompt_edit.toPlainText(),
+            task.prompt_text,
+        )
+        center.template_combo.setCurrentIndex(1)
+        self.assertEqual(
+            center.prompt_edit.toPlainText(),
+            "内置基础提示词",
+        )
+        center.resize(1400, 880)
+        center.show()
+        self.app.processEvents()
+        center._sync_generation_splitter()
+        self.app.processEvents()
+        self.assertEqual(
+            center.task_splitter.sizes(),
+            center.generation_splitter.sizes(),
+        )
         self.assertEqual(center.gallery.list_widget.count(), 1)
         self.assertEqual(
             center.gallery.preview.current_path,
             result_path.resolve(),
         )
+        extra_garment = self.root / "额外衣服.png"
+        Image.new("RGB", (30, 40), "yellow").save(extra_garment)
+        center.source_role_combo.setCurrentIndex(
+            center.source_role_combo.findData("garment")
+        )
+        center._add_local_paths("garment", [extra_garment])
+        self.assertEqual(len(center.local_state.garments), 3)
+        self.assertIn("衣服 3 张", center.task_detail.text())
+        restored = TaskCenterPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            NanoBananaClient(lambda: "test-key"),
+            type(
+                "KeyStore",
+                (),
+                {"load": staticmethod(lambda: "test-key")},
+            )(),
+            FileStore(AppPaths(self.root / "task-center-data")),
+            AppSettings(Database(self.root / "task-center.db")),
+        )
+        self.assertIsNotNone(restored.local_state)
+        self.assertEqual(len(restored.local_state.garments), 3)
+        with patch(
+            "yixin.ui.task_center_page.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            center._clear_sources()
+        self.assertEqual(center.local_state.garments, ())
+        self.assertIsNone(center.local_state.model)
+        self.assertFalse(center.generate_button.isEnabled())
+        restored.deleteLater()
         center.deleteLater()
 
     def test_task_center_saves_only_current_original_result(self) -> None:
@@ -935,6 +1113,49 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(saved[0].read_bytes(), source.read_bytes())
         toast.assert_called_once()
         center.deleteLater()
+
+    def test_task_center_local_source_permissions(self) -> None:
+        write_task_images(self.root)
+        ai_actor = AuthUser(4, "ai", "AI制作Amy", "ai")
+        task = make_task("working")
+        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
+            task
+        ]
+        center = TaskCenterPage(
+            self.repository,
+            self.resolver,
+            ai_actor,
+            NanoBananaClient(lambda: "test-key"),
+            type(
+                "KeyStore",
+                (),
+                {"load": staticmethod(lambda: "test-key")},
+            )(),
+            FileStore(AppPaths(self.root / "permission-data")),
+            AppSettings(Database(self.root / "permission.db")),
+        )
+        self.assertTrue(center.add_source_files_button.isEnabled())
+        center.deleteLater()
+
+        task = make_task("awaiting_acceptance")
+        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
+            task
+        ]
+        pending = TaskCenterPage(
+            self.repository,
+            self.resolver,
+            ai_actor,
+            NanoBananaClient(lambda: "test-key"),
+            type(
+                "KeyStore",
+                (),
+                {"load": staticmethod(lambda: "test-key")},
+            )(),
+            FileStore(AppPaths(self.root / "permission-pending")),
+            AppSettings(Database(self.root / "permission-pending.db")),
+        )
+        self.assertFalse(pending.add_source_files_button.isEnabled())
+        pending.deleteLater()
 
 
 if __name__ == "__main__":

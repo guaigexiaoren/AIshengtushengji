@@ -21,7 +21,6 @@ from PySide6.QtWidgets import (
 from ..collaboration.repository import MySQLCentralRepository, utc_now
 from ..collaboration.shared_paths import SharedPathResolver
 from ..collaboration.types import (
-    PROJECT_COMPLETED,
     PROJECT_STATUS_LABELS,
     ROLE_ADMIN,
     TASK_APPROVED,
@@ -160,12 +159,13 @@ class SubmissionListPage(QWidget):
         left_layout.addLayout(actions)
         body.addWidget(left)
 
-        self.preview_tabs = QTabWidget()
-        self.preview_tabs.addTab(self._build_reference_preview(), "参考图")
         self.result_gallery = ResultGallery(self.resolver)
+        self.preview_tabs = QTabWidget()
         self.preview_tabs.addTab(self.result_gallery, "结果图")
+        self.preview_tabs.addTab(self._build_reference_preview(), "参考图")
         if self.view_mode == "submitted":
-            self.preview_tabs.setTabVisible(1, False)
+            self.preview_tabs.setTabVisible(0, False)
+            self.preview_tabs.setCurrentIndex(1)
         body.addWidget(self.preview_tabs)
         body.setSizes([760, 440])
         outer.addWidget(body, 1)
@@ -198,22 +198,15 @@ class SubmissionListPage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "读取任务失败", str(exc))
             return
-        if self.view_mode == "completed":
-            self.projects = [
-                project
-                for project in projects
-                if project.status == PROJECT_COMPLETED
-            ]
-        else:
-            statuses = set(VIEW_STATUSES[self.view_mode])
-            visible_ids = {
-                task.project_id
-                for task in self._all_tasks
-                if task.status in statuses
-            }
-            self.projects = [
-                project for project in projects if project.id in visible_ids
-            ]
+        statuses = set(VIEW_STATUSES[self.view_mode])
+        visible_ids = {
+            task.project_id
+            for task in self._all_tasks
+            if task.status in statuses
+        }
+        self.projects = [
+            project for project in projects if project.id in visible_ids
+        ]
         self.project_table.setRowCount(0)
         for project in self.projects:
             row = self.project_table.rowCount()

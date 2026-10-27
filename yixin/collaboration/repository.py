@@ -1055,6 +1055,7 @@ class MySQLCentralRepository:
         *,
         garment_paths: Sequence[str],
         model_path: str,
+        new_assets: Sequence[ProjectAssetInput] = (),
     ) -> None:
         garment_paths = tuple(dict.fromkeys(path.strip() for path in garment_paths))
         if not garment_paths:
@@ -1063,6 +1064,23 @@ class MySQLCentralRepository:
             raise ValueError("子任务最多支持 13 张衣服图")
         if not model_path.strip():
             raise ValueError("子任务必须选择一张模特图")
+        pending_assets = tuple(
+            dict.fromkeys(
+                (
+                    asset.role,
+                    asset.relative_path,
+                    asset.original_name,
+                    asset.content_hash,
+                    asset.mime,
+                    asset.width,
+                    asset.height,
+                )
+                for asset in new_assets
+            )
+        )
+        for asset in pending_assets:
+            if asset[0] not in ("garment", "model"):
+                raise ValueError("新增素材角色不正确")
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 task = self._task_row_for_update(cursor, task_id)
@@ -1074,6 +1092,33 @@ class MySQLCentralRepository:
                     TASK_CANCELLED,
                 ):
                     raise StateConflictError("待审核或已完成的子任务不能修改素材")
+                added_count = 0
+                for asset in pending_assets:
+                    cursor.execute(
+                        """
+                        SELECT id FROM project_assets
+                        WHERE project_id = %s AND role = %s
+                          AND relative_path = %s
+                        LIMIT 1
+                        """,
+                        (task["project_id"], asset[0], asset[1]),
+                    )
+                    if cursor.fetchone() is not None:
+                        continue
+                    cursor.execute(
+                        """
+                        INSERT INTO project_assets(
+                            project_id, role, relative_path, original_name,
+                            content_hash, mime, width, height, created_at
+                        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            task["project_id"],
+                            *asset,
+                            utc_now(),
+                        ),
+                    )
+                    added_count += 1
                 placeholders = ", ".join(["%s"] * len(garment_paths))
                 cursor.execute(
                     f"""
@@ -1146,6 +1191,7 @@ class MySQLCentralRepository:
                     {
                         "garments": list(garment_paths),
                         "model": model_path,
+                        "added_assets": added_count,
                     },
                 )
 

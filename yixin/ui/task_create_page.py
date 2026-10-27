@@ -74,8 +74,13 @@ class CheckableHeaderView(QHeaderView):
         self,
         orientation: Qt.Orientation,
         parent: QWidget | None = None,
+        *,
+        check_section: int = 0,
+        label: str = "选择",
     ) -> None:
         super().__init__(orientation, parent)
+        self.check_section = check_section
+        self.label = label
         self._check_state = Qt.CheckState.Unchecked
         self.setSectionsClickable(True)
 
@@ -94,7 +99,7 @@ class CheckableHeaderView(QHeaderView):
         rect: QRect,
         logical_index: int,
     ) -> None:
-        if logical_index != 0:
+        if logical_index != self.check_section:
             super().paintSection(painter, rect, logical_index)
             return
         option = QStyleOptionHeader()
@@ -140,13 +145,14 @@ class CheckableHeaderView(QHeaderView):
                 rect.height(),
             ),
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-            "选择",
+            self.label,
         )
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if (
             event.button() == Qt.MouseButton.LeftButton
-            and self.logicalIndexAt(event.position().toPoint()) == 0
+            and self.logicalIndexAt(event.position().toPoint())
+            == self.check_section
         ):
             state = (
                 Qt.CheckState.Unchecked
@@ -189,44 +195,47 @@ class PairPreviewCard(QFrame):
             self.setCursor(Qt.CursorShape.PointingHandCursor)
             self.setToolTip("点击选中此配对，可移除所选配对")
         layout = QVBoxLayout(self)
-        model = QLabel()
-        model.setFixedSize(78, 94)
-        model.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pixmap = load_scaled_pixmap(model_path, QSize(74, 90))
-        if not pixmap.isNull():
-            model.setPixmap(pixmap)
-        model.setToolTip(model_path.name)
-        layout.addWidget(model, 0, Qt.AlignmentFlag.AlignHCenter)
         summary = QLabel(
             f"衣服 {len(garment_paths)} 张 · 1 个子任务"
         )
         summary.setStyleSheet("color:#60708a;")
         thumb_host = QWidget()
-        thumbs = QGridLayout(thumb_host)
+        thumbs = QHBoxLayout(thumb_host)
+        self.thumbnail_layout = thumbs
         thumbs.setContentsMargins(0, 0, 0, 0)
         thumbs.setSpacing(4)
+        model = QLabel()
+        model.setObjectName("ModelThumbnail")
+        model.setFixedSize(58, 72)
+        model.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = load_scaled_pixmap(model_path, QSize(56, 70))
+        if not pixmap.isNull():
+            model.setPixmap(pixmap)
+        model.setToolTip(model_path.name)
+        thumbs.addWidget(model)
         self.garment_thumbnails: list[QLabel] = []
-        for index, path in enumerate(garment_paths):
+        for path in garment_paths:
             image = QLabel()
             image.setObjectName("GarmentThumbnail")
-            image.setFixedSize(42, 52)
+            image.setFixedSize(58, 72)
             image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            thumb = load_scaled_pixmap(path, QSize(40, 50))
+            thumb = load_scaled_pixmap(path, QSize(56, 70))
             if not thumb.isNull():
                 image.setPixmap(thumb)
             image.setToolTip(path.name)
-            thumbs.addWidget(image, index // 4, index % 4)
+            thumbs.addWidget(image)
             self.garment_thumbnails.append(image)
         thumb_scroll = QScrollArea()
-        thumb_scroll.setWidgetResizable(True)
+        thumb_scroll.setWidgetResizable(False)
         thumb_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        thumb_scroll.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
         )
+        thumb_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
         thumb_scroll.setWidget(thumb_host)
-        thumb_scroll.setFixedHeight(112)
+        thumb_scroll.setFixedHeight(94)
+        thumb_host.adjustSize()
         layout.addWidget(summary)
         layout.addWidget(thumb_scroll)
 
@@ -314,19 +323,26 @@ class TaskCreatePage(QWidget):
             CheckableHeaderView(
                 Qt.Orientation.Horizontal,
                 self.product_table,
+                check_section=1,
+                label="",
             )
         )
         self.product_table.setHorizontalHeaderLabels(
             [
-                "选择",
+                "状态",
+                "",
                 "货号",
                 "衣服图",
                 "模特图",
                 "子任务",
                 "预计任务编码",
                 "重复情况",
-                "状态",
             ]
+        )
+        self.product_table.verticalHeader().setVisible(False)
+        self.product_table.setColumnWidth(1, 42)
+        self.product_table.horizontalHeader().setToolTip(
+            "全选或取消全选"
         )
         self.product_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
@@ -556,7 +572,12 @@ class TaskCreatePage(QWidget):
             )
             if can_select:
                 selectable += 1
-            self.product_table.setItem(row, 0, check)
+            self.product_table.setItem(
+                row,
+                0,
+                QTableWidgetItem("可创建" if can_select else "需处理"),
+            )
+            self.product_table.setItem(row, 1, check)
             values = (
                 state.product_code,
                 str(len(state.garments)),
@@ -568,15 +589,14 @@ class TaskCreatePage(QWidget):
                     if state.existing_tasks
                     else "无重复"
                 ),
-                "可创建" if can_select else "需处理",
             )
-            for column, value in enumerate(values, start=1):
+            for column, value in enumerate(values, start=2):
                 self.product_table.setItem(
                     row,
                     column,
                     QTableWidgetItem(value),
                 )
-            self.product_table.item(row, 0).setData(
+            self.product_table.item(row, 1).setData(
                 Qt.ItemDataRole.UserRole,
                 state.product_code,
             )
@@ -587,14 +607,14 @@ class TaskCreatePage(QWidget):
         self._update_select_header()
 
     def _product_check_changed(self, item: QTableWidgetItem) -> None:
-        if item.column() == 0:
+        if item.column() == 1:
             self._update_select_header()
 
     def _update_select_header(self) -> None:
         checked = 0
         eligible = 0
         for row in range(self.product_table.rowCount()):
-            item = self.product_table.item(row, 0)
+            item = self.product_table.item(row, 1)
             if item is None or not (
                 item.flags() & Qt.ItemFlag.ItemIsUserCheckable
             ):
@@ -614,7 +634,7 @@ class TaskCreatePage(QWidget):
         checked = state == Qt.CheckState.Checked
         self.product_table.blockSignals(True)
         for row in range(self.product_table.rowCount()):
-            item = self.product_table.item(row, 0)
+            item = self.product_table.item(row, 1)
             if item is None or not (
                 item.flags() & Qt.ItemFlag.ItemIsUserCheckable
             ):
@@ -631,7 +651,7 @@ class TaskCreatePage(QWidget):
         row = self.product_table.currentRow()
         if row < 0:
             return None
-        item = self.product_table.item(row, 0)
+        item = self.product_table.item(row, 1)
         return str(item.data(Qt.ItemDataRole.UserRole)) if item else None
 
     def _product_selected(self) -> None:
@@ -919,7 +939,7 @@ class TaskCreatePage(QWidget):
         return [
             str(item.data(Qt.ItemDataRole.UserRole))
             for row in range(self.product_table.rowCount())
-            if (item := self.product_table.item(row, 0)) is not None
+            if (item := self.product_table.item(row, 1)) is not None
             and item.checkState() == Qt.CheckState.Checked
         ]
 
@@ -1007,7 +1027,7 @@ class TaskCreatePage(QWidget):
 
     def _row_for_code(self, code: str) -> int:
         for row in range(self.product_table.rowCount()):
-            item = self.product_table.item(row, 0)
+            item = self.product_table.item(row, 1)
             if item.data(Qt.ItemDataRole.UserRole) == code:
                 return row
         return 0
