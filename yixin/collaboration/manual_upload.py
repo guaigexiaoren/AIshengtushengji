@@ -6,20 +6,18 @@ from typing import Sequence
 from ..logging_utils import sanitize_text
 from ..storage import (
     MIME_TO_SUFFIX,
-    FileStore,
     atomic_write_bytes,
     image_metadata,
     sha256_bytes,
 )
 from .repository import MySQLCentralRepository
-from .shared_paths import SharedPathResolver, safe_path_component
+from .shared_paths import SharedPathResolver
 from .types import AuthUser, GeneratedResultInput, ProjectTask
 
 
 def upload_manual_candidates(
     repository: MySQLCentralRepository,
     resolver: SharedPathResolver,
-    file_store: FileStore,
     task: ProjectTask,
     actor: AuthUser,
     paths: Sequence[Path],
@@ -32,7 +30,6 @@ def upload_manual_candidates(
     output.mkdir(parents=True, exist_ok=True)
     generated: list[GeneratedResultInput] = []
     seen: set[str] = set()
-    task_prefix = safe_path_component(task.task_code)
     try:
         for source in paths:
             data = Path(source).read_bytes()
@@ -44,18 +41,10 @@ def upload_manual_candidates(
             index = len(generated)
             suffix = MIME_TO_SUFFIX.get(mime, ".png")
             destination = output / (
-                f"manual_{task_prefix}_r{attempt.attempt_no:03d}_"
+                f"_r{attempt.attempt_no:03d}_"
                 f"{index + 1:02d}_{content_hash[:12]}{suffix}"
             )
             atomic_write_bytes(destination, data)
-            thumbnail = file_store.create_thumbnail(
-                destination,
-                output
-                / (
-                    f"thumb_manual_{task_prefix}_"
-                    f"r{attempt.attempt_no:03d}_{index + 1:02d}.jpg"
-                ),
-            )
             generated.append(
                 GeneratedResultInput(
                     result_index=index,
@@ -63,10 +52,7 @@ def upload_manual_candidates(
                         project_root,
                         destination,
                     ),
-                    thumbnail_relative_path=resolver.relative_to_project(
-                        project_root,
-                        thumbnail,
-                    ),
+                    thumbnail_relative_path="",
                     content_hash=content_hash,
                     mime=mime,
                     width=width,

@@ -83,6 +83,7 @@ class FakeCentralRepository:
         self.project_urgent_updates = []
         self.queued_attempts = []
         self.project_attempts = []
+        self.review_requests = []
         self.submission_requests = []
 
     def create_project(self, _actor, draft):
@@ -167,6 +168,11 @@ class FakeCentralRepository:
 
     def submit_for_acceptance(self, task_id, actor, **kwargs):
         self.submission_requests.append((task_id, actor, kwargs))
+
+    def review_task(self, task_id, actor, *, approved, reason=""):
+        self.review_requests.append(
+            (task_id, actor, approved, reason)
+        )
 
     def api_key_statuses(self):
         return {}
@@ -1306,7 +1312,7 @@ class CollaborationPageTests(unittest.TestCase):
         ):
             center._upload_manual()
         upload_manual.assert_called_once()
-        self.assertEqual(upload_manual.call_args.args[3].id, task.id)
+        self.assertEqual(upload_manual.call_args.args[2].id, task.id)
         self.assertEqual(
             open_files.call_args.args[2],
             str(upload_history.resolve()),
@@ -1333,6 +1339,81 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertIsNotNone(snapshot)
         self.assertEqual(len(snapshot), 3)
         center.deleteLater()
+
+    def test_pending_review_supports_multi_select_batch_actions(self) -> None:
+        write_task_images(self.root)
+        first = make_task("awaiting_acceptance")
+        second = replace(
+            first,
+            id=12,
+            task_code="春季项目-123-001-002",
+        )
+        self.repository.list_projects = lambda **_: [
+            make_project("in_progress")
+        ]
+        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
+            first,
+            second,
+        ]
+        page = SubmissionListPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            "pending",
+        )
+        page.show()
+        self.app.processEvents()
+        self.assertEqual(
+            page.task_table.selectionMode(),
+            QAbstractItemView.SelectionMode.ExtendedSelection,
+        )
+        self.assertTrue(page.selection_hint.isVisible())
+        page.task_table.selectRow(0)
+        page.task_table.setCurrentCell(
+            1,
+            0,
+            QItemSelectionModel.SelectionFlag.Select
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+        self.app.processEvents()
+        self.assertEqual(len(page._selected_tasks()), 2)
+        self.assertEqual(page.approve_button.text(), "验收通过（2）")
+        self.assertEqual(page.return_button.text(), "退回返工（2）")
+        with (
+            patch(
+                "yixin.ui.submission_list_page.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(page, "refresh"),
+        ):
+            page._approve_task()
+        self.assertEqual(
+            {request[0] for request in self.repository.review_requests},
+            {11, 12},
+        )
+        self.assertTrue(
+            all(request[2] for request in self.repository.review_requests)
+        )
+        self.repository.review_requests.clear()
+        with (
+            patch(
+                "yixin.ui.submission_list_page.QInputDialog.getMultiLineText",
+                return_value=("请统一调整领口", True),
+            ),
+            patch.object(page, "refresh"),
+        ):
+            page._return_task()
+        self.assertEqual(
+            {
+                (request[0], request[2], request[3])
+                for request in self.repository.review_requests
+            },
+            {
+                (11, False, "请统一调整领口"),
+                (12, False, "请统一调整领口"),
+            },
+        )
+        page.deleteLater()
 
     def test_task_center_uses_source_strip_and_current_results(self) -> None:
         write_task_images(self.root)

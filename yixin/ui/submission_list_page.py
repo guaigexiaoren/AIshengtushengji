@@ -145,6 +145,17 @@ class SubmissionListPage(QWidget):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 8, 8, 0)
+        task_header = QHBoxLayout()
+        self.selection_hint = QLabel(
+            "按住 Ctrl 多选，按住 Shift 连续选择"
+        )
+        self.selection_hint.setStyleSheet(
+            "color:#7a879c;font-size:10px;"
+        )
+        self.selection_hint.setVisible(self.view_mode == "pending")
+        task_header.addStretch(1)
+        task_header.addWidget(self.selection_hint)
+        left_layout.addLayout(task_header)
         self.task_table = QTableWidget(0, 7)
         self.task_table.setHorizontalHeaderLabels(
             [
@@ -160,6 +171,10 @@ class SubmissionListPage(QWidget):
         self.task_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
+        if self.view_mode == "pending":
+            self.task_table.setSelectionMode(
+                QAbstractItemView.SelectionMode.ExtendedSelection
+            )
         self.task_table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
@@ -471,6 +486,20 @@ class SubmissionListPage(QWidget):
             )
         return None
 
+    def _selected_tasks(self) -> list[ProjectTask]:
+        task_ids = []
+        for index in self.task_table.selectionModel().selectedRows(0):
+            item = self.task_table.item(index.row(), 0)
+            if item is not None:
+                task_ids.append(
+                    int(item.data(Qt.ItemDataRole.UserRole))
+                )
+        return [
+            task
+            for task_id in dict.fromkeys(task_ids)
+            if (task := self._tasks_by_id.get(task_id)) is not None
+        ]
+
     def _can_manage(self, project: ProjectRecord | None) -> bool:
         return bool(
             project
@@ -560,6 +589,7 @@ class SubmissionListPage(QWidget):
             else "设置加急"
         )
         task = self._current_task()
+        selected_count = len(self._selected_tasks())
         reviewable = bool(
             task
             and can_manage
@@ -567,6 +597,16 @@ class SubmissionListPage(QWidget):
         )
         self.view_results.setEnabled(
             bool(task and self.result_gallery.list_widget.count())
+        )
+        self.return_button.setText(
+            f"退回返工（{selected_count}）"
+            if selected_count > 1
+            else "退回返工"
+        )
+        self.approve_button.setText(
+            f"验收通过（{selected_count}）"
+            if selected_count > 1
+            else "验收通过"
         )
         self.return_button.setEnabled(reviewable)
         self.approve_button.setEnabled(reviewable)
@@ -636,26 +676,39 @@ class SubmissionListPage(QWidget):
         ).exec()
 
     def _approve_task(self) -> None:
-        task = self._current_task()
-        if task is None:
+        tasks = self._selected_tasks() or [self._current_task()]
+        tasks = [task for task in tasks if task is not None]
+        if not tasks:
             return
         answer = QMessageBox.question(
             self,
             "验收通过",
-            f"确认子任务 {task.task_code} 已通过吗？",
+            f"确认通过所选 {len(tasks)} 个子任务吗？",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        try:
-            self.repository.review_task(task.id, self.actor, approved=True)
-        except Exception as exc:
-            QMessageBox.warning(self, "验收失败", str(exc))
-            return
+        failures = []
+        for task in tasks:
+            try:
+                self.repository.review_task(
+                    task.id,
+                    self.actor,
+                    approved=True,
+                )
+            except Exception as exc:
+                failures.append(f"{task.task_code}：{exc}")
+        if failures:
+            QMessageBox.warning(
+                self,
+                "部分验收失败",
+                "\n".join(failures[:10]),
+            )
         self.refresh()
 
     def _return_task(self) -> None:
-        task = self._current_task()
-        if task is None:
+        tasks = self._selected_tasks() or [self._current_task()]
+        tasks = [task for task in tasks if task is not None]
+        if not tasks:
             return
         reason, ok = QInputDialog.getMultiLineText(
             self,
@@ -667,16 +720,23 @@ class SubmissionListPage(QWidget):
         if not reason.strip():
             QMessageBox.warning(self, "需要修改点", "退回时必须填写修改内容。")
             return
-        try:
-            self.repository.review_task(
-                task.id,
-                self.actor,
-                approved=False,
-                reason=reason,
+        failures = []
+        for task in tasks:
+            try:
+                self.repository.review_task(
+                    task.id,
+                    self.actor,
+                    approved=False,
+                    reason=reason,
+                )
+            except Exception as exc:
+                failures.append(f"{task.task_code}：{exc}")
+        if failures:
+            QMessageBox.warning(
+                self,
+                "部分退回失败",
+                "\n".join(failures[:10]),
             )
-        except Exception as exc:
-            QMessageBox.warning(self, "退回失败", str(exc))
-            return
         self.refresh()
 
     @staticmethod

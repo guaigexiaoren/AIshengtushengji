@@ -1362,7 +1362,6 @@ class TaskCenterPage(QWidget):
             worker = ProjectGenerationWorker(
                 repository=self.repository,
                 client=self.client,
-                file_store=self.file_store,
                 resolver=self.resolver,
                 task=job["task"],
                 actor=self.actor,
@@ -1527,7 +1526,6 @@ class TaskCenterPage(QWidget):
             count = upload_manual_candidates(
                 self.repository,
                 self.resolver,
-                self.file_store,
                 task,
                 self.actor,
                 [Path(path) for path in paths],

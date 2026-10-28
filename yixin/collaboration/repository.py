@@ -3045,6 +3045,31 @@ class MySQLCentralRepository:
                 )
                 return [_generation_result(row) for row in cursor.fetchall()]
 
+    def result_path_reference_count(
+        self,
+        relative_path: str,
+        excluding_result_id: int,
+    ) -> int:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM generation_results
+                    WHERE id <> %s
+                      AND (
+                          relative_path = %s
+                          OR thumbnail_relative_path = %s
+                      )
+                    """,
+                    (
+                        excluding_result_id,
+                        relative_path,
+                        relative_path,
+                    ),
+                )
+                return int(cursor.fetchone()["count"])
+
     def delete_generation_results(self, result_ids: Sequence[int]) -> None:
         clean_ids = tuple(dict.fromkeys(int(value) for value in result_ids))
         if not clean_ids:

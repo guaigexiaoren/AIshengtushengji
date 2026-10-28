@@ -16,8 +16,6 @@ from yixin.collaboration.types import (
     ProjectTask,
     ROLE_AI,
 )
-from yixin.paths import AppPaths
-from yixin.storage import FileStore
 
 
 class FakeManualRepository:
@@ -104,12 +102,9 @@ class ManualUploadTests(unittest.TestCase):
             Image.new("RGB", (30, 40), "red").save(source_one)
             Image.new("RGB", (30, 40), "blue").save(source_two)
             repository = FakeManualRepository(task)
-            paths = AppPaths(Path(temp) / "data")
-            paths.ensure()
             count = upload_manual_candidates(
                 repository,
                 SharedPathResolver(root),
-                FileStore(paths),
                 task,
                 AuthUser(2, "ai", "制作A", ROLE_AI),
                 [source_one, source_two],
@@ -119,16 +114,25 @@ class ManualUploadTests(unittest.TestCase):
             results = repository.completed[2]["results"]
             self.assertEqual(len(results), 2)
             self.assertTrue(
-                all("manual" in result.relative_path for result in results)
+                all(
+                    result.thumbnail_relative_path == ""
+                    for result in results
+                )
             )
             self.assertTrue(
                 all(
                     result.relative_path.startswith(
-                        "AI成品/项目-123-001/manual_"
+                        "AI成品/_r002_"
                     )
                     for result in results
                 )
             )
+            output_files = [
+                path
+                for path in (project / "AI成品").iterdir()
+                if path.is_file()
+            ]
+            self.assertEqual(len(output_files), 2)
 
 
 if __name__ == "__main__":

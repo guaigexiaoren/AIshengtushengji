@@ -54,9 +54,10 @@ class SharedPathTests(unittest.TestCase):
             self.assertEqual(resolver.relative_to_root(project), "项目A")
             task = make_task("项目A")
             output = resolver.output_directory(task, 2)
+            self.assertEqual(output, (project / "AI成品").resolve())
             self.assertEqual(
                 resolver.relative_output_path(task, output / "result.png"),
-                "AI成品/P001/result.png",
+                "AI成品/result.png",
             )
 
     def test_path_cannot_escape_share_root(self) -> None:

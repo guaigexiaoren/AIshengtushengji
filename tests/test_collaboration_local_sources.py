@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import base64
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -16,9 +17,10 @@ from yixin.collaboration.types import (
     ProjectTask,
 )
 from yixin.collaboration.worker import ProjectGenerationWorker
-from yixin.models import ImageApiResult, ImageRequest
+from yixin.models import ImageApiResult, ImageRequest, RemoteImage
 from yixin.paths import AppPaths
 from yixin.storage import FileStore
+from tests.helpers import png_bytes
 
 
 def make_task(root: Path) -> ProjectTask:
@@ -198,11 +200,18 @@ class LocalTaskSourceTests(unittest.TestCase):
 
             class Client:
                 received = None
+                image_bytes = png_bytes((70, 80, 90), (20, 20))
 
                 def generate(self, request: ImageRequest):
                     self.received = request
                     return ImageApiResult(
-                        images=(),
+                        images=(
+                            RemoteImage(
+                                b64_json=base64.b64encode(
+                                    self.image_bytes
+                                ).decode("ascii")
+                            ),
+                        ),
                         request_id="local-test",
                         remote_task_id="",
                         usage_input_tokens=1,
@@ -211,13 +220,16 @@ class LocalTaskSourceTests(unittest.TestCase):
                         status_code=200,
                     )
 
+                @staticmethod
+                def resolve_image(_image):
+                    return Client.image_bytes
+
             client = Client()
             paths = AppPaths(root / "data")
             paths.ensure()
             worker = ProjectGenerationWorker(
                 repository=Repository(),
                 client=client,
-                file_store=FileStore(paths),
                 resolver=resolver,
                 task=task,
                 actor=AuthUser(7, "ai", "AI甲", "ai"),
@@ -234,6 +246,10 @@ class LocalTaskSourceTests(unittest.TestCase):
                 tuple(image.path for image in client.received.reference_images),
                 tuple(image.path for image in references),
             )
+            output = root / "share" / "项目" / "123" / "AI成品"
+            files = [path for path in output.iterdir() if path.is_file()]
+            self.assertEqual(len(files), 1)
+            self.assertRegex(files[0].name, r"^_r001_01_[0-9a-f]{12}\.png$")
 
 
 if __name__ == "__main__":

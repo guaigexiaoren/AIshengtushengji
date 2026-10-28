@@ -35,7 +35,14 @@ def cleanup_expired_candidates(
                         task.project_relative_root,
                         relative_path,
                     )
-                    if path.is_file():
+                    if (
+                        path.is_file()
+                        and repository.result_path_reference_count(
+                            relative_path,
+                            result.id,
+                        )
+                        == 0
+                    ):
                         path.unlink()
                         removed.append(str(path))
                 except Exception as exc:

@@ -9,13 +9,12 @@ from ..logging_utils import sanitize_text
 from ..models import ApiError, ImageRequest, StoredImage
 from ..storage import (
     MIME_TO_SUFFIX,
-    FileStore,
     atomic_write_bytes,
     image_metadata,
     sha256_bytes,
 )
 from .repository import MySQLCentralRepository
-from .shared_paths import SharedPathResolver, safe_path_component
+from .shared_paths import SharedPathResolver
 from .types import (
     AuthUser,
     GeneratedResultInput,
@@ -35,7 +34,6 @@ class ProjectGenerationWorker:
         *,
         repository: MySQLCentralRepository,
         client: NanoBananaClient,
-        file_store: FileStore,
         resolver: SharedPathResolver,
         task: ProjectTask,
         actor: AuthUser,
@@ -49,7 +47,6 @@ class ProjectGenerationWorker:
     ) -> None:
         self.repository = repository
         self.client = client
-        self.file_store = file_store
         self.resolver = resolver
         self.task = task
         self.actor = actor
@@ -145,25 +142,16 @@ class ProjectGenerationWorker:
             )
             output_directory.mkdir(parents=True, exist_ok=True)
             generated: list[GeneratedResultInput] = []
-            task_prefix = safe_path_component(self.task.task_code)
             for index, remote in enumerate(api_result.images):
                 data = self.client.resolve_image(remote)
                 mime, width, height = image_metadata(data)
                 suffix = MIME_TO_SUFFIX.get(mime, ".png")
                 content_hash = sha256_bytes(data)
                 image_path = output_directory / (
-                    f"result_{task_prefix}_r{attempt.attempt_no:03d}_"
+                    f"_r{attempt.attempt_no:03d}_"
                     f"{index + 1:02d}_{content_hash[:12]}{suffix}"
                 )
                 atomic_write_bytes(image_path, data)
-                thumbnail_path = self.file_store.create_thumbnail(
-                    image_path,
-                    output_directory
-                    / (
-                        f"thumb_{task_prefix}_r{attempt.attempt_no:03d}_"
-                        f"{index + 1:02d}.jpg"
-                    ),
-                )
                 generated.append(
                     GeneratedResultInput(
                         result_index=index,
@@ -171,10 +159,7 @@ class ProjectGenerationWorker:
                             project_root,
                             image_path,
                         ),
-                        thumbnail_relative_path=self.resolver.relative_to_project(
-                            project_root,
-                            thumbnail_path,
-                        ),
+                        thumbnail_relative_path="",
                         content_hash=content_hash,
                         mime=mime,
                         width=width,
