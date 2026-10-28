@@ -5,7 +5,14 @@ from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import QRect, QSize, Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QIcon, QMouseEvent
+from PySide6.QtGui import (
+    QDragEnterEvent,
+    QDropEvent,
+    QIcon,
+    QImage,
+    QMouseEvent,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -54,6 +61,7 @@ from ..collaboration.types import (
     PROJECT_SCOPE_LABELS,
 )
 from ..storage import SUPPORTED_IMAGE_SUFFIXES, atomic_copy_file, image_metadata
+from .async_thumbnails import ThumbnailLoader, get_thumbnail_loader
 from .widgets import load_scaled_pixmap, scan_image_inputs
 
 
@@ -210,12 +218,22 @@ class PairPreviewCard(QFrame):
         *,
         index: int = -1,
         selectable: bool = False,
+        thumbnail_loader: ThumbnailLoader | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.index = index
         self.selectable = selectable
         self._selected = False
+        self.thumbnail_loader = thumbnail_loader
+        self._thumbnail_contexts: dict[int, tuple[QLabel, QSize]] = {}
+        if self.thumbnail_loader is not None:
+            self.thumbnail_loader.thumbnail_ready.connect(
+                self._thumbnail_ready
+            )
+            self.thumbnail_loader.thumbnail_failed.connect(
+                self._thumbnail_failed
+            )
         self.setObjectName("PairPreviewCard")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(
@@ -239,26 +257,31 @@ class PairPreviewCard(QFrame):
         thumbs.setContentsMargins(0, 0, 0, 0)
         thumbs.setSpacing(4)
         model = QLabel()
+        self.model_thumbnail = model
         model.setObjectName("ModelThumbnail")
         model.setFixedSize(58, 72)
         model.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        pixmap = load_scaled_pixmap(model_path, QSize(56, 70))
-        if not pixmap.isNull():
-            model.setPixmap(pixmap)
         model.setToolTip(model_path.name)
         thumbs.addWidget(model)
+        self._set_thumbnail(
+            model,
+            model_path,
+            QSize(56, 70),
+        )
         self.garment_thumbnails: list[QLabel] = []
         for path in garment_paths:
             image = QLabel()
             image.setObjectName("GarmentThumbnail")
             image.setFixedSize(58, 72)
             image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            thumb = load_scaled_pixmap(path, QSize(56, 70))
-            if not thumb.isNull():
-                image.setPixmap(thumb)
             image.setToolTip(path.name)
             thumbs.addWidget(image)
             self.garment_thumbnails.append(image)
+            self._set_thumbnail(
+                image,
+                path,
+                QSize(56, 70),
+            )
         thumb_scroll = QScrollArea()
         thumb_scroll.setWidgetResizable(False)
         thumb_scroll.setHorizontalScrollBarPolicy(
@@ -272,6 +295,45 @@ class PairPreviewCard(QFrame):
         thumb_host.adjustSize()
         layout.addWidget(summary)
         layout.addWidget(thumb_scroll)
+
+    def _set_thumbnail(
+        self,
+        label: QLabel,
+        path: Path,
+        target: QSize,
+    ) -> None:
+        if self.thumbnail_loader is None:
+            pixmap = load_scaled_pixmap(path, target)
+            if not pixmap.isNull():
+                label.setPixmap(pixmap)
+            return
+        request = self.thumbnail_loader.request_thumbnail(path, target)
+        self._thumbnail_contexts[request.request_id] = (label, target)
+
+    def _thumbnail_ready(
+        self,
+        request_id: int,
+        _path: str,
+        image: QImage,
+    ) -> None:
+        context = self._thumbnail_contexts.pop(request_id, None)
+        if context is None:
+            return
+        label, target = context
+        scaled = image.scaled(
+            target,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        label.setPixmap(QPixmap.fromImage(scaled))
+
+    def _thumbnail_failed(
+        self,
+        request_id: int,
+        _path: str,
+        _message: str,
+    ) -> None:
+        self._thumbnail_contexts.pop(request_id, None)
 
     def set_selected(self, selected: bool) -> None:
         if selected == self._selected:
@@ -313,6 +375,18 @@ class TaskCreatePage(QWidget):
         self.accessible_projects: tuple[tuple[str, str], ...] = ()
         self.pair_cards: list[PairPreviewCard] = []
         self.selected_pair_model_index: int | None = None
+        self.thumbnail_loader = get_thumbnail_loader()
+        self._thumbnail_generation = 0
+        self._asset_thumbnail_contexts: dict[
+            int,
+            tuple[int, QListWidget, int, Path, QSize],
+        ] = {}
+        self.thumbnail_loader.thumbnail_ready.connect(
+            self._asset_thumbnail_ready
+        )
+        self.thumbnail_loader.thumbnail_failed.connect(
+            self._asset_thumbnail_failed
+        )
         self._build()
         if auto_load:
             self.refresh()
@@ -778,6 +852,8 @@ class TaskCreatePage(QWidget):
 
     def _show_state(self) -> None:
         state = self.current_state
+        self._thumbnail_generation += 1
+        self._asset_thumbnail_contexts.clear()
         self.garment_list.clear()
         self.model_list.clear()
         self._clear_pair_preview()
@@ -791,15 +867,60 @@ class TaskCreatePage(QWidget):
         self._fill_assets(self.model_list, state.models)
         self._refresh_pair_preview()
 
-    @staticmethod
-    def _fill_assets(widget: QListWidget, paths: list[Path]) -> None:
+    def _fill_assets(
+        self,
+        widget: QListWidget,
+        paths: list[Path],
+    ) -> None:
         for path in paths:
             item = QListWidgetItem(path.name)
-            pixmap = load_scaled_pixmap(path, QSize(96, 96))
-            if not pixmap.isNull():
-                item.setIcon(QIcon(pixmap))
             item.setData(Qt.ItemDataRole.UserRole, str(path))
             widget.addItem(item)
+            target = QSize(96, 96)
+            request = self.thumbnail_loader.request_thumbnail(
+                path,
+                target,
+            )
+            self._asset_thumbnail_contexts[request.request_id] = (
+                self._thumbnail_generation,
+                widget,
+                widget.count() - 1,
+                path,
+                target,
+            )
+
+    def _asset_thumbnail_ready(
+        self,
+        request_id: int,
+        _path: str,
+        image: QImage,
+    ) -> None:
+        context = self._asset_thumbnail_contexts.pop(request_id, None)
+        if context is None:
+            return
+        generation, widget, row, expected_path, target = context
+        if generation != self._thumbnail_generation:
+            return
+        item = widget.item(row)
+        if (
+            item is None
+            or item.data(Qt.ItemDataRole.UserRole) != str(expected_path)
+        ):
+            return
+        scaled = image.scaled(
+            target,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        item.setIcon(QIcon(QPixmap.fromImage(scaled)))
+
+    def _asset_thumbnail_failed(
+        self,
+        request_id: int,
+        _path: str,
+        _message: str,
+    ) -> None:
+        self._asset_thumbnail_contexts.pop(request_id, None)
 
     def _clear_pair_preview(self) -> None:
         while self.pair_preview_layout.count():
@@ -997,6 +1118,7 @@ class TaskCreatePage(QWidget):
                 garment_paths,
                 index=model_index,
                 selectable=manual,
+                thumbnail_loader=self.thumbnail_loader,
             )
             card.selected.connect(self._select_manual_pair)
             self.pair_cards.append(card)
