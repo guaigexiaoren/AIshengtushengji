@@ -179,14 +179,14 @@ class ProjectHistoryPage(QWidget):
     def _refresh_project_filter(self) -> None:
         selected = self.project_filter.currentData()
         projects = {
-            row["project_code"]: row["project_code"]
+            self._attempt_project_name(row)
             for row in self.attempts
         }
         self.project_filter.blockSignals(True)
         self.project_filter.clear()
         self.project_filter.addItem("全部项目", None)
-        for code in sorted(projects):
-            self.project_filter.addItem(code, code)
+        for project_name in sorted(projects):
+            self.project_filter.addItem(project_name, project_name)
         index = self.project_filter.findData(selected)
         self.project_filter.setCurrentIndex(max(0, index))
         self.project_filter.blockSignals(False)
@@ -200,7 +200,7 @@ class ProjectHistoryPage(QWidget):
         self._apply_filters()
 
     def _apply_filters(self, *_args) -> None:
-        project_code = self.project_filter.currentData()
+        project_name = self.project_filter.currentData()
         product = self.product_search.text().strip().casefold()
         status = self.status_filter.currentData()
         start = self.start_date.python_date()
@@ -208,7 +208,10 @@ class ProjectHistoryPage(QWidget):
         rows = []
         for attempt in self.attempts:
             created = utc_naive_to_local(attempt["created_at"]).date()
-            if project_code and attempt["project_code"] != project_code:
+            if (
+                project_name
+                and self._attempt_project_name(attempt) != project_name
+            ):
                 continue
             if product and product not in str(
                 attempt["product_code"] or ""
@@ -264,6 +267,15 @@ class ProjectHistoryPage(QWidget):
             self.detail_meta.clear()
             self.prompt_view.clear()
             self.gallery.clear()
+
+    @staticmethod
+    def _attempt_project_name(attempt: dict) -> str:
+        return str(
+            attempt.get("access_project_name")
+            or attempt.get("product_code")
+            or attempt.get("project_code")
+            or ""
+        ).strip()
 
     def _attempt_selected(self) -> None:
         row = self.table.currentRow()

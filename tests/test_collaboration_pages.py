@@ -2072,21 +2072,94 @@ class CollaborationPageTests(unittest.TestCase):
                 "task_code": task.task_code,
                 "product_code": task.product_code,
                 "project_name": task.project_name,
+                "access_project_name": "春季项目",
                 "operator_name": "AI制作Amy",
                 "model": "gemini-3.1-flash-image",
                 "status": "succeeded",
                 "prompt_text": "项目历史提示词",
                 "created_at": datetime.now(),
                 "result_count": 1,
-            }
+            },
+            {
+                "id": 41,
+                "task_id": task.id,
+                "attempt_no": 2,
+                "project_code": "春季项目-123-002",
+                "task_code": "春季项目-123-002-001",
+                "product_code": "123",
+                "project_name": "123",
+                "access_project_name": "春季项目",
+                "operator_name": "AI制作Amy",
+                "model": "gemini-3.1-flash-image",
+                "status": "succeeded",
+                "prompt_text": "同名项目",
+                "created_at": datetime.now(),
+                "result_count": 0,
+            },
+            {
+                "id": 42,
+                "task_id": task.id,
+                "attempt_no": 3,
+                "project_code": "刘一一-CD1A0954开衫-001",
+                "task_code": "刘一一-CD1A0954开衫-001-001",
+                "product_code": "CD1A0954开衫",
+                "project_name": "CD1A0954开衫",
+                "access_project_name": "刘一一",
+                "operator_name": "AI制作Amy",
+                "model": "gemini-3.1-flash-image",
+                "status": "succeeded",
+                "prompt_text": "外部项目",
+                "created_at": datetime.now(),
+                "result_count": 0,
+            },
+            {
+                "id": 43,
+                "task_id": task.id,
+                "attempt_no": 4,
+                "project_code": "旧项目编码",
+                "task_code": "旧项目编码-001",
+                "product_code": "旧货号",
+                "project_name": "旧货号",
+                "operator_name": "AI制作Amy",
+                "model": "gemini-3.1-flash-image",
+                "status": "succeeded",
+                "prompt_text": "旧数据",
+                "created_at": datetime.now(),
+                "result_count": 0,
+            },
         ]
         page = ProjectHistoryPage(
             self.repository,
             self.resolver,
             self.actor,
         )
-        self.assertEqual(page.table.rowCount(), 1)
-        self.assertEqual(page.table.item(0, 1).text(), task.task_code)
+        self.assertEqual(page.table.rowCount(), 4)
+        self.assertEqual(
+            {
+                page.project_filter.itemText(index)
+                for index in range(page.project_filter.count())
+            },
+            {"全部项目", "春季项目", "刘一一", "旧货号"},
+        )
+        spring_index = page.project_filter.findData("春季项目")
+        page.project_filter.setCurrentIndex(spring_index)
+        self.assertEqual(page.table.rowCount(), 2)
+        page.project_filter.setCurrentIndex(0)
+        self.assertEqual(page.table.rowCount(), 4)
+        target_row = next(
+            row
+            for row in range(page.table.rowCount())
+            if page.table.item(row, 0).data(
+                Qt.ItemDataRole.UserRole
+            )
+            == 40
+        )
+        self.assertEqual(
+            page.table.item(target_row, 1).text(),
+            task.task_code,
+        )
+        page.table.selectRow(target_row)
+        self.app.processEvents()
         self.assertEqual(page.gallery.list_widget.count(), 1)
         self.assertEqual(
             page.gallery.preview.current_path,
@@ -2095,7 +2168,7 @@ class CollaborationPageTests(unittest.TestCase):
         page.product_search.setText("不存在")
         self.assertEqual(page.table.rowCount(), 0)
         page.product_search.clear()
-        self.assertEqual(page.table.rowCount(), 1)
+        self.assertEqual(page.table.rowCount(), 4)
         self.assertTrue(page.table.isSortingEnabled())
         page.deleteLater()
         database = Database(self.root / "history-tabs.db")

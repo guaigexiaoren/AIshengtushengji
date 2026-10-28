@@ -2939,6 +2939,7 @@ class MySQLCentralRepository:
                            t.task_code, t.project_id,
                            p.project_code, p.product_code,
                            p.name AS project_name,
+                           p.project_name AS access_project_name,
                            COUNT(gr.id) AS result_count
                     FROM generation_attempts ga
                     JOIN project_tasks t ON t.id = ga.task_id
@@ -2947,7 +2948,7 @@ class MySQLCentralRepository:
                     LEFT JOIN generation_results gr ON gr.attempt_id = ga.id
                     GROUP BY ga.id, u.display_name, t.task_code,
                              t.project_id, p.project_code, p.product_code,
-                             p.name
+                             p.name, p.project_name
                     ORDER BY ga.created_at DESC, ga.id DESC
                     LIMIT %s
                     """,

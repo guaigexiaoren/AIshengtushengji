@@ -272,6 +272,10 @@ class MySQLIntegrationTests(unittest.TestCase):
                 row for row in history if int(row["id"]) == attempt.id
             )
             self.assertEqual(history_row["task_code"], task.task_code)
+            self.assertEqual(
+                history_row["access_project_name"],
+                "集成项目",
+            )
             self.assertEqual(int(history_row["result_count"]), 1)
             self.assertEqual(
                 len(repository.list_attempt_results(attempt.id)),
