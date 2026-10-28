@@ -281,6 +281,19 @@ class MySQLIntegrationTests(unittest.TestCase):
                 len(repository.list_attempt_results(attempt.id)),
                 1,
             )
+            project_attempts = repository.list_project_attempts(
+                project_id
+            )
+            self.assertIn(
+                attempt.id,
+                [int(row["id"]) for row in project_attempts],
+            )
+            self.assertTrue(
+                all(
+                    row["access_project_name"] == "集成项目"
+                    for row in project_attempts
+                )
+            )
             repository.submit_for_acceptance(
                 task.id,
                 winner,

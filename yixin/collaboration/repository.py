@@ -2923,6 +2923,34 @@ class MySQLCentralRepository:
                 )
                 return [_generation_attempt(row) for row in cursor.fetchall()]
 
+    def list_project_attempts(
+        self,
+        project_id: int,
+    ) -> list[dict[str, Any]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT ga.*, u.display_name AS operator_name,
+                           t.task_code, t.project_id,
+                           p.project_code, p.product_code,
+                           p.project_name AS access_project_name,
+                           COUNT(gr.id) AS result_count
+                    FROM generation_attempts ga
+                    JOIN project_tasks t ON t.id = ga.task_id
+                    JOIN projects p ON p.id = t.project_id
+                    JOIN users u ON u.id = ga.operator_id
+                    LEFT JOIN generation_results gr ON gr.attempt_id = ga.id
+                    WHERE t.project_id = %s
+                    GROUP BY ga.id, u.display_name, t.task_code,
+                             t.project_id, p.project_code, p.product_code,
+                             p.project_name
+                    ORDER BY ga.created_at DESC, ga.id DESC
+                    """,
+                    (project_id,),
+                )
+                return [dict(row) for row in cursor.fetchall()]
+
     def list_project_attempt_history(
         self,
         actor: AuthUser,

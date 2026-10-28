@@ -32,6 +32,7 @@ if HAS_PYSIDE:
     from yixin.collaboration.shared_paths import SharedPathResolver
     from yixin.collaboration.types import (
         ATTEMPT_QUEUED,
+        ATTEMPT_SUCCEEDED,
         ROLE_ADMIN,
         ROLE_OPERATIONS,
         AuthUser,
@@ -81,6 +82,7 @@ class FakeCentralRepository:
         self.skip_requests = []
         self.project_urgent_updates = []
         self.queued_attempts = []
+        self.project_attempts = []
         self.submission_requests = []
 
     def create_project(self, _actor, draft):
@@ -134,6 +136,9 @@ class FakeCentralRepository:
 
     def list_attempts(self, _task_id):
         return []
+
+    def list_project_attempts(self, _project_id):
+        return list(self.project_attempts)
 
     def list_queued_attempts(self, _operator_id):
         return list(self.queued_attempts)
@@ -1462,9 +1467,22 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(center.project_table.isSortingEnabled())
         self.assertTrue(center.task_table.isSortingEnabled())
         self.assertEqual(
-            center.queue_table.horizontalHeaderItem(4).text(),
-            "结果数",
+            [
+                center.queue_table.horizontalHeaderItem(index).text()
+                for index in range(center.queue_table.columnCount())
+            ],
+            [
+                "主任务编码",
+                "货号",
+                "子任务编码",
+                "轮次",
+                "操作人员",
+                "状态",
+                "创建时间",
+                "结果数",
+            ],
         )
+        self.assertEqual(center.queue_refresh_button.text(), "刷新")
         self.assertIs(
             center.generation_splitter.widget(1).findChild(QTableWidget),
             center.queue_table,
@@ -1514,6 +1532,7 @@ class CollaborationPageTests(unittest.TestCase):
             "内置基础提示词",
         )
         self.assertEqual(center.gallery.list_widget.count(), 1)
+        self.assertEqual(center.gallery.selected_result_ids(), [21])
         self.assertEqual(
             center.gallery.preview.current_path,
             result_path.resolve(),
@@ -1933,6 +1952,92 @@ class CollaborationPageTests(unittest.TestCase):
         center.center_start_date.setDate(working_qdate)
         center.center_end_date.setDate(working_qdate)
         self.assertEqual(center.project_table.rowCount(), 1)
+        center.deleteLater()
+
+    def test_task_center_queue_shows_all_subtasks_in_main_task(self) -> None:
+        write_task_images(self.root)
+        first = replace(
+            make_task("working"),
+            assignee_id=self.actor.id,
+            assignee_name=self.actor.display_name,
+        )
+        second = replace(
+            first,
+            id=12,
+            task_code="春季项目-123-001-002",
+        )
+        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
+            first,
+            second,
+        ]
+        self.repository.project_attempts = [
+            {
+                "id": 71,
+                "task_id": first.id,
+                "attempt_no": 2,
+                "operator_id": self.actor.id,
+                "operator_name": self.actor.display_name,
+                "project_code": first.project_code,
+                "product_code": first.product_code,
+                "access_project_name": first.access_project_name,
+                "task_code": first.task_code,
+                "model": "gemini-3.1-flash-image",
+                "status": ATTEMPT_QUEUED,
+                "created_at": datetime.now(),
+                "generated_image_count": 0,
+                "result_count": 0,
+            },
+            {
+                "id": 72,
+                "task_id": second.id,
+                "attempt_no": 1,
+                "operator_id": self.actor.id,
+                "operator_name": self.actor.display_name,
+                "project_code": second.project_code,
+                "product_code": second.product_code,
+                "access_project_name": second.access_project_name,
+                "task_code": second.task_code,
+                "model": "gemini-3.1-flash-image",
+                "status": ATTEMPT_SUCCEEDED,
+                "created_at": datetime.now(),
+                "generated_image_count": 1,
+                "result_count": 1,
+            },
+        ]
+        center = TaskCenterPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            NanoBananaClient(lambda: "test-key"),
+            type(
+                "KeyStore",
+                (),
+                {"load": staticmethod(lambda: "test-key")},
+            )(),
+            FileStore(AppPaths(self.root / "queue-all-data")),
+            AppSettings(Database(self.root / "queue-all.db")),
+        )
+        center.resize(1480, 900)
+        center.show()
+        self.app.processEvents()
+        center._refresh_queue()
+        self.assertEqual(center.queue_table.rowCount(), 2)
+        self.assertEqual(center.queue_table.item(0, 2).text(), first.task_code)
+        self.assertEqual(center.queue_table.item(1, 2).text(), second.task_code)
+        center.task_table.selectRow(1)
+        self.app.processEvents()
+        center._refresh_queue()
+        self.assertEqual(center.queue_table.rowCount(), 2)
+        calls = []
+        original = self.repository.list_project_attempts
+        self.repository.list_project_attempts = (
+            lambda project_id: (
+                calls.append(project_id)
+                or original(project_id)
+            )
+        )
+        center.queue_refresh_button.click()
+        self.assertEqual(calls, [first.project_id])
         center.deleteLater()
 
     def test_task_center_skip_remaining_marks_project_tasks(self) -> None:

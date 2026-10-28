@@ -445,9 +445,18 @@ class TaskCenterPage(QWidget):
 
         queue_card = QGroupBox("生成任务队列")
         queue_layout = QVBoxLayout(queue_card)
-        self.queue_table = QTableWidget(0, 5)
+        self.queue_table = QTableWidget(0, 8)
         self.queue_table.setHorizontalHeaderLabels(
-            ["轮次", "操作人员", "状态", "创建时间", "结果数"]
+            [
+                "主任务编码",
+                "货号",
+                "子任务编码",
+                "轮次",
+                "操作人员",
+                "状态",
+                "创建时间",
+                "结果数",
+            ]
         )
         self.queue_table.verticalHeader().setVisible(False)
         self.queue_table.setEditTriggers(
@@ -457,12 +466,19 @@ class TaskCenterPage(QWidget):
         self.queue_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Interactive
         )
-        for column, width in enumerate((70, 120, 110, 145, 70)):
+        for column, width in enumerate(
+            (180, 80, 190, 60, 100, 90, 135, 65)
+        ):
             self.queue_table.setColumnWidth(column, width)
         queue_layout.addWidget(self.queue_table)
+        queue_footer = QHBoxLayout()
         self.queue_hint = QLabel()
         self.queue_hint.setStyleSheet("color:#60708a;")
-        queue_layout.addWidget(self.queue_hint)
+        queue_footer.addWidget(self.queue_hint, 1)
+        self.queue_refresh_button = QPushButton("刷新")
+        self.queue_refresh_button.clicked.connect(self._refresh_queue)
+        queue_footer.addWidget(self.queue_refresh_button)
+        queue_layout.addLayout(queue_footer)
         self.generation_splitter.addWidget(queue_card)
         self.generation_splitter.setSizes([420, 400])
         return self.generation_splitter
@@ -1391,34 +1407,42 @@ class TaskCenterPage(QWidget):
     def _refresh_queue(self) -> None:
         if not hasattr(self, "queue_table") or not self.isVisible():
             return
-        task = self.current_task
         self.queue_table.setRowCount(0)
-        if task is None:
+        if self.current_project_id is None:
             self.queue_hint.setText(
                 f"正在执行 {len(self.active_workers)} 个，等待 {len(self.waiting_jobs)} 个"
             )
             return
         try:
-            attempts = self.repository.list_attempts(task.id)
+            attempts = self.repository.list_project_attempts(
+                self.current_project_id
+            )
         except Exception:
             attempts = []
         for attempt in attempts:
             row = self.queue_table.rowCount()
             self.queue_table.insertRow(row)
-            label = "PS成品" if attempt.model == "manual_ps" else ATTEMPT_LABELS.get(
-                attempt.status,
-                attempt.status,
+            label = (
+                "PS成品"
+                if attempt["model"] == "manual_ps"
+                else ATTEMPT_LABELS.get(
+                    attempt["status"],
+                    attempt["status"],
+                )
             )
             values = (
-                f"第 {attempt.attempt_no} 轮",
-                attempt.operator_name or str(attempt.operator_id),
+                attempt["project_code"],
+                attempt["product_code"] or attempt["access_project_name"],
+                attempt["task_code"],
+                f"第 {attempt['attempt_no']} 轮",
+                attempt["operator_name"] or str(attempt["operator_id"]),
                 label,
                 utc_naive_to_local(
-                    attempt.created_at
+                    attempt["created_at"]
                 ).strftime("%Y-%m-%d %H:%M")
-                if attempt.created_at
+                if attempt["created_at"]
                 else "",
-                str(attempt.generated_image_count),
+                str(attempt["result_count"]),
             )
             for column, value in enumerate(values):
                 self.queue_table.setItem(row, column, QTableWidgetItem(value))
@@ -1436,6 +1460,16 @@ class TaskCenterPage(QWidget):
             QMessageBox.warning(self, "读取候选图失败", str(exc))
             return
         self.gallery.set_task(task, results)
+        if results:
+            latest_attempt_id = results[0].attempt_id
+            self.gallery.set_selected_result_ids(
+                tuple(
+                    result.id
+                    for result in results
+                    if result.attempt_id == latest_attempt_id
+                    and result.source_revision == task.source_revision
+                )
+            )
         self._selection_changed()
 
     def _selection_changed(self, *_args) -> None:
