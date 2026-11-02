@@ -1293,7 +1293,7 @@ class BatchDressTests(unittest.TestCase):
         history.refresh()
         history.show_task(task_id)
         row = history._find_task_row(task_id)
-        self.assertIn("批量换装", history.table.item(row, 4).text())
+        self.assertEqual(history.table.item(row, 2).text(), "批量换装")
         history._retry_current()
         self.app.processEvents()
 

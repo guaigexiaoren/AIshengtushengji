@@ -19,6 +19,7 @@ if HAS_PYSIDE:
         QAbstractItemView,
         QApplication,
         QDialog,
+        QGraphicsView,
         QHeaderView,
         QLabel,
         QMessageBox,
@@ -71,6 +72,9 @@ if HAS_PYSIDE:
     from yixin.ui.project_history_page import ProjectHistoryPage
     from yixin.ui.unified_history_page import (
         UnifiedHistoryPage,
+    )
+    from yixin.ui.image_preview import (
+        LargeImageDialog,
     )
     from yixin.ui.date_filter import OptionalDateEdit
     from yixin.ui.task_center_page import TaskCenterPage
@@ -490,6 +494,14 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertFalse(page.urgent_button.isVisible())
         self.assertFalse(page.review_actions.isVisible())
         self.assertFalse(page.result_panel.isHidden())
+        self.assertIs(
+            page.result_panel,
+            page.dual_preview.result_pane,
+        )
+        self.assertIs(
+            page.reference_panel,
+            page.dual_preview.reference_pane,
+        )
         self.assertFalse(page._can_edit_task(available))
         page.deleteLater()
 
@@ -850,8 +862,12 @@ class CollaborationPageTests(unittest.TestCase):
         ]
         nav = SidebarNav(
             labels,
-            group_before={0: "AI图提交", 2: "任务中心"},
-            submenu_indices={0, 1, 2, 3},
+            group_before={
+                0: "AI图提交",
+                2: "任务中心",
+                4: "创造中心",
+            },
+            submenu_indices={0, 1, 2, 3, 4, 5},
         )
         nav.setStyleSheet(APP_STYLESHEET)
         nav.resize(210, 650)
@@ -862,15 +878,22 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(
             all(
                 nav._buttons[index].property("submenu") in (True, "true")
-                for index in (0, 1, 2, 3)
+                for index in (0, 1, 2, 3, 4, 5)
             )
         )
-        self.assertFalse(nav._buttons[4].property("submenu"))
+        self.assertFalse(nav._buttons[6].property("submenu"))
         group_label = nav.findChild(QLabel, "NavGroup")
         self.assertIsNotNone(group_label)
         self.assertEqual(
             group_label.font().pixelSize(),
-            nav._buttons[4].font().pixelSize(),
+            nav._buttons[6].font().pixelSize(),
+        )
+        self.assertEqual(
+            [
+                label.text()
+                for label in nav.findChildren(QLabel, "NavGroup")
+            ],
+            ["AI图提交", "任务中心", "创造中心"],
         )
         nav.close()
         nav.deleteLater()
@@ -1422,6 +1445,14 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.assertEqual(
             window.nav_list._buttons[2].property("submenu"),
+            True,
+        )
+        self.assertEqual(
+            window.nav_list._buttons[3].property("submenu"),
+            True,
+        )
+        self.assertEqual(
+            window.nav_list._buttons[4].property("submenu"),
             True,
         )
         window.close()
@@ -2883,12 +2914,14 @@ class CollaborationPageTests(unittest.TestCase):
         result_path = product_root / "AI成品" / "result.png"
         result_path.parent.mkdir(parents=True)
         Image.new("RGB", (30, 40), "orange").save(result_path)
+        thumbnail_path = product_root / "AI成品" / "thumb_result.png"
+        Image.new("RGB", (10, 10), "orange").save(thumbnail_path)
         result = GenerationResult(
             id=30,
             attempt_id=40,
             result_index=0,
             relative_path=result_path.relative_to(product_root).as_posix(),
-            thumbnail_relative_path=result_path.relative_to(
+            thumbnail_relative_path=thumbnail_path.relative_to(
                 product_root
             ).as_posix(),
             content_hash="b" * 64,
@@ -2997,19 +3030,39 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.assertEqual(page.table.rowCount(), 1)
         self.assertEqual(page.table.item(0, 0).text(), "项目")
-        self.assertEqual(page.combined_strip.count(), 4)
         self.assertEqual(
-            [
-                page.combined_strip.item(index).text()
-                for index in range(page.combined_strip.count())
-            ],
-            ["参考 1", "参考 2", "参考 3", "结果 1"],
+            page.dual_preview.result_pane.list_widget.count(),
+            1,
         )
-        self.assertEqual(page.combined_strip.currentRow(), 3)
+        self.assertEqual(
+            page.dual_preview.reference_pane.list_widget.count(),
+            3,
+        )
+        self.assertEqual(
+            page.dual_preview.result_pane.list_widget.currentRow(),
+            0,
+        )
+        self.assertEqual(
+            page.dual_preview.reference_pane.list_widget.currentRow(),
+            2,
+        )
+        self.assertEqual(
+            page.dual_preview.reference_pane.list_widget.item(2).text(),
+            "模特",
+        )
         self.assertEqual(
             page.preview.current_path,
             result_path.resolve(),
         )
+        self.assertTrue(page.save_local_button.isEnabled())
+        reference_strip = page.dual_preview.reference_pane.list_widget
+        reference_strip.itemClicked.emit(reference_strip.item(2))
+        self.app.processEvents()
+        self.assertFalse(page.save_local_button.isEnabled())
+        result_strip = page.dual_preview.result_pane.list_widget
+        result_strip.itemClicked.emit(result_strip.item(0))
+        self.app.processEvents()
+        self.assertTrue(page.save_local_button.isEnabled())
         emitted: list[tuple[int, int]] = []
         page.project_retry_requested.connect(
             lambda task_id, attempt_id: emitted.append(
@@ -3024,9 +3077,9 @@ class CollaborationPageTests(unittest.TestCase):
             page._save_library()
         self.assertEqual(len(database.list_works()), 1)
         with patch(
-            "yixin.ui.unified_history_page.LargeImageDialog"
+            "yixin.ui.image_preview.LargeImageDialog"
         ) as dialog_cls:
-            page._zoom_current()
+            page.dual_preview.result_pane._open_zoom()
         dialog_cls.return_value.exec.assert_called_once()
         page.deleteLater()
 
@@ -3075,6 +3128,27 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(cancelled, [50])
         self.assertEqual(emitted, [50])
         page.deleteLater()
+
+    def test_large_image_dialog_supports_pan_and_zoom(self) -> None:
+        image_path = self.root / "zoom-history.png"
+        Image.new("RGB", (320, 240), "purple").save(image_path)
+        dialog = LargeImageDialog(image_path)
+        self.assertEqual(
+            dialog.view.dragMode(),
+            QGraphicsView.DragMode.ScrollHandDrag,
+        )
+        dialog._set_scale(0.01)
+        self.assertEqual(dialog._scale, 0.1)
+        dialog._set_scale(8)
+        self.assertEqual(dialog._scale, 4.0)
+        dialog._fit_to_window()
+        self.assertGreater(dialog._scale, 0)
+        dialog._release_resources()
+        self.assertIsNone(dialog.view.scene())
+        self.assertIsNone(dialog.pixmap_item)
+        self.assertTrue(dialog._pixmap.isNull())
+        dialog.close()
+        dialog.deleteLater()
 
 
 if __name__ == "__main__":

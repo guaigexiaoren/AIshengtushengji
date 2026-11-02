@@ -36,11 +36,10 @@ from ..collaboration.types import (
     ProjectTask,
 )
 from ..time_utils import utc_naive_to_local
-from .result_gallery import ResultGallery
 from .date_filter import OptionalDateEdit
 from .dialogs import CompareDialog
+from .image_preview import DualImagePreview
 from .subtask_source_dialog import SubtaskSourceDialog
-from .widgets import ImageStrip, ImageView
 
 
 VIEW_STATUSES = {
@@ -244,13 +243,17 @@ class SubmissionListPage(QWidget):
         self.review_actions.setVisible(self.view_mode == "pending")
         preview_layout.addWidget(self.review_actions)
 
-        self.preview_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.result_panel = self._build_result_preview()
-        self.reference_panel = self._build_reference_preview()
-        self.preview_splitter.addWidget(self.result_panel)
-        self.preview_splitter.addWidget(self.reference_panel)
-        self.preview_splitter.setSizes([300, 300])
-        preview_layout.addWidget(self.preview_splitter, 1)
+        self.dual_preview = DualImagePreview(self.resolver)
+        self.preview_splitter = self.dual_preview.splitter
+        self.result_panel = self.dual_preview.result_pane
+        self.reference_panel = self.dual_preview.reference_pane
+        self.result_gallery = self.result_panel
+        self.reference_gallery = self.reference_panel
+        self.result_header = self.result_gallery.title_label
+        self.reference_header = self.reference_gallery.title_label
+        self.reference_strip = self.reference_gallery.list_widget
+        self.reference_preview = self.reference_gallery.preview
+        preview_layout.addWidget(self.dual_preview, 1)
         if self.view_mode == "submitted":
             self.result_panel.hide()
         body.addWidget(preview_panel)
@@ -265,40 +268,12 @@ class SubmissionListPage(QWidget):
     def _optional_date_edit(placeholder: str) -> OptionalDateEdit:
         return OptionalDateEdit(placeholder)
 
-    def _build_result_preview(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(0, 0, 6, 0)
-        self.result_header = QLabel("结果图（0）")
-        self.result_header.setStyleSheet("font-weight:700;color:#1f2d43;")
-        layout.addWidget(self.result_header)
-        self.result_gallery = ResultGallery(self.resolver)
-        layout.addWidget(self.result_gallery, 1)
-        return widget
-
-    def _build_reference_preview(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(6, 0, 0, 0)
-        self.reference_header = QLabel("参考图（0）")
-        self.reference_header.setStyleSheet("font-weight:700;color:#1f2d43;")
-        layout.addWidget(self.reference_header)
-        self.reference_strip = ImageStrip(icon_size=96)
-        self.reference_preview = ImageView()
-        self.reference_preview.set_placeholder("选择参考图查看大图")
-        self.reference_preview.setMinimumHeight(320)
-        self.reference_strip.currentRowChanged.connect(
-            self._show_reference_image
-        )
-        layout.addWidget(self.reference_strip)
-        layout.addWidget(self.reference_preview, 1)
-        return widget
-
     def refresh(self) -> None:
         try:
             shared_root = self.repository.get_shared_setting("share_root")
             if shared_root:
                 self.resolver = SharedPathResolver(shared_root)
+                self.dual_preview.set_resolver(self.resolver)
             self._all_tasks = self.repository.list_board_tasks(
                 self.actor,
                 include_finished=True,
@@ -581,8 +556,10 @@ class SubmissionListPage(QWidget):
             task.model_path,
         )
         items.append((model_path, "模特", model_path))
-        self.reference_strip.set_images(items)
-        self.reference_strip.setCurrentRow(len(items) - 1)
+        self.reference_gallery.set_images(
+            items,
+            default_row=len(items) - 1,
+        )
         self._update_preview_counts()
 
     def _update_preview_counts(self) -> None:
@@ -592,12 +569,6 @@ class SubmissionListPage(QWidget):
         self.reference_header.setText(
             f"参考图（{self.reference_strip.count()}）"
         )
-
-    def _show_reference_image(self, row: int) -> None:
-        if 0 <= row < self.reference_strip.count():
-            item = self.reference_strip.item(row)
-            path = item.data(Qt.ItemDataRole.UserRole)
-            self.reference_preview.set_image(path)
 
     def _update_actions(self) -> None:
         project = self._current_project()

@@ -353,6 +353,8 @@ class MainWindow(QMainWindow):
             "提交记录",
             "待分配",
             "AI生图",
+            "普通创作",
+            "批量换装",
         )
         submenu_indices = {
             index
@@ -370,10 +372,17 @@ class MainWindow(QMainWindow):
             for index, label in enumerate(labels)
             if label in ("待分配", "AI生图")
         ]
+        creation_indices = [
+            index
+            for index, label in enumerate(labels)
+            if label in ("普通创作", "批量换装")
+        ]
         if ai_indices:
             group_before[min(ai_indices)] = "AI图提交"
         if task_indices:
             group_before[min(task_indices)] = "任务中心"
+        if creation_indices:
+            group_before[min(creation_indices)] = "创造中心"
         self.nav_list = SidebarNav(
             labels,
             group_before=group_before or None,
