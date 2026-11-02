@@ -285,7 +285,7 @@ class GuiFlowTests(unittest.TestCase):
         nested = root / "子目录"
         nested.mkdir(parents=True)
         first = make_image(root / "2.png", (20, 50, 80))
-        second = make_image(nested / "10.png", (50, 80, 20))
+        make_image(nested / "10.png", (50, 80, 20))
         duplicate = root / "duplicate.png"
         duplicate.write_bytes(first.read_bytes())
         (root / "ignore.txt").write_text("ignore", encoding="utf-8")

@@ -26,6 +26,7 @@ from ..collaboration.types import (
     TASK_AVAILABLE,
     TASK_AWAITING_ACCEPTANCE,
     TASK_CLAIMED,
+    TASK_EXPANDED,
     TASK_RETURNED,
     TASK_SKIPPED,
     TASK_STATUS_LABELS,
@@ -46,6 +47,16 @@ VIEW_STATUSES = {
     "submitted": (TASK_AVAILABLE, TASK_CLAIMED, TASK_WORKING, TASK_RETURNED),
     "pending": (TASK_AWAITING_ACCEPTANCE,),
     "completed": (TASK_APPROVED, TASK_SKIPPED),
+    "records": (
+        TASK_AVAILABLE,
+        TASK_CLAIMED,
+        TASK_WORKING,
+        TASK_AWAITING_ACCEPTANCE,
+        TASK_RETURNED,
+        TASK_APPROVED,
+        TASK_SKIPPED,
+        "cancelled",
+    ),
 }
 VIEW_TITLES = {
     "submitted": (
@@ -54,6 +65,10 @@ VIEW_TITLES = {
     ),
     "pending": ("待审核", "查看参考图与成品，通过或填写修改点退回。"),
     "completed": ("已完成", "查看已经通过验收的子任务与成品。"),
+    "records": (
+        "提交记录",
+        "只读查看自己提交的任务、制作进度、参考图和成品。",
+    ),
 }
 
 
@@ -138,6 +153,8 @@ class SubmissionListPage(QWidget):
             self.project_table.setColumnWidth(column, width)
         self.project_table.setMaximumHeight(220)
         self.project_table.setSortingEnabled(True)
+        if self.view_mode == "records":
+            self.project_table.setColumnHidden(6, True)
         self.project_table.itemSelectionChanged.connect(self._project_selected)
         outer.addWidget(self.project_table)
 
@@ -291,6 +308,12 @@ class SubmissionListPage(QWidget):
                 limit=10000,
                 actor=self.actor,
             )
+            if self.view_mode == "records":
+                self._all_tasks = [
+                    task
+                    for task in self._all_tasks
+                    if task.status != TASK_EXPANDED
+                ]
         except Exception as exc:
             QMessageBox.warning(self, "读取任务失败", str(exc))
             return
@@ -510,6 +533,8 @@ class SubmissionListPage(QWidget):
         )
 
     def _can_edit_task(self, task: ProjectTask) -> bool:
+        if self.view_mode == "records":
+            return False
         return self._can_manage(self._current_project()) and task.status not in (
             TASK_AWAITING_ACCEPTANCE,
             TASK_APPROVED,

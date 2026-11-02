@@ -58,7 +58,6 @@ from .crop import CropDialog
 from .dialogs import LibraryPickerDialog, TemplateManagerDialog
 from .widgets import (
     load_scaled_pixmap,
-    natural_sort_key,
     scan_image_inputs,
 )
 

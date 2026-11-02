@@ -40,11 +40,11 @@ from yixin.ui.batch_dress_page import (
     DressTaskGroup,
     PAIR_CARD_GAP,
     PAIR_CARD_MIN_WIDTH,
-    natural_sort_key,
     scan_image_inputs,
 )
 from yixin.ui.main_window import MainWindow
 from yixin.ui.theme import APP_STYLESHEET
+from yixin.ui.widgets import natural_sort_key
 from yixin.worker import TaskWorker
 from tests.collaboration_fakes import EmptyCentralRepository, fake_ai_user
 
@@ -104,7 +104,7 @@ class BatchDressTests(unittest.TestCase):
         self.assertEqual(
             labels,
             [
-            "AI图提交",
+            "AI提交",
             "待分配",
             "AI生图",
                 "普通创作",

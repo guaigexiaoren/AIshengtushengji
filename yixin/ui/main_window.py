@@ -22,6 +22,7 @@ from ..collaboration.shared_paths import SharedPathResolver
 from ..collaboration.types import (
     ROLE_ADMIN,
     ROLE_AI,
+    ROLE_OPERATIONS,
     ROLE_LABELS,
     ROLE_DEFAULT_MENUS,
     ROLE_ALLOWED_MENUS,
@@ -40,6 +41,7 @@ from .create_page import CreatePage
 from .dialogs import SettingsDialog
 from .unified_history_page import UnifiedHistoryPage
 from .library_page import LibraryPage
+from .submission_list_page import SubmissionListPage
 from .ai_generation_page import AIGenerationPage
 from .task_assignment_page import TaskAssignmentPage
 from .task_create_page import TaskCreatePage
@@ -153,7 +155,18 @@ class MainWindow(QMainWindow):
             actor,
             auto_load=False,
         )
-        self.page_specs.append(("AI图提交", self.new_task_page))
+        self.page_specs.append(("AI提交", self.new_task_page))
+        if self.actor.role in (ROLE_OPERATIONS, ROLE_ADMIN):
+            self.submission_records_page = SubmissionListPage(
+                repository,
+                resolver,
+                actor,
+                "records",
+                auto_load=False,
+            )
+            self.page_specs.append(
+                ("提交记录", self.submission_records_page)
+            )
         if self.actor.role in (ROLE_AI, ROLE_ADMIN):
             self.assignment_page = TaskAssignmentPage(
                 repository,
@@ -230,7 +243,8 @@ class MainWindow(QMainWindow):
         )
         allowed_menu_keys = configured & role_allowed
         label_keys = {
-            "AI图提交": "new_task",
+            "AI提交": "new_task",
+            "提交记录": "submission_history",
             "待分配": "assign_tasks",
             "AI生图": "ai_generate",
             "普通创作": "create",
@@ -334,20 +348,35 @@ class MainWindow(QMainWindow):
         layout.addWidget(subtitle)
         layout.addSpacing(20)
         labels = [text for text, _ in self.page_specs]
-        submenu_labels = ("待分配", "AI生图")
+        submenu_labels = (
+            "AI提交",
+            "提交记录",
+            "待分配",
+            "AI生图",
+        )
         submenu_indices = {
             index
             for index, label in enumerate(labels)
             if label in submenu_labels
         }
-        group_index = min(submenu_indices) if submenu_indices else 0
+        group_before = {}
+        ai_indices = [
+            index
+            for index, label in enumerate(labels)
+            if label in ("AI提交", "提交记录")
+        ]
+        task_indices = [
+            index
+            for index, label in enumerate(labels)
+            if label in ("待分配", "AI生图")
+        ]
+        if ai_indices:
+            group_before[min(ai_indices)] = "AI图提交"
+        if task_indices:
+            group_before[min(task_indices)] = "任务中心"
         self.nav_list = SidebarNav(
             labels,
-            group_before=(
-                {group_index: "任务中心"}
-                if submenu_indices
-                else None
-            ),
+            group_before=group_before or None,
             submenu_indices=submenu_indices,
         )
         self.nav_list.setObjectName("NavList")
@@ -431,6 +460,16 @@ class MainWindow(QMainWindow):
         task_id: int,
         attempt_id: int,
     ) -> None:
+        if not any(
+            page is self.ai_generation_page
+            for _, page in self.page_specs
+        ):
+            QMessageBox.warning(
+                self,
+                "没有AI生图权限",
+                "当前账号没有AI生图菜单权限，无法载入项目重试。",
+            )
+            return
         try:
             self.ai_generation_page.prepare_history_retry(
                 task_id,

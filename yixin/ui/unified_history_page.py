@@ -898,4 +898,11 @@ class UnifiedHistoryPage(QWidget):
             self.preview.current_path,
             self,
         )
+        self._zoom_dialog.finished.connect(self._release_zoom_dialog)
         self._zoom_dialog.exec()
+
+    def _release_zoom_dialog(self, _result: int) -> None:
+        dialog = self._zoom_dialog
+        self._zoom_dialog = None
+        if dialog is not None:
+            dialog.deleteLater()

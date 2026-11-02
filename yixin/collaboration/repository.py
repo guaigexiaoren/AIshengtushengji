@@ -70,7 +70,7 @@ from .types import (
     ROLE_ALLOWED_MENUS,
 )
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 LEGACY_SHARED_ROOT = (
     r"\\fe80--211-32ff-fe87-ba49.ipv6-literal.net\AI作图"
 )
@@ -186,6 +186,7 @@ class MySQLCentralRepository:
                     self._apply_schema_v4(cursor)
                     self._apply_schema_v5(cursor)
                     self._apply_schema_v6(cursor)
+                    self._apply_schema_v7(cursor)
                     self._apply_shared_root_update(cursor)
                     cursor.execute(
                         "INSERT IGNORE INTO schema_migrations(version, applied_at) "
@@ -410,6 +411,35 @@ class MySQLCentralRepository:
                 column,
                 definition,
             )
+
+    @staticmethod
+    def _apply_schema_v7(cursor) -> None:
+        cursor.execute(
+            "SELECT COALESCE(MAX(version), 0) AS version "
+            "FROM schema_migrations"
+        )
+        previous_version = int(cursor.fetchone()["version"])
+        if previous_version >= 7:
+            return
+        cursor.execute(
+            """
+            INSERT IGNORE INTO user_menu_permissions(user_id, menu_key)
+            SELECT id, 'submission_history'
+            FROM users
+            WHERE role IN (%s, %s)
+            """,
+            (ROLE_OPERATIONS, ROLE_ADMIN),
+        )
+        cursor.execute(
+            """
+            DELETE FROM user_menu_permissions
+            WHERE menu_key = 'submission_history'
+              AND user_id IN (
+                  SELECT id FROM users WHERE role = %s
+              )
+            """,
+            (ROLE_AI,),
+        )
 
     @staticmethod
     def _apply_shared_root_update(cursor) -> None:
@@ -4083,6 +4113,18 @@ class MySQLCentralRepository:
                     (task_id,),
                 )
                 return [_generation_attempt(row) for row in cursor.fetchall()]
+
+    def generation_attempt_status(self, attempt_id: int) -> str:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT status FROM generation_attempts WHERE id = %s",
+                    (attempt_id,),
+                )
+                row = cursor.fetchone()
+        if row is None:
+            raise ValueError("生成轮次不存在")
+        return str(row["status"])
 
     def list_project_attempts(
         self,

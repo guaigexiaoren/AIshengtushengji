@@ -16,7 +16,8 @@ ROLE_LABELS = {
 }
 
 MENU_KEYS = {
-    "new_task": "AI图提交",
+    "new_task": "AI提交",
+    "submission_history": "提交记录",
     "assign_tasks": "待分配",
     "ai_generate": "AI生图",
     "create": "普通创作",
@@ -26,7 +27,7 @@ MENU_KEYS = {
     "admin": "管理控制台",
 }
 ROLE_DEFAULT_MENUS = {
-    ROLE_OPERATIONS: ("new_task",),
+    ROLE_OPERATIONS: ("new_task", "submission_history"),
     ROLE_AI: (
         "new_task",
         "assign_tasks",
@@ -39,7 +40,7 @@ ROLE_DEFAULT_MENUS = {
     ROLE_ADMIN: tuple(MENU_KEYS),
 }
 ROLE_ALLOWED_MENUS = {
-    ROLE_OPERATIONS: ("new_task",),
+    ROLE_OPERATIONS: ("new_task", "submission_history"),
     ROLE_AI: ROLE_DEFAULT_MENUS[ROLE_AI],
     ROLE_ADMIN: ROLE_DEFAULT_MENUS[ROLE_ADMIN],
 }

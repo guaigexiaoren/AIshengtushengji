@@ -392,7 +392,7 @@ class TaskCreatePage(QWidget):
         outer = QVBoxLayout(self)
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("AI图提交")
+        title = QLabel("AI提交")
         title.setStyleSheet("font-size:22px;font-weight:700;color:#1f2d43;")
         subtitle = QLabel("扫描共享盘货号，确认衣服与模特后创建任务。")
         subtitle.setStyleSheet("color:#6d7a91;")

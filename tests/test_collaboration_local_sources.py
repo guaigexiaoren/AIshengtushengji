@@ -9,7 +9,9 @@ from PIL import Image
 
 from yixin.collaboration.local_sources import LocalTaskSourceStore
 from yixin.collaboration.shared_paths import SharedPathResolver
+from yixin.collaboration.repository import StateConflictError
 from yixin.collaboration.types import (
+    ATTEMPT_CANCELLED,
     ATTEMPT_QUEUED,
     AuthUser,
     GenerationAttempt,
@@ -250,6 +252,71 @@ class LocalTaskSourceTests(unittest.TestCase):
             files = [path for path in output.iterdir() if path.is_file()]
             self.assertEqual(len(files), 1)
             self.assertRegex(files[0].name, r"^_r001_01_[0-9a-f]{12}\.png$")
+
+    def test_cancelled_queued_attempt_exits_without_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = make_task(root / "share")
+            attempt = GenerationAttempt(
+                id=32,
+                task_id=task.id,
+                attempt_no=1,
+                operator_id=7,
+                model="gemini-3.1-flash-image",
+                prompt_text="取消竞态",
+                aspect_ratio="3:4",
+                resolution="2K",
+                n=1,
+                status=ATTEMPT_QUEUED,
+                source_revision=1,
+                unit_price=0,
+                generated_image_count=0,
+            )
+
+            class Repository:
+                def get_task(self, _task_id):
+                    return task
+
+                def start_queued_generation_attempt(self, *_args):
+                    raise StateConflictError("已取消")
+
+                def current_model_price(self, _model):
+                    return 0
+
+                def generation_attempt_status(self, _attempt_id):
+                    return ATTEMPT_CANCELLED
+
+                def fail_generation_attempt(self, *_args, **_kwargs):
+                    raise AssertionError("不应记录失败")
+
+            finished = []
+            failed = []
+            worker = ProjectGenerationWorker(
+                repository=Repository(),
+                client=object(),
+                resolver=SharedPathResolver(root / "share"),
+                task=task,
+                actor=AuthUser(7, "ai", "AI甲", "ai"),
+                prompt="取消竞态",
+                model="gemini-3.1-flash-image",
+                aspect_ratio="3:4",
+                resolution="2K",
+                n=1,
+                reserved_attempt=attempt,
+            )
+            worker.signals.finished.connect(
+                lambda task_id, attempt_id: finished.append(
+                    (task_id, attempt_id)
+                )
+            )
+            worker.signals.failed.connect(
+                lambda task_id, message, attempt_id: failed.append(
+                    (task_id, message, attempt_id)
+                )
+            )
+            worker._run()
+            self.assertEqual(finished, [(task.id, attempt.id)])
+            self.assertEqual(failed, [])
 
 
 if __name__ == "__main__":

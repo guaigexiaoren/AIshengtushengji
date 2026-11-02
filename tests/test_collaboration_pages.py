@@ -459,6 +459,40 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertGreaterEqual(page.garment_list.minimumHeight(), 240)
         page.deleteLater()
 
+    def test_submission_records_are_read_only_and_hide_expanded_parents(
+        self,
+    ) -> None:
+        project = make_project()
+        available = replace(make_task("available"), id=11)
+        approved = replace(
+            make_task("approved"),
+            id=12,
+            task_code="春季项目-123-001-002",
+        )
+        expanded = replace(
+            make_task("expanded"),
+            id=13,
+            task_code="春季项目-123-001-003",
+        )
+        self.repository.list_projects = lambda **_kwargs: [project]
+        self.repository.list_board_tasks = (
+            lambda _actor, **_kwargs: [available, approved, expanded]
+        )
+        page = SubmissionListPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            "records",
+        )
+        self.assertEqual(page.project_table.rowCount(), 1)
+        self.assertTrue(page.project_table.isColumnHidden(6))
+        self.assertEqual(page.task_table.rowCount(), 2)
+        self.assertFalse(page.urgent_button.isVisible())
+        self.assertFalse(page.review_actions.isVisible())
+        self.assertFalse(page.result_panel.isHidden())
+        self.assertFalse(page._can_edit_task(available))
+        page.deleteLater()
+
     def test_assignment_page_multi_select_and_claim(self) -> None:
         write_task_images(self.root)
         project = make_project()
@@ -804,7 +838,8 @@ class CollaborationPageTests(unittest.TestCase):
 
     def test_sidebar_shows_all_new_menu_items(self) -> None:
         labels = [
-            "AI图提交",
+            "AI提交",
+            "提交记录",
             "待分配",
             "AI生图",
             "普通创作",
@@ -815,8 +850,8 @@ class CollaborationPageTests(unittest.TestCase):
         ]
         nav = SidebarNav(
             labels,
-            group_before={1: "任务中心"},
-            submenu_indices={1, 2},
+            group_before={0: "AI图提交", 2: "任务中心"},
+            submenu_indices={0, 1, 2, 3},
         )
         nav.setStyleSheet(APP_STYLESHEET)
         nav.resize(210, 650)
@@ -827,7 +862,7 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(
             all(
                 nav._buttons[index].property("submenu") in (True, "true")
-                for index in (1, 2)
+                for index in (0, 1, 2, 3)
             )
         )
         self.assertFalse(nav._buttons[4].property("submenu"))
@@ -1321,7 +1356,7 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.assertEqual(
             labels,
-            ["AI图提交"],
+            ["AI提交", "提交记录"],
         )
         with patch.object(window.new_task_page, "refresh") as refresh:
             window.show()
@@ -1372,7 +1407,7 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(
             labels,
             [
-                "AI图提交",
+                "AI提交",
                 "待分配",
                 "AI生图",
                 "普通创作",
@@ -1388,6 +1423,47 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(
             window.nav_list._buttons[2].property("submenu"),
             True,
+        )
+        window.close()
+        window.deleteLater()
+
+    def test_project_retry_requires_ai_generation_menu(self) -> None:
+        paths = AppPaths(self.root / "retry-permission-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        actor = AuthUser(
+            4,
+            "ai_amy",
+            "AI制作Amy",
+            "ai",
+            menu_permissions=(
+                "new_task",
+                "history",
+            ),
+        )
+        client = NanoBananaClient(lambda: None)
+        window = MainWindow(
+            paths=paths,
+            database=database,
+            file_store=file_store,
+            library_service=LibraryService(database, file_store, paths),
+            secret_store=SecretStore(paths.api_key_file),
+            worker=TaskWorker(database, client, file_store),
+            client=client,
+            repository=self.repository,
+            resolver=self.resolver,
+            actor=actor,
+        )
+        with patch(
+            "yixin.ui.main_window.QMessageBox.warning"
+        ) as warning:
+            window._open_project_retry(11, 41)
+        warning.assert_called_once()
+        self.assertNotEqual(
+            window.stack.currentWidget(),
+            window.ai_generation_page,
         )
         window.close()
         window.deleteLater()

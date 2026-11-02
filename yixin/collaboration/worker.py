@@ -13,10 +13,11 @@ from ..storage import (
     image_metadata,
     sha256_bytes,
 )
-from .repository import MySQLCentralRepository
+from .repository import MySQLCentralRepository, StateConflictError
 from .shared_paths import SharedPathResolver
 from .types import (
     AuthUser,
+    ATTEMPT_CANCELLED,
     GeneratedResultInput,
     GenerationAttempt,
     ProjectTask,
@@ -83,10 +84,22 @@ class ProjectGenerationWorker:
             unit_price = self.repository.current_model_price(self.model)
             if self.reserved_attempt is not None:
                 attempt_id = self.reserved_attempt.id
-                attempt = self.repository.start_queued_generation_attempt(
-                    attempt_id,
-                    self.actor,
-                )
+                try:
+                    attempt = self.repository.start_queued_generation_attempt(
+                        attempt_id,
+                        self.actor,
+                    )
+                except StateConflictError:
+                    status = self.repository.generation_attempt_status(
+                        attempt_id
+                    )
+                    if status == ATTEMPT_CANCELLED:
+                        self.signals.finished.emit(
+                            self.task.id,
+                            attempt_id,
+                        )
+                        return
+                    raise
             else:
                 attempt = self.repository.create_generation_attempt(
                     self.task.id,

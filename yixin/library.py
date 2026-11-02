@@ -298,17 +298,21 @@ class LibraryService:
                 )
                 for asset in task.garment_assets
             ]
+            model_path = resolver.resolve_project_path(
+                task.project_relative_root,
+                task.model_path,
+            )
+            model_mime, model_width, model_height = image_metadata(
+                model_path.read_bytes()
+            )
             reference_assets.append(
                 (
-                    resolver.resolve_project_path(
-                        task.project_relative_root,
-                        task.model_path,
-                    ),
+                    model_path,
                     task.model_name,
                     task.model_hash,
-                    "image/png",
-                    0,
-                    0,
+                    model_mime,
+                    model_width,
+                    model_height,
                 )
             )
             for position, (

@@ -1,7 +1,12 @@
 import unittest
 from pathlib import Path
 
-from yixin.collaboration.types import MENU_KEYS, TASK_STATUS_LABELS
+from yixin.collaboration.types import (
+    MENU_KEYS,
+    ROLE_AI,
+    ROLE_DEFAULT_MENUS,
+    TASK_STATUS_LABELS,
+)
 
 
 class CollaborationSchemaTests(unittest.TestCase):
@@ -54,13 +59,22 @@ class CollaborationSchemaTests(unittest.TestCase):
         self.assertIn("FOREIGN KEY", schema)
 
     def test_new_workflow_menu_and_status_labels(self) -> None:
-        self.assertEqual(MENU_KEYS["new_task"], "AI图提交")
+        self.assertEqual(MENU_KEYS["new_task"], "AI提交")
+        self.assertEqual(MENU_KEYS["submission_history"], "提交记录")
         self.assertEqual(MENU_KEYS["assign_tasks"], "待分配")
         self.assertEqual(MENU_KEYS["ai_generate"], "AI生图")
         self.assertNotIn("submitted", MENU_KEYS)
         self.assertNotIn("pending", MENU_KEYS)
         self.assertNotIn("completed", MENU_KEYS)
         self.assertEqual(TASK_STATUS_LABELS["expanded"], "已拆分")
+        self.assertIn(
+            "submission_history",
+            ROLE_DEFAULT_MENUS["operations"],
+        )
+        self.assertNotIn(
+            "submission_history",
+            ROLE_DEFAULT_MENUS[ROLE_AI],
+        )
 
 
 if __name__ == "__main__":

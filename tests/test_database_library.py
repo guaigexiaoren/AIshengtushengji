@@ -70,7 +70,6 @@ class DatabaseLibraryTests(unittest.TestCase):
             thumbnail_path=thumbnail,
             remote_url=None,
         )
-        task = self.database.get_task(task_id)
         self.database.update_task_from_api(
             task_id,
             request_id=f"req-{task_id}",
