@@ -92,13 +92,6 @@ class AsyncThumbnailTests(unittest.TestCase):
             )
             self.assertEqual(page.garment_list.count(), 13)
             self.assertEqual(page.model_list.count(), 20)
-            self.assertEqual(len(page.pair_cards), 20)
-            self.assertTrue(
-                all(
-                    len(card.garment_thumbnails) == 13
-                    for card in page.pair_cards
-                )
-            )
             for _ in range(200):
                 self.app.processEvents()
                 loaded = (
@@ -109,14 +102,6 @@ class AsyncThumbnailTests(unittest.TestCase):
                     and all(
                         not page.model_list.item(index).icon().isNull()
                         for index in range(page.model_list.count())
-                    )
-                    and all(
-                        not card.model_thumbnail.pixmap().isNull()
-                        and all(
-                            not label.pixmap().isNull()
-                            for label in card.garment_thumbnails
-                        )
-                        for card in page.pair_cards
                     )
                 )
                 if loaded:

@@ -192,6 +192,8 @@ CREATE TABLE IF NOT EXISTS project_tasks (
     submitted_at DATETIME(6) NULL,
     approved_at DATETIME(6) NULL,
     returned_at DATETIME(6) NULL,
+    parent_task_id BIGINT UNSIGNED NULL,
+    split_at DATETIME(6) NULL,
     created_at DATETIME(6) NOT NULL,
     updated_at DATETIME(6) NOT NULL,
     CONSTRAINT fk_project_tasks_project FOREIGN KEY (project_id)
@@ -204,9 +206,12 @@ CREATE TABLE IF NOT EXISTS project_tasks (
         REFERENCES users(id),
     CONSTRAINT fk_project_tasks_urgent_by FOREIGN KEY (urgent_by)
         REFERENCES users(id),
+    CONSTRAINT fk_project_tasks_parent FOREIGN KEY (parent_task_id)
+        REFERENCES project_tasks(id),
     UNIQUE KEY uk_project_task_no (project_id, task_no),
     INDEX idx_project_tasks_status_created (status, created_at),
-    INDEX idx_project_tasks_assignee_status (assignee_id, status)
+    INDEX idx_project_tasks_assignee_status (assignee_id, status),
+    INDEX idx_project_tasks_parent (parent_task_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS generation_attempts (

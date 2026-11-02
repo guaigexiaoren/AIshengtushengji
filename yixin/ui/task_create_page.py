@@ -19,7 +19,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
     QGroupBox,
     QHeaderView,
     QHBoxLayout,
@@ -30,7 +29,6 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
-    QStackedWidget,
     QStyle,
     QStyleOptionButton,
     QStyleOptionHeader,
@@ -373,8 +371,7 @@ class TaskCreatePage(QWidget):
         self.current_state: ProductDraftState | None = None
         self.account_directory: AccountDirectory | None = None
         self.accessible_projects: tuple[tuple[str, str], ...] = ()
-        self.pair_cards: list[PairPreviewCard] = []
-        self.selected_pair_model_index: int | None = None
+        self.pairing_mode = PAIRING_ALL
         self.thumbnail_loader = get_thumbnail_loader()
         self._thumbnail_generation = 0
         self._asset_thumbnail_contexts: dict[
@@ -395,9 +392,9 @@ class TaskCreatePage(QWidget):
         outer = QVBoxLayout(self)
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("新建任务")
+        title = QLabel("AI图提交")
         title.setStyleSheet("font-size:22px;font-weight:700;color:#1f2d43;")
-        subtitle = QLabel("自动扫描共享盘货号目录，确认后批量创建任务。")
+        subtitle = QLabel("扫描共享盘货号，确认衣服与模特后创建任务。")
         subtitle.setStyleSheet("color:#6d7a91;")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
@@ -481,16 +478,9 @@ class TaskCreatePage(QWidget):
         scan_layout.addWidget(self.product_table, 1)
         outer.addWidget(scan_card, 1)
 
-        detail_card = QGroupBox("素材与配对预览")
+        detail_card = QGroupBox("素材预览")
         detail_layout = QVBoxLayout(detail_card)
         mode_row = QHBoxLayout()
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItem("自动配对（每张模特配全部衣服）", PAIRING_ALL)
-        self.mode_combo.addItem("手动配对", PAIRING_MANUAL)
-        self.mode_combo.currentIndexChanged.connect(self._pairing_changed)
-        mode_row.addWidget(QLabel("配对方式"))
-        mode_row.addWidget(self.mode_combo)
-        mode_row.addStretch(1)
         self.detail_title = QLabel("选择一个货号查看图片")
         mode_row.addWidget(self.detail_title)
         detail_layout.addLayout(mode_row)
@@ -502,45 +492,6 @@ class TaskCreatePage(QWidget):
         assets_row.addWidget(model_box, 1)
         detail_layout.addLayout(assets_row)
 
-        self.pairing_tools = QStackedWidget()
-        self.pairing_tools.setFixedHeight(46)
-        auto_page = QWidget()
-        auto_layout = QHBoxLayout(auto_page)
-        auto_layout.setContentsMargins(0, 0, 0, 0)
-        auto_layout.addWidget(
-            QLabel("自动配对：每张模特图关联全部衣服图")
-        )
-        auto_layout.addStretch(1)
-        self.pairing_tools.addWidget(auto_page)
-        manual_page = QWidget()
-        manual_actions = QHBoxLayout(manual_page)
-        manual_actions.setContentsMargins(0, 0, 0, 0)
-        garment_hint = QLabel("在左侧衣服图列表按住 Ctrl 可多选")
-        add_pair = QPushButton("添加配对")
-        remove_pair = QPushButton("移除所选配对")
-        add_pair.clicked.connect(self._add_manual_pair)
-        remove_pair.clicked.connect(self._remove_manual_pair)
-        manual_actions.addWidget(garment_hint, 1)
-        manual_actions.addWidget(add_pair)
-        manual_actions.addWidget(remove_pair)
-        self.pairing_tools.addWidget(manual_page)
-        detail_layout.addWidget(self.pairing_tools)
-
-        self.pair_preview = QScrollArea()
-        self.pair_preview.setWidgetResizable(True)
-        self.pair_preview.setMinimumHeight(250)
-        self.pair_preview.setMaximumHeight(250)
-        self.pair_preview_content = QWidget()
-        self.pair_preview_layout = QGridLayout(self.pair_preview_content)
-        self.pair_preview_layout.setContentsMargins(0, 0, 0, 0)
-        self.pair_preview_layout.setSpacing(6)
-        for column in range(4):
-            self.pair_preview_layout.setColumnStretch(column, 1)
-        self.pair_preview.setWidget(self.pair_preview_content)
-        detail_layout.addWidget(self.pair_preview, 1)
-        self.pair_summary = QLabel()
-        self.pair_summary.setWordWrap(True)
-        detail_layout.addWidget(self.pair_summary)
         outer.addWidget(detail_card, 1)
 
         footer = QHBoxLayout()
@@ -562,7 +513,6 @@ class TaskCreatePage(QWidget):
         )
         footer.addWidget(self.create_button)
         outer.addLayout(footer)
-        self._update_mode_visibility()
 
     def _asset_box(self, title: str, role: str) -> tuple[QListWidget, QGroupBox]:
         box = QGroupBox(title)
@@ -584,10 +534,10 @@ class TaskCreatePage(QWidget):
         images.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
-        images.setIconSize(QSize(96, 96))
+        images.setIconSize(QSize(128, 128))
         images.setGridSize(QSize(120, 125))
         images.setResizeMode(QListWidget.ResizeMode.Adjust)
-        images.setMinimumHeight(145)
+        images.setMinimumHeight(240)
         images.files_dropped.connect(
             lambda paths: self._handle_image_drop(role, paths)
         )
@@ -609,7 +559,6 @@ class TaskCreatePage(QWidget):
             self.current_state = None
             self.garment_list.clear()
             self.model_list.clear()
-            self._clear_pair_preview()
             self.create_button.setEnabled(False)
             return
         self.create_button.setEnabled(
@@ -736,7 +685,6 @@ class TaskCreatePage(QWidget):
             self.detail_title.setText("当前日期没有符合结构的货号目录")
             self.garment_list.clear()
             self.model_list.clear()
-            self._clear_pair_preview()
 
     def _refresh_product_table(self) -> None:
         self.product_table.blockSignals(True)
@@ -856,7 +804,6 @@ class TaskCreatePage(QWidget):
         self._asset_thumbnail_contexts.clear()
         self.garment_list.clear()
         self.model_list.clear()
-        self._clear_pair_preview()
         if state is None:
             return
         self.detail_title.setText(
@@ -865,7 +812,6 @@ class TaskCreatePage(QWidget):
         )
         self._fill_assets(self.garment_list, state.garments)
         self._fill_assets(self.model_list, state.models)
-        self._refresh_pair_preview()
 
     def _fill_assets(
         self,
@@ -1085,7 +1031,7 @@ class TaskCreatePage(QWidget):
         return build_pairs(
             garments,
             models,
-            self.mode_combo.currentData(),
+            self.pairing_mode,
             current.manual_pairs,
         )
 
@@ -1277,7 +1223,7 @@ class TaskCreatePage(QWidget):
                     project_relative_root=self.resolver.relative_to_root(
                         state.path
                     ),
-                    pairing_mode=self.mode_combo.currentData(),
+                    pairing_mode=self.pairing_mode,
                     assets=assets,
                     pairs=result.pairs,
                     note=self.note_edit.text().strip(),

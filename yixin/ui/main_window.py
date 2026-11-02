@@ -32,7 +32,6 @@ from ..database import Database
 from ..library import LibraryService
 from ..paths import AppPaths
 from ..security import SecretStore
-from ..settings import AppSettings
 from ..storage import FileStore
 from ..worker import TaskWorker
 from .batch_dress_page import BatchDressPage
@@ -41,8 +40,8 @@ from .create_page import CreatePage
 from .dialogs import SettingsDialog
 from .history_page import HistoryTabsPage
 from .library_page import LibraryPage
-from .submission_list_page import SubmissionListPage
-from .task_center_page import TaskCenterPage
+from .ai_generation_page import AIGenerationPage
+from .task_assignment_page import TaskAssignmentPage
 from .task_create_page import TaskCreatePage
 
 
@@ -154,48 +153,36 @@ class MainWindow(QMainWindow):
             actor,
             auto_load=False,
         )
-        self.page_specs.append(("新建任务", self.new_task_page))
-        self.submitted_page = SubmissionListPage(
-            repository,
-            resolver,
-            actor,
-            "submitted",
-            auto_load=False,
-        )
-        self.pending_page = SubmissionListPage(
-            repository,
-            resolver,
-            actor,
-            "pending",
-            auto_load=False,
-        )
-        self.completed_page = SubmissionListPage(
-            repository,
-            resolver,
-            actor,
-            "completed",
-            auto_load=False,
-        )
-        self.page_specs.extend(
-            [
-                ("已提交", self.submitted_page),
-                ("待审核", self.pending_page),
-                ("已完成", self.completed_page),
-            ]
-        )
-        self.task_center_page = TaskCenterPage(
-            repository,
-            resolver,
-            actor,
-            client,
-            secret_store,
-            file_store,
-            AppSettings(database),
-            library_service,
-            auto_load=False,
-        )
-        self.page_specs.append(("任务中心", self.task_center_page))
+        self.page_specs.append(("AI图提交", self.new_task_page))
         if self.actor.role in (ROLE_AI, ROLE_ADMIN):
+            self.assignment_page = TaskAssignmentPage(
+                repository,
+                resolver,
+                actor,
+                auto_load=False,
+            )
+            self.ai_generation_page = AIGenerationPage(
+                repository,
+                resolver,
+                actor,
+                client,
+                secret_store,
+                database,
+                file_store,
+                library_service,
+                worker,
+                secret_store,
+                auto_load=False,
+            )
+            self.page_specs.extend(
+                [
+                    ("待分配", self.assignment_page),
+                    ("AI生图", self.ai_generation_page),
+                ]
+            )
+            self.assignment_page.projects_claimed.connect(
+                lambda _count: self.ai_generation_page.refresh()
+            )
             self.create_page = CreatePage(
                 database,
                 file_store,
@@ -243,11 +230,9 @@ class MainWindow(QMainWindow):
         )
         allowed_menu_keys = configured & role_allowed
         label_keys = {
-            "新建任务": "new_task",
-            "已提交": "submitted",
-            "待审核": "pending",
-            "已完成": "completed",
-            "任务中心": "task_center",
+            "AI图提交": "new_task",
+            "待分配": "assign_tasks",
+            "AI生图": "ai_generate",
             "普通创作": "create",
             "批量换装": "batch",
             "历史记录": "history",
@@ -301,6 +286,9 @@ class MainWindow(QMainWindow):
             self.create_page.settings_requested.connect(self.open_settings)
             self.batch_dress_page.settings_requested.connect(self.open_settings)
             self.batch_dress_page.tasks_enqueued.connect(self._on_batch_enqueued)
+            self.ai_generation_page.tasks_enqueued.connect(
+                self._on_batch_enqueued
+            )
             self.create_page.templates_changed.connect(
                 self.batch_dress_page.refresh_templates
             )
@@ -313,7 +301,7 @@ class MainWindow(QMainWindow):
         self.worker.signals.task_changed.connect(self._on_task_changed)
         if self.actor.role in (ROLE_AI, ROLE_ADMIN):
             initial_page = (
-                self.task_center_page
+                self.ai_generation_page
                 if self.actor.role == ROLE_AI
                 else self.new_task_page
             )
@@ -340,7 +328,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(subtitle)
         layout.addSpacing(20)
         labels = [text for text, _ in self.page_specs]
-        submenu_labels = ("新建任务", "已提交", "待审核", "已完成")
+        submenu_labels = ("待分配", "AI生图")
         submenu_indices = {
             index
             for index, label in enumerate(labels)
@@ -350,7 +338,7 @@ class MainWindow(QMainWindow):
         self.nav_list = SidebarNav(
             labels,
             group_before=(
-                {group_index: "AI图提交"}
+                {group_index: "任务中心"}
                 if submenu_indices
                 else None
             ),
@@ -440,8 +428,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         project_running = bool(
-            hasattr(self, "task_center_page")
-            and self.task_center_page.is_generating()
+            hasattr(self, "ai_generation_page")
+            and self.ai_generation_page.is_generating()
         )
         if self.database.has_running_tasks() or project_running:
             answer = QMessageBox.warning(

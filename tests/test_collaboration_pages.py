@@ -39,7 +39,6 @@ if HAS_PYSIDE:
         AuthUser,
         GenerationAttempt,
         GenerationResult,
-        PairingInput,
         ProjectAssetInput,
         ProjectRecord,
         ProjectTask,
@@ -71,9 +70,10 @@ if HAS_PYSIDE:
     from yixin.ui.history_page import HistoryTabsPage
     from yixin.ui.date_filter import OptionalDateEdit
     from yixin.ui.task_center_page import TaskCenterPage
+    from yixin.ui.task_assignment_page import TaskAssignmentPage
+    from yixin.ui.ai_generation_page import AIGenerationPage
     from yixin.ui.task_create_page import (
         CheckableHeaderView,
-        PairPreviewCard,
         TaskCreatePage,
     )
     from yixin.ui.theme import APP_STYLESHEET
@@ -124,10 +124,8 @@ class FakeCentralRepository:
     def user_menu_permissions(self, _user_id):
         return (
             "new_task",
-            "submitted",
-            "pending",
-            "completed",
-            "task_center",
+            "assign_tasks",
+            "ai_generate",
         )
 
     def user_project_access(self, _user_id):
@@ -144,6 +142,21 @@ class FakeCentralRepository:
 
     def list_board_tasks(self, _actor, **_kwargs):
         return []
+
+    def list_assignment_projects(self, _actor, **_kwargs):
+        return []
+
+    def list_ai_generation_tasks(self, _actor, **_kwargs):
+        return []
+
+    def claim_projects(self, _project_ids, _actor):
+        return ()
+
+    def split_and_queue_generations(self, _task_id, _actor, **_kwargs):
+        return []
+
+    def mark_task_skipped(self, _task_id, _actor):
+        return None
 
     def list_attempts(self, _task_id):
         return []
@@ -243,6 +256,25 @@ class FakeCentralRepository:
             unit_price=kwargs["unit_price"],
             generated_image_count=0,
             operator_name=actor.display_name,
+            created_at=datetime.now(),
+        )
+
+    def queue_generation_attempt(self, task_id, actor, **kwargs):
+        self.generation_requests.append((task_id, actor, kwargs))
+        return GenerationAttempt(
+            id=8,
+            task_id=task_id,
+            attempt_no=2,
+            operator_id=actor.id,
+            model=kwargs["model"],
+            prompt_text=kwargs["prompt"],
+            aspect_ratio=kwargs["aspect_ratio"],
+            resolution=kwargs["resolution"],
+            n=kwargs["n"],
+            status=ATTEMPT_QUEUED,
+            source_revision=1,
+            unit_price=kwargs["unit_price"],
+            generated_image_count=0,
             created_at=datetime.now(),
         )
 
@@ -401,6 +433,202 @@ class CollaborationPageTests(unittest.TestCase):
         for page in (create, submitted, pending, completed, center, admin):
             page.deleteLater()
 
+    def test_ai_submit_removes_pair_controls_and_enlarges_assets(self) -> None:
+        page = TaskCreatePage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            auto_load=False,
+        )
+        self.assertFalse(hasattr(page, "mode_combo"))
+        self.assertFalse(hasattr(page, "pair_preview"))
+        self.assertEqual(page.garment_list.iconSize().width(), 128)
+        self.assertGreaterEqual(page.garment_list.minimumHeight(), 240)
+        page.deleteLater()
+
+    def test_assignment_page_multi_select_and_claim(self) -> None:
+        write_task_images(self.root)
+        project = make_project()
+        task = replace(make_task("available"), assignee_id=None)
+        self.repository.list_assignment_projects = (
+            lambda _actor, **_kwargs: [project]
+        )
+        self.repository.list_project_tasks = lambda _project_id: [task]
+        requested: list[list[int]] = []
+
+        def claim(project_ids, _actor):
+            requested.append(list(project_ids))
+            return tuple(project_ids)
+
+        self.repository.claim_projects = claim
+        page = TaskAssignmentPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            auto_load=False,
+        )
+        page.refresh()
+        self.assertEqual(page.project_table.rowCount(), 1)
+        self.assertEqual(page.task_table.rowCount(), 1)
+        self.assertEqual(page.source_strip.count(), 3)
+        page.project_table.selectRow(0)
+        with patch(
+            "yixin.ui.task_assignment_page.QMessageBox.information"
+        ):
+            page._claim_selected()
+        self.assertEqual(requested, [[project.id]])
+        page.deleteLater()
+
+    def test_ai_generation_page_loads_subtask_and_toggles_skip(self) -> None:
+        write_task_images(self.root)
+        task = make_task("claimed")
+        self.repository.list_ai_generation_tasks = (
+            lambda _actor, **_kwargs: [task]
+        )
+        self.repository.list_queued_attempts = lambda _actor_id: []
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        paths = AppPaths(self.root / "ai-page-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: "sk-test-123456")
+        worker = TaskWorker(database, client, file_store)
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            AuthUser(4, "ai_amy", "AI Amy", "ai"),
+            client,
+            key_store,
+            database,
+            file_store,
+            LibraryService(database, file_store, paths),
+            worker,
+            key_store,
+            auto_load=False,
+        )
+        page.refresh()
+        self.assertEqual(page.task_selector.count(), 2)
+        self.assertEqual(len(page.garment_assets), 2)
+        self.assertEqual(len(page.person_assets), 1)
+        self.assertEqual(len(page.pairs), 1)
+        skip_buttons = [
+            button
+            for button in page.findChildren(QPushButton)
+            if button.text() == "不做图" and button.isVisibleTo(page)
+        ]
+        self.assertEqual(len(skip_buttons), 1)
+        button_texts = {
+            button.text() for button in page.findChildren(QPushButton)
+        }
+        self.assertNotIn("上传PS成品", button_texts)
+        self.assertNotIn("提交验收", button_texts)
+        self.assertNotIn("验收通过", button_texts)
+        skip_buttons[0].click()
+        self.assertTrue(page.pairs[0].skipped)
+        page.deleteLater()
+
+    def test_ai_generation_page_splits_each_pair_into_child_task(self) -> None:
+        write_task_images(self.root)
+        task = make_task("claimed")
+        self.repository.list_ai_generation_tasks = (
+            lambda _actor, **_kwargs: [task]
+        )
+        self.repository.list_queued_attempts = lambda _actor_id: []
+        captured: list[tuple] = []
+
+        def split(task_id, actor, *, pairs):
+            captured.append((task_id, actor.id, tuple(pairs)))
+            return ()
+
+        self.repository.split_and_queue_generations = split
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        paths = AppPaths(self.root / "ai-split-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: "sk-test-123456")
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            AuthUser(4, "ai_amy", "AI Amy", "ai"),
+            client,
+            key_store,
+            database,
+            file_store,
+            LibraryService(database, file_store, paths),
+            TaskWorker(database, client, file_store),
+            key_store,
+            auto_load=False,
+        )
+        page.refresh()
+        skip_buttons = [
+            button
+            for button in page.findChildren(QPushButton)
+            if button.text() == "不做图" and button.isVisibleTo(page)
+        ]
+        skip_buttons[0].click()
+        page._enqueue_all()
+        self.assertEqual(len(captured), 1)
+        self.assertEqual(captured[0][0], task.id)
+        specs = captured[0][2]
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(len(specs[0].garment_hashes), 2)
+        self.assertTrue(specs[0].skipped)
+        page.deleteLater()
+
+    def test_ai_generation_page_retries_failed_child_without_split(self) -> None:
+        write_task_images(self.root)
+        task = replace(
+            make_task("claimed"),
+            id=21,
+            task_code="春季项目-123-001-003",
+            parent_task_id=11,
+        )
+        self.repository.list_ai_generation_tasks = (
+            lambda _actor, **_kwargs: [task]
+        )
+        self.repository.list_queued_attempts = lambda _actor_id: []
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        paths = AppPaths(self.root / "ai-retry-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: "sk-test-123456")
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            AuthUser(4, "ai_amy", "AI Amy", "ai"),
+            client,
+            key_store,
+            database,
+            file_store,
+            LibraryService(database, file_store, paths),
+            TaskWorker(database, client, file_store),
+            key_store,
+            auto_load=False,
+        )
+        page.refresh()
+        page._enqueue_all()
+        self.assertEqual(len(self.repository.generation_requests), 1)
+        task_id, _actor, _kwargs = self.repository.generation_requests[0]
+        self.assertEqual(task_id, task.id)
+        page.deleteLater()
+
     def test_login_has_no_database_settings(self) -> None:
         login = LoginDialog(self.repository)
         texts = [button.text() for button in login.findChildren(QPushButton)]
@@ -442,11 +670,9 @@ class CollaborationPageTests(unittest.TestCase):
 
     def test_sidebar_shows_all_new_menu_items(self) -> None:
         labels = [
-            "新建任务",
-            "已提交",
-            "待审核",
-            "已完成",
-            "任务中心",
+            "AI图提交",
+            "待分配",
+            "AI生图",
             "普通创作",
             "批量换装",
             "历史记录",
@@ -455,8 +681,8 @@ class CollaborationPageTests(unittest.TestCase):
         ]
         nav = SidebarNav(
             labels,
-            group_before={0: "AI图提交"},
-            submenu_indices={0, 1, 2, 3},
+            group_before={1: "任务中心"},
+            submenu_indices={1, 2},
         )
         nav.setStyleSheet(APP_STYLESHEET)
         nav.resize(210, 650)
@@ -467,7 +693,7 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(
             all(
                 nav._buttons[index].property("submenu") in (True, "true")
-                for index in range(4)
+                for index in (1, 2)
             )
         )
         self.assertFalse(nav._buttons[4].property("submenu"))
@@ -511,28 +737,6 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(page.account_directory.source_date, date.today())
         self.assertFalse(page.account_directory.date_recognized)
         page.deleteLater()
-
-    def test_pair_preview_card_shows_model_and_all_garments(self) -> None:
-        product = self.root / "配对"
-        (product / "衣服图").mkdir(parents=True)
-        (product / "模特图").mkdir(parents=True)
-        garments = []
-        for index in range(7):
-            path = product / "衣服图" / f"衣服{index + 1}.png"
-            Image.new("RGB", (20, 20), "red").save(path)
-            garments.append(path)
-        model = product / "模特图" / "模特1.png"
-        Image.new("RGB", (20, 20), "blue").save(model)
-        card = PairPreviewCard(model, garments)
-        card.show()
-        self.app.processEvents()
-        labels = [label.text() for label in card.findChildren(QLabel)]
-        self.assertNotIn("模特1.png", labels)
-        self.assertIn("衣服 7 张 · 1 个子任务", labels)
-        self.assertEqual(len(card.garment_thumbnails), 7)
-        self.assertEqual(card.thumbnail_layout.count(), 8)
-        card.close()
-        card.deleteLater()
 
     def test_product_header_selects_only_eligible_rows(self) -> None:
         date_folder = current_date_folder(
@@ -620,63 +824,6 @@ class CollaborationPageTests(unittest.TestCase):
             Qt.CheckState.Unchecked,
         )
         self.assertEqual(page._selected_codes(), [])
-        page.deleteLater()
-
-    def test_pair_preview_uses_four_columns_and_manual_selection(self) -> None:
-        date_folder = current_date_folder(
-            self.root / "内部项目" / "春季项目"
-        )
-        product = date_folder.path / "123"
-        (product / "衣服图").mkdir(parents=True)
-        (product / "模特图").mkdir(parents=True)
-        garment = product / "衣服图" / "衣服1.png"
-        Image.new("RGB", (20, 20), "red").save(garment)
-        models = []
-        for index in range(5):
-            path = product / "模特图" / f"模特{index + 1}.png"
-            Image.new("RGB", (20, 20), "blue").save(path)
-            models.append(path)
-        page = TaskCreatePage(
-            self.repository,
-            self.resolver,
-            self.actor,
-        )
-        self.assertEqual(
-            page.pair_preview.minimumHeight(),
-            page.pair_preview.maximumHeight(),
-        )
-        self.assertEqual(len(page.pair_cards), 5)
-        positions = [
-            page.pair_preview_layout.getItemPosition(index)
-            for index in range(page.pair_preview_layout.count())
-        ]
-        self.assertEqual(
-            positions[:4],
-            [
-                (0, 0, 1, 1),
-                (0, 1, 1, 1),
-                (0, 2, 1, 1),
-                (0, 3, 1, 1),
-            ],
-        )
-        self.assertEqual(positions[4][:2], (1, 0))
-        page.mode_combo.setCurrentIndex(
-            page.mode_combo.findData("manual")
-        )
-        state = page.current_state
-        state.manual_pairs.clear()
-        state.manual_pairs.extend(
-            PairingInput(0, index)
-            for index in range(len(models))
-        )
-        page._refresh_pair_preview()
-        self.assertEqual(len(page.pair_cards), 5)
-        page._select_manual_pair(0)
-        self.assertEqual(page.selected_pair_model_index, 0)
-        self.assertTrue(page.pair_cards[0]._selected)
-        page._remove_manual_pair()
-        self.assertEqual(len(state.manual_pairs), 4)
-        self.assertEqual(len(page.pair_cards), 4)
         page.deleteLater()
 
     def test_task_create_drag_folder_and_main_task_quota(self) -> None:
@@ -876,18 +1023,15 @@ class CollaborationPageTests(unittest.TestCase):
         )
         dialog = EditUserDialog(
             operator,
-            (
-                "new_task",
-                "submitted",
-                "pending",
-                "completed",
-            ),
+            ("new_task",),
             (("internal", "春季项目"),),
             self.repository.list_shared_projects(),
         )
-        self.assertTrue(dialog.permissions.menu_checks["task_center"].isEnabled())
         self.assertFalse(
-            dialog.permissions.menu_checks["task_center"].isChecked()
+            dialog.permissions.menu_checks["assign_tasks"].isEnabled()
+        )
+        self.assertFalse(
+            dialog.permissions.menu_checks["ai_generate"].isEnabled()
         )
         self.assertFalse(
             dialog.permissions.menu_checks["admin"].isEnabled()
@@ -901,8 +1045,8 @@ class CollaborationPageTests(unittest.TestCase):
         add_dialog = AddUserDialog(self.repository.list_shared_projects())
         self.assertFalse(
             add_dialog.permissions.menu_checks[
-                "task_center"
-            ].isChecked()
+                "assign_tasks"
+            ].isEnabled()
         )
         self.assertFalse(
             add_dialog.permissions.menu_checks["admin"].isEnabled()
@@ -1043,13 +1187,74 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.assertEqual(
             labels,
-            ["新建任务", "已提交", "待审核", "已完成"],
+            ["AI图提交"],
         )
         with patch.object(window.new_task_page, "refresh") as refresh:
             window.show()
             self.app.processEvents()
             QTest.qWait(20)
             refresh.assert_called_once_with()
+        window.close()
+        window.deleteLater()
+
+    def test_ai_main_window_has_task_center_submenus(self) -> None:
+        paths = AppPaths(self.root / "ai-window-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        actor = AuthUser(
+            4,
+            "ai_amy",
+            "AI制作Amy",
+            "ai",
+            menu_permissions=(
+                "new_task",
+                "assign_tasks",
+                "ai_generate",
+                "create",
+                "batch",
+                "history",
+                "library",
+            ),
+        )
+        client = NanoBananaClient(lambda: None)
+        window = MainWindow(
+            paths=paths,
+            database=database,
+            file_store=file_store,
+            library_service=LibraryService(database, file_store, paths),
+            secret_store=SecretStore(paths.api_key_file),
+            worker=TaskWorker(database, client, file_store),
+            client=client,
+            repository=self.repository,
+            resolver=self.resolver,
+            actor=actor,
+        )
+        labels = [
+            window.nav_list.item(index).text()
+            for index in range(window.nav_list.count())
+        ]
+        self.assertEqual(
+            labels,
+            [
+                "AI图提交",
+                "待分配",
+                "AI生图",
+                "普通创作",
+                "批量换装",
+                "历史记录",
+                "作品库",
+            ],
+        )
+        self.assertEqual(
+            window.nav_list._buttons[1].property("submenu"),
+            True,
+        )
+        self.assertEqual(
+            window.nav_list._buttons[2].property("submenu"),
+            True,
+        )
         window.close()
         window.deleteLater()
 

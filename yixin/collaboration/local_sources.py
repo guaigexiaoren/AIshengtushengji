@@ -134,6 +134,46 @@ class LocalTaskSourceStore:
         self._save()
         return self.state
 
+    def replace_all(
+        self,
+        garments: Iterable[StoredImage],
+        model: StoredImage | None,
+    ) -> LocalSourceState:
+        copied_garments = tuple(
+            self._copy_image(
+                image.path,
+                "garment",
+                original_name=image.original_name,
+                source_path=image.source_path or image.path,
+                content_hash=image.content_hash,
+                mime=image.mime,
+                width=image.width,
+                height=image.height,
+            )
+            for image in garments
+        )
+        copied_model = (
+            self._copy_image(
+                model.path,
+                "model",
+                original_name=model.original_name,
+                source_path=model.source_path or model.path,
+                content_hash=model.content_hash,
+                mime=model.mime,
+                width=model.width,
+                height=model.height,
+            )
+            if model is not None
+            else None
+        )
+        self.state = LocalSourceState(
+            self.task.source_revision,
+            copied_garments,
+            copied_model,
+        )
+        self._save()
+        return self.state
+
     def restore_image(self, role: str, index: int) -> LocalSourceState:
         current = self.image_at(role, index)
         if current is None or current.source_path is None:

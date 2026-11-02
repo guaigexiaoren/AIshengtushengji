@@ -16,11 +16,9 @@ ROLE_LABELS = {
 }
 
 MENU_KEYS = {
-    "new_task": "新建任务",
-    "submitted": "已提交",
-    "pending": "待审核",
-    "completed": "已完成",
-    "task_center": "任务中心",
+    "new_task": "AI图提交",
+    "assign_tasks": "待分配",
+    "ai_generate": "AI生图",
     "create": "普通创作",
     "batch": "批量换装",
     "history": "历史记录",
@@ -28,18 +26,11 @@ MENU_KEYS = {
     "admin": "管理控制台",
 }
 ROLE_DEFAULT_MENUS = {
-    ROLE_OPERATIONS: (
-        "new_task",
-        "submitted",
-        "pending",
-        "completed",
-    ),
+    ROLE_OPERATIONS: ("new_task",),
     ROLE_AI: (
         "new_task",
-        "submitted",
-        "pending",
-        "completed",
-        "task_center",
+        "assign_tasks",
+        "ai_generate",
         "create",
         "batch",
         "history",
@@ -48,13 +39,7 @@ ROLE_DEFAULT_MENUS = {
     ROLE_ADMIN: tuple(MENU_KEYS),
 }
 ROLE_ALLOWED_MENUS = {
-    ROLE_OPERATIONS: (
-        "new_task",
-        "submitted",
-        "pending",
-        "completed",
-        "task_center",
-    ),
+    ROLE_OPERATIONS: ("new_task",),
     ROLE_AI: ROLE_DEFAULT_MENUS[ROLE_AI],
     ROLE_ADMIN: ROLE_DEFAULT_MENUS[ROLE_ADMIN],
 }
@@ -85,6 +70,7 @@ TASK_AWAITING_ACCEPTANCE = "awaiting_acceptance"
 TASK_RETURNED = "returned"
 TASK_APPROVED = "approved"
 TASK_SKIPPED = "skipped"
+TASK_EXPANDED = "expanded"
 TASK_CANCELLED = "cancelled"
 TASK_STATUS_LABELS = {
     TASK_AVAILABLE: "已提交",
@@ -94,6 +80,7 @@ TASK_STATUS_LABELS = {
     TASK_RETURNED: "已退回",
     TASK_APPROVED: "已完成",
     TASK_SKIPPED: "无需制作",
+    TASK_EXPANDED: "已拆分",
     TASK_CANCELLED: "已取消",
 }
 
@@ -246,6 +233,8 @@ class ProjectTask:
     project_scope: str = "internal"
     access_project_name: str = ""
     project_is_urgent: bool = False
+    parent_task_id: int | None = None
+    split_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -330,6 +319,26 @@ class GeneratedResultInput:
     mime: str
     width: int
     height: int
+
+
+@dataclass(frozen=True)
+class GenerationPairSpec:
+    prompt_text: str
+    model: str
+    aspect_ratio: str
+    resolution: str | None
+    n: int
+    unit_price: Decimal
+    garment_hashes: tuple[str, ...]
+    skipped: bool = False
+
+
+@dataclass(frozen=True)
+class SplitGenerationItem:
+    task_id: int
+    task_code: str
+    attempt_id: int | None
+    skipped: bool
 
 
 @dataclass(frozen=True)

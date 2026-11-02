@@ -85,7 +85,11 @@ class MySQLIntegrationTests(unittest.TestCase):
                 max_generation_concurrency=2,
             )
             self.assertNotIn(
-                "task_center",
+                "assign_tasks",
+                repository.user_menu_permissions(operator.id),
+            )
+            self.assertNotIn(
+                "ai_generate",
                 repository.user_menu_permissions(operator.id),
             )
             self.assertEqual(
@@ -296,7 +300,16 @@ class MySQLIntegrationTests(unittest.TestCase):
                     ),
                 ),
             )
-            result_id = repository.list_results(task.id)[0].id
+            self.assertEqual(
+                repository.get_task(task.id).status,
+                TASK_APPROVED,
+            )
+            self.assertTrue(
+                all(
+                    result.is_final
+                    for result in repository.list_results(task.id)
+                )
+            )
             history = repository.list_project_attempt_history(admin)
             history_row = next(
                 row for row in history if int(row["id"]) == attempt.id
@@ -324,14 +337,6 @@ class MySQLIntegrationTests(unittest.TestCase):
                     for row in project_attempts
                 )
             )
-            repository.submit_for_acceptance(
-                task.id,
-                winner,
-                final_result_ids=(result_id,),
-                final_quantity=1,
-            )
-            repository.review_task(task.id, operator, approved=True)
-            self.assertEqual(repository.get_task(task.id).status, TASK_APPROVED)
             self.assertEqual(
                 repository.report(ReportFilter()).summary.total_cost,
                 Decimal("1.2500"),

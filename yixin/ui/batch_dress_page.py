@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QMimeData, QPoint, QSize, QTimer, Qt, Signal
@@ -95,6 +95,7 @@ class DressTaskGroup:
     roles: tuple[str, ...]
     kind: str
     auto_prompt: bool = True
+    skipped: bool = False
 
     @property
     def key(self) -> tuple[tuple[str, str], ...]:
@@ -543,12 +544,15 @@ class FreeComposeDialog(QDialog):
 
 class DressPairCard(QFrame):
     remove_requested = Signal(object)
+    skip_requested = Signal(object)
 
     def __init__(
         self,
         pair: DressTaskGroup,
         position: int,
         parent: QWidget | None = None,
+        *,
+        allow_skip: bool = False,
     ) -> None:
         super().__init__(parent)
         self.pair = pair
@@ -572,6 +576,15 @@ class DressPairCard(QFrame):
         remove.clicked.connect(lambda: self.remove_requested.emit(self.pair))
         header.addWidget(order)
         header.addStretch(1)
+        if allow_skip:
+            skip = QPushButton(
+                "恢复制作" if pair.skipped else "不做图"
+            )
+            skip.setStyleSheet("padding: 3px 7px;")
+            skip.clicked.connect(
+                lambda: self.skip_requested.emit(self.pair)
+            )
+            header.addWidget(skip)
         header.addWidget(remove)
         layout.addLayout(header)
 
@@ -583,6 +596,11 @@ class DressPairCard(QFrame):
             )
         ]
         self.setToolTip("\n".join(reference_lines))
+        if pair.skipped:
+            self.setStyleSheet(
+                "QFrame#DressPairCard { background:#f0f1f3;"
+                "border:1px dashed #a9b1bd;border-radius:9px; }"
+            )
         body = QHBoxLayout()
         body.setSpacing(5)
         body.addStretch(1)
@@ -702,6 +720,9 @@ class BatchDressPage(QWidget):
         worker: TaskWorker,
         secret_store: SecretStore,
         parent: QWidget | None = None,
+        *,
+        external_top: QWidget | None = None,
+        allow_pair_skip: bool = False,
     ) -> None:
         super().__init__(parent)
         self.database = database
@@ -717,10 +738,11 @@ class BatchDressPage(QWidget):
         self.pair_columns = 4
         self._pair_layout_pending = False
         self._pair_panel_height = 0
+        self.allow_pair_skip = allow_pair_skip
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(8)
+        outer.setSpacing(6)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -733,6 +755,8 @@ class BatchDressPage(QWidget):
         layout.setContentsMargins(0, 0, 4, 4)
         layout.setSpacing(8)
         layout.addWidget(self._build_header())
+        if external_top is not None:
+            layout.addWidget(external_top)
         self.top_options_host = QWidget()
         top_options = QHBoxLayout(self.top_options_host)
         top_options.setContentsMargins(0, 0, 0, 0)
@@ -764,6 +788,7 @@ class BatchDressPage(QWidget):
             return
         self._pair_panel_height = target
         self.pair_group.setFixedHeight(target)
+        self.layout().activate()
 
     def _build_header(self) -> QWidget:
         card = QFrame()
@@ -1227,6 +1252,7 @@ class BatchDressPage(QWidget):
                 roles=pair.roles,
                 kind=pair.kind,
                 auto_prompt=pair.auto_prompt,
+                skipped=pair.skipped,
             )
             if any(
                 reference_role == role and reference == previous
@@ -1599,6 +1625,15 @@ class BatchDressPage(QWidget):
         self.pairs = [item for item in self.pairs if item.key != pair.key]
         self._refresh_pairs()
 
+    def _toggle_pair_skip(self, pair: DressTaskGroup) -> None:
+        self.pairs = [
+            replace(item, skipped=not item.skipped)
+            if item.key == pair.key
+            else item
+            for item in self.pairs
+        ]
+        self._refresh_pairs()
+
     def _clear_pairs(self) -> None:
         if not self.pairs:
             return
@@ -1630,8 +1665,13 @@ class BatchDressPage(QWidget):
                 self.pair_grid.setColumnStretch(column, 1)
             return
         for index, pair in enumerate(self.pairs):
-            card = DressPairCard(pair, index + 1)
+            card = DressPairCard(
+                pair,
+                index + 1,
+                allow_skip=self.allow_pair_skip,
+            )
             card.remove_requested.connect(self._remove_pair)
+            card.skip_requested.connect(self._toggle_pair_skip)
             self.pair_grid.addWidget(
                 card,
                 index // self.pair_columns,

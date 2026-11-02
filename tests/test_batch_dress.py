@@ -104,11 +104,9 @@ class BatchDressTests(unittest.TestCase):
         self.assertEqual(
             labels,
             [
-                "新建任务",
-                "已提交",
-                "待审核",
-                "已完成",
-                "任务中心",
+            "AI图提交",
+            "待分配",
+            "AI生图",
                 "普通创作",
                 "批量换装",
                 "历史记录",

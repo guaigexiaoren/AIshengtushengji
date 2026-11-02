@@ -15,6 +15,18 @@ class EmptyCentralRepository:
     def list_board_tasks(self, _actor, **_kwargs):
         return []
 
+    def list_assignment_projects(self, _actor, **_kwargs):
+        return []
+
+    def list_ai_generation_tasks(self, _actor, **_kwargs):
+        return []
+
+    def list_project_attempt_history(self, _actor, **_kwargs):
+        return []
+
+    def list_attempt_results(self, _attempt_id):
+        return []
+
     def list_attempts(self, _task_id):
         return []
 
