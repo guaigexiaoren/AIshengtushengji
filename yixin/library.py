@@ -222,6 +222,173 @@ class LibraryService:
                 pass
             raise
 
+    def save_project_result(
+        self,
+        *,
+        repository,
+        resolver,
+        task_id: int,
+        attempt_id: int,
+        result,
+    ) -> int:
+        task = repository.get_task(task_id)
+        if task is None:
+            raise ValueError("项目子任务不存在")
+        attempt = next(
+            (
+                item
+                for item in repository.list_attempts(task_id)
+                if item.id == attempt_id
+            ),
+            None,
+        )
+        if attempt is None:
+            raise ValueError("项目生成轮次不存在")
+        result_path = resolver.resolve_project_path(
+            task.project_relative_root,
+            result.relative_path,
+        )
+        if not result_path.is_file():
+            raise ValueError("项目成品文件已不存在")
+        folder_name = uuid.uuid4().hex
+        folder = self.file_store.library_folder(folder_name)
+        folder.mkdir(parents=True, exist_ok=False)
+        work_id: int | None = None
+        try:
+            output_path = self.file_store.copy_to_library(
+                folder,
+                result_path,
+                "output",
+            )
+            output_mime, output_width, output_height = image_metadata(
+                output_path.read_bytes()
+            )
+            output_stored = StoredImage(
+                path=output_path,
+                content_hash=result.content_hash,
+                mime=output_mime,
+                width=output_width,
+                height=output_height,
+                original_name=result_path.name,
+            )
+            thumbnail_path = self.file_store.create_thumbnail(
+                output_path,
+                folder / "thumbnail.jpg",
+            )
+            thumbnail = StoredImage(
+                path=thumbnail_path,
+                content_hash=sha256_file(thumbnail_path),
+                mime="image/jpeg",
+                width=0,
+                height=0,
+                original_name="thumbnail.jpg",
+            )
+            references: list[StoredImage] = []
+            reference_assets = [
+                (
+                    resolver.resolve_project_path(
+                        task.project_relative_root,
+                        asset.relative_path,
+                    ),
+                    asset.original_name,
+                    asset.content_hash,
+                    asset.mime,
+                    asset.width,
+                    asset.height,
+                )
+                for asset in task.garment_assets
+            ]
+            reference_assets.append(
+                (
+                    resolver.resolve_project_path(
+                        task.project_relative_root,
+                        task.model_path,
+                    ),
+                    task.model_name,
+                    task.model_hash,
+                    "image/png",
+                    0,
+                    0,
+                )
+            )
+            for position, (
+                source,
+                original_name,
+                content_hash,
+                mime,
+                width,
+                height,
+            ) in enumerate(reference_assets, start=1):
+                if not source.is_file():
+                    raise ValueError(
+                        f"第 {position} 张项目参考图已不存在"
+                    )
+                copied = self.file_store.copy_to_library(
+                    folder,
+                    source,
+                    f"reference_{position:02d}",
+                )
+                references.append(
+                    StoredImage(
+                        path=copied,
+                        content_hash=content_hash,
+                        mime=mime,
+                        width=width,
+                        height=height,
+                        original_name=original_name,
+                    )
+                )
+            prompt = attempt.prompt_text or task.prompt_text
+            parameters = {
+                "source": "project_task",
+                "project_code": task.project_code,
+                "task_code": task.task_code,
+                "attempt_no": attempt.attempt_no,
+                "model": attempt.model,
+                "aspect_ratio": attempt.aspect_ratio,
+                "resolution": attempt.resolution,
+                "n": attempt.n,
+                "provider_code": attempt.provider_code,
+                "provider_name": attempt.provider_name,
+                "requested_provider_code":
+                    attempt.requested_provider_code,
+                "requested_provider_name":
+                    attempt.requested_provider_name,
+            }
+            assets = [
+                ("result", 0, output_stored),
+                ("thumbnail", 0, thumbnail),
+                *(
+                    ("reference", position, image)
+                    for position, image in enumerate(references)
+                ),
+            ]
+            title = (
+                prompt.strip().splitlines()[0][:48]
+                if prompt.strip()
+                else task.task_code
+            )
+            work_id = self.database.create_external_work_with_assets(
+                folder_name=folder_name,
+                title=title,
+                prompt=prompt,
+                model=attempt.model,
+                parameters=parameters,
+                assets=assets,
+            )
+            return work_id
+        except Exception:
+            if work_id is not None:
+                try:
+                    self.database.delete_work(work_id)
+                except Exception:
+                    pass
+            try:
+                self.file_store.remove_work_folder(folder)
+            except Exception:
+                pass
+            raise
+
     def delete_work(self, work_id: int) -> bool:
         deleted = self.database.delete_work(work_id)
         if deleted is None:

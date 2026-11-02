@@ -2,14 +2,16 @@ from __future__ import annotations
 
 from collections import deque
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QMessageBox,
     QPushButton,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -42,6 +44,8 @@ from .batch_dress_page import BatchDressPage, DressTaskGroup
 
 
 class AIGenerationPage(BatchDressPage):
+    project_attempt_cancelled = Signal(int)
+
     def __init__(
         self,
         repository: MySQLCentralRepository,
@@ -69,7 +73,9 @@ class AIGenerationPage(BatchDressPage):
         self.local_store: LocalTaskSourceStore | None = None
         self.active_workers: set[ProjectGenerationWorker] = set()
         self.waiting_jobs: deque[dict] = deque()
-        task_selector = self._build_task_selector()
+        self.api_providers = []
+        self.project_progress: dict[int, tuple[int, int]] = {}
+        self.force_direct_retry_task_id: int | None = None
         super().__init__(
             database,
             file_store,
@@ -77,13 +83,13 @@ class AIGenerationPage(BatchDressPage):
             worker,
             secret_store,
             parent,
-            external_top=task_selector,
             allow_pair_skip=True,
         )
         self.task_selector.currentIndexChanged.connect(
             self._task_changed
         )
         self.task_refresh_button.clicked.connect(self.refresh)
+        self._refresh_providers()
         self.queue_timer = QTimer(self)
         self.queue_timer.setInterval(1200)
         self.queue_timer.timeout.connect(self._refresh_queue_state)
@@ -97,33 +103,75 @@ class AIGenerationPage(BatchDressPage):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(2)
+        title_row = QHBoxLayout()
         title = QLabel("AI生图")
         title.setStyleSheet("font-size:22px;font-weight:700;color:#1f2d43;")
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        title_row.addWidget(QLabel("子任务"))
+        self.task_selector = QComboBox()
+        self.task_selector.setMinimumWidth(420)
+        title_row.addWidget(self.task_selector)
+        self.task_refresh_button = QPushButton("刷新子任务")
+        title_row.addWidget(self.task_refresh_button)
+        self.task_status_label = QLabel("尚未选择")
+        self.task_status_label.setStyleSheet("color:#60708a;")
+        title_row.addWidget(self.task_status_label)
         subtitle = QLabel(
             "选择子任务后自动载入共享盘素材，编辑配对并批量加入生成队列。"
         )
         subtitle.setStyleSheet("color:#6d7a91;")
-        layout.addWidget(title)
+        layout.addLayout(title_row)
         layout.addWidget(subtitle)
         return card
 
-    def _build_task_selector(self) -> QWidget:
+    def _additional_settings_rows(self, form: QFormLayout) -> None:
+        self.provider_combo = QComboBox()
+        self.provider_combo.addItem("自动选择", "")
+        form.addRow("供应商", self.provider_combo)
+        template_host = QWidget()
+        template_layout = QHBoxLayout(template_host)
+        template_layout.setContentsMargins(0, 0, 0, 0)
+        self._build_template_controls(template_layout)
+        form.addRow("提示词模板", template_host)
+
+    def _build_prompt(self) -> QWidget:
         card = QFrame()
         card.setObjectName("Card")
-        layout = QHBoxLayout(card)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.addWidget(QLabel("子任务"))
-        self.task_selector = QComboBox()
-        self.task_selector.setMinimumWidth(380)
-        layout.addWidget(self.task_selector, 1)
-        self.task_refresh_button = QPushButton("刷新子任务")
-        layout.addWidget(self.task_refresh_button)
-        self.task_status_label = QLabel("尚未选择")
-        self.task_status_label.setStyleSheet("color:#60708a;")
-        layout.addWidget(self.task_status_label)
+        layout = QVBoxLayout(card)
+        title = QLabel("提示词")
+        title.setStyleSheet("font-weight:700;")
+        layout.addWidget(title)
+        self.prompt_edit = QTextEdit()
+        self.prompt_edit.setMinimumHeight(130)
+        self.prompt_edit.setPlaceholderText(
+            "请描述换装要求。参考图顺序固定为：衣服图在前，模特图最后。"
+        )
+        layout.addWidget(self.prompt_edit)
         return card
 
+    def _refresh_providers(self) -> None:
+        selected = self.provider_combo.currentData()
+        try:
+            self.api_providers = self.repository.list_api_providers(
+                include_disabled=False
+            )
+        except Exception:
+            self.api_providers = []
+        self.provider_combo.blockSignals(True)
+        self.provider_combo.clear()
+        self.provider_combo.addItem("自动选择", "")
+        for provider in self.api_providers:
+            self.provider_combo.addItem(
+                provider.display_name,
+                provider.provider_code,
+            )
+        index = self.provider_combo.findData(selected or "")
+        self.provider_combo.setCurrentIndex(max(0, index))
+        self.provider_combo.blockSignals(False)
+
     def refresh(self) -> None:
+        self._refresh_providers()
         self.refresh_templates()
         self._refresh_generation_tasks()
         self._resume_queued_jobs()
@@ -144,6 +192,14 @@ class AIGenerationPage(BatchDressPage):
             return
         current_id = self.task_selector.currentData()
         self.generation_tasks = tasks
+        try:
+            self.project_progress = (
+                self.repository.project_progress_counts(
+                    tuple(task.project_id for task in tasks)
+                )
+            )
+        except Exception:
+            self.project_progress = {}
         self._generation_tasks_by_id = {
             task.id: task for task in tasks
         }
@@ -151,8 +207,13 @@ class AIGenerationPage(BatchDressPage):
         self.task_selector.clear()
         self.task_selector.addItem("请选择子任务", None)
         for task in tasks:
+            completed, total = self.project_progress.get(
+                task.project_id,
+                (0, 0),
+            )
             label = (
                 f"{task.task_code} · {task.product_code or task.project_name}"
+                f" · 主任务 {completed}/{total}"
                 f" · {TASK_STATUS_LABELS.get(task.status, task.status)}"
             )
             if task.parent_task_id is not None:
@@ -233,7 +294,10 @@ class AIGenerationPage(BatchDressPage):
             self.resolution_combo.setCurrentIndex(resolution_index)
         self.count_spin.setValue(max(1, int(task.n)))
         self.task_status_label.setText(
-            f"{task.task_code} · {TASK_STATUS_LABELS.get(task.status, task.status)}"
+            f"主任务 "
+            f"{self.project_progress.get(task.project_id, (0, 0))[0]}/"
+            f"{self.project_progress.get(task.project_id, (0, 0))[1]}"
+            f" · {TASK_STATUS_LABELS.get(task.status, task.status)}"
         )
         self._update_asset_actions()
 
@@ -288,7 +352,10 @@ class AIGenerationPage(BatchDressPage):
                 QMessageBox.warning(self, "API Key 不可用", str(exc))
                 return
         try:
-            if task.parent_task_id is None:
+            if (
+                task.parent_task_id is None
+                and self.force_direct_retry_task_id != task.id
+            ):
                 count = self._split_source_task(task, prompt)
             else:
                 count = self._retry_child_task(task, prompt)
@@ -304,6 +371,63 @@ class AIGenerationPage(BatchDressPage):
         self._refresh_generation_tasks()
         self._resume_queued_jobs()
         self._pump_queue()
+        self.force_direct_retry_task_id = None
+
+    def prepare_history_retry(
+        self,
+        task_id: int,
+        attempt_id: int,
+    ) -> None:
+        task = self.repository.get_task(task_id)
+        if task is None:
+            raise ValueError("项目子任务不存在")
+        attempts = self.repository.list_attempts(task_id)
+        attempt = next(
+            (item for item in attempts if item.id == attempt_id),
+            None,
+        )
+        if attempt is None:
+            raise ValueError("生成轮次不存在")
+        self._generation_tasks_by_id[task.id] = task
+        self.generation_tasks = [
+            item for item in self.generation_tasks if item.id != task.id
+        ] + [task]
+        if self.task_selector.findData(task.id) < 0:
+            self.task_selector.addItem(
+                f"{task.task_code} · 历史重试",
+                task.id,
+            )
+        self.task_selector.setCurrentIndex(
+            self.task_selector.findData(task.id)
+        )
+        self._task_changed()
+        self.prompt_edit.setPlainText(attempt.prompt_text)
+        model_index = self.model_combo.findData(attempt.model)
+        if model_index >= 0:
+            self.model_combo.setCurrentIndex(model_index)
+        aspect_index = self.aspect_combo.findData(attempt.aspect_ratio)
+        if aspect_index >= 0:
+            self.aspect_combo.setCurrentIndex(aspect_index)
+        resolution_index = self.resolution_combo.findData(
+            attempt.resolution or "auto"
+        )
+        if resolution_index >= 0:
+            self.resolution_combo.setCurrentIndex(resolution_index)
+        self.count_spin.setValue(max(1, int(attempt.n)))
+        provider_index = self.provider_combo.findData(
+            attempt.requested_provider_code or ""
+        )
+        self.provider_combo.setCurrentIndex(max(0, provider_index))
+        self.force_direct_retry_task_id = task.id
+
+    def remove_cancelled_attempt(self, attempt_id: int) -> None:
+        self.waiting_jobs = deque(
+            job
+            for job in self.waiting_jobs
+            if job["attempt"].id != attempt_id
+        )
+        self._refresh_generation_tasks()
+        self._pump_queue()
 
     def _split_source_task(
         self,
@@ -313,6 +437,12 @@ class AIGenerationPage(BatchDressPage):
         strategy = self.app_settings.auto_strategy()
         specs: list[GenerationPairSpec] = []
         groups: list[DressTaskGroup] = []
+        provider_code = str(self.provider_combo.currentData() or "")
+        provider_name = (
+            self.provider_combo.currentText()
+            if provider_code
+            else ""
+        )
         for group in self.pairs:
             group_prompt = (
                 "无需制作"
@@ -345,9 +475,29 @@ class AIGenerationPage(BatchDressPage):
                     ),
                     garment_hashes=garment_hashes,
                     skipped=group.skipped,
+                    requested_provider_code=provider_code,
+                    requested_provider_name=provider_name,
                 )
             )
             groups.append(group)
+        unsupported_models = []
+        if provider_code:
+            for spec in specs:
+                if spec.skipped:
+                    continue
+                routes = self.repository.list_provider_routes(
+                    spec.model,
+                    provider_code=provider_code,
+                )
+                if not routes:
+                    unsupported_models.append(spec.model)
+        if unsupported_models:
+            QMessageBox.information(
+                self,
+                "首选供应商不支持当前模型",
+                "以下模型未配置在该供应商中，将自动切换到其他平台：\n"
+                + "、".join(sorted(set(unsupported_models))),
+            )
         results = self.repository.split_and_queue_generations(
             task.id,
             self.actor,
@@ -426,6 +576,15 @@ class AIGenerationPage(BatchDressPage):
             resolution=self.resolution_combo.currentData(),
             n=self.count_spin.value(),
             unit_price=self.repository.current_model_price(model_id),
+            requested_provider_code=str(
+                self.provider_combo.currentData() or ""
+            ),
+            requested_provider_name=(
+                self.provider_combo.currentText()
+                if self.provider_combo.currentData()
+                else ""
+            ),
+            allow_reopen=task.status in ("approved", "skipped"),
         )
         store = self.local_store
         if store is None:

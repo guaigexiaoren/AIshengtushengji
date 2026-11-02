@@ -47,9 +47,11 @@ if HAS_PYSIDE:
         BUILTIN_PROMPT_TEMPLATES,
         PROTOCOL_OPENAI_CHAT_IMAGE,
         PROTOCOL_OPENAI_IMAGES,
+        TASK_SUCCESS,
     )
     from yixin.database import Database
     from yixin.library import LibraryService
+    from yixin.models import ImageRequest
     from yixin.paths import AppPaths
     from yixin.security import SecretStore
     from yixin.settings import INPUT_MANUAL_UPLOAD, AppSettings
@@ -67,7 +69,10 @@ if HAS_PYSIDE:
     from yixin.ui.submission_list_page import SubmissionListPage
     from yixin.ui.subtask_source_dialog import SubtaskSourceDialog
     from yixin.ui.project_history_page import ProjectHistoryPage
-    from yixin.ui.history_page import HistoryTabsPage
+    from yixin.ui.unified_history_page import (
+        LargeImageDialog,
+        UnifiedHistoryPage,
+    )
     from yixin.ui.date_filter import OptionalDateEdit
     from yixin.ui.task_center_page import TaskCenterPage
     from yixin.ui.task_assignment_page import TaskAssignmentPage
@@ -211,6 +216,15 @@ class FakeCentralRepository:
 
     def list_provider_models(self, _provider_id, **_kwargs):
         return []
+
+    def list_provider_routes(self, _model, **_kwargs):
+        return []
+
+    def project_progress_counts(self, project_ids):
+        return {int(project_id): (0, 0) for project_id in project_ids}
+
+    def cancel_queued_generation_attempt(self, _attempt_id, _actor):
+        return None
 
     def list_model_prices(self):
         return {}
@@ -516,6 +530,11 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(len(page.garment_assets), 2)
         self.assertEqual(len(page.person_assets), 1)
         self.assertEqual(len(page.pairs), 1)
+        self.assertIsNotNone(page.provider_combo)
+        self.assertNotEqual(
+            page.template_combo.parentWidget(),
+            page.prompt_edit.parentWidget(),
+        )
         skip_buttons = [
             button
             for button in page.findChildren(QPushButton)
@@ -539,6 +558,20 @@ class CollaborationPageTests(unittest.TestCase):
             lambda _actor, **_kwargs: [task]
         )
         self.repository.list_queued_attempts = lambda _actor_id: []
+        self.repository.list_api_providers = lambda **_kwargs: [
+            ApiProvider(
+                id=3,
+                provider_code="a6api",
+                display_name="A6API",
+                base_url="https://api.a6api.vip/v1",
+                default_protocol=PROTOCOL_OPENAI_IMAGES,
+                enabled=True,
+                priority=30,
+            )
+        ]
+        self.repository.project_progress_counts = (
+            lambda _ids: {task.project_id: (2, 5)}
+        )
         captured: list[tuple] = []
 
         def split(task_id, actor, *, pairs):
@@ -571,6 +604,10 @@ class CollaborationPageTests(unittest.TestCase):
             auto_load=False,
         )
         page.refresh()
+        self.assertEqual(page.provider_combo.count(), 2)
+        self.assertIn("主任务 2/5", page.task_selector.itemText(1))
+        self.assertIn("待制作", page.task_selector.itemText(1))
+        page.provider_combo.setCurrentIndex(1)
         skip_buttons = [
             button
             for button in page.findChildren(QPushButton)
@@ -584,6 +621,10 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(len(specs), 1)
         self.assertEqual(len(specs[0].garment_hashes), 2)
         self.assertTrue(specs[0].skipped)
+        self.assertEqual(
+            specs[0].requested_provider_code,
+            "a6api",
+        )
         page.deleteLater()
 
     def test_ai_generation_page_retries_failed_child_without_split(self) -> None:
@@ -627,6 +668,90 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(len(self.repository.generation_requests), 1)
         task_id, _actor, _kwargs = self.repository.generation_requests[0]
         self.assertEqual(task_id, task.id)
+        page.deleteLater()
+
+    def test_ai_generation_page_prepares_completed_history_retry(self) -> None:
+        write_task_images(self.root)
+        task = replace(
+            make_task("approved"),
+            id=31,
+            task_code="春季项目-123-001-005",
+            parent_task_id=11,
+        )
+        attempt = GenerationAttempt(
+            id=41,
+            task_id=task.id,
+            attempt_no=3,
+            operator_id=4,
+            model="gemini-3.1-flash-image",
+            prompt_text="历史重试提示词",
+            aspect_ratio="4:3",
+            resolution="1K",
+            n=2,
+            status=ATTEMPT_SUCCEEDED,
+            source_revision=1,
+            unit_price=Decimal("1.00"),
+            generated_image_count=1,
+            provider_name="A6API",
+            requested_provider_code="a6api",
+            requested_provider_name="A6API",
+            created_at=datetime.now(),
+        )
+        self.repository.tasks_by_id[task.id] = task
+        self.repository.list_attempts = lambda _task_id: [attempt]
+        self.repository.list_ai_generation_tasks = (
+            lambda _actor, **_kwargs: []
+        )
+        self.repository.list_queued_attempts = lambda _actor_id: []
+        self.repository.list_api_providers = lambda **_kwargs: [
+            ApiProvider(
+                id=3,
+                provider_code="a6api",
+                display_name="A6API",
+                base_url="https://api.a6api.vip/v1",
+                default_protocol=PROTOCOL_OPENAI_IMAGES,
+                enabled=True,
+                priority=30,
+            )
+        ]
+        paths = AppPaths(self.root / "history-retry-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        store = FileStore(paths)
+        client = NanoBananaClient(lambda: "test-key")
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            AuthUser(4, "ai_amy", "AI Amy", "ai"),
+            client,
+            key_store,
+            database,
+            store,
+            LibraryService(database, store, paths),
+            TaskWorker(database, client, store),
+            key_store,
+            auto_load=False,
+        )
+        page.refresh()
+        page.prepare_history_retry(task.id, attempt.id)
+        self.assertEqual(page.current_task.id, task.id)
+        self.assertEqual(
+            page.prompt_edit.toPlainText(),
+            "历史重试提示词",
+        )
+        self.assertEqual(page.provider_combo.currentData(), "a6api")
+        self.assertEqual(page.count_spin.value(), 2)
+        page._enqueue_all()
+        self.assertEqual(len(self.repository.generation_requests), 1)
+        _task_id, _actor, kwargs = self.repository.generation_requests[0]
+        self.assertTrue(kwargs["allow_reopen"])
+        self.assertEqual(kwargs["requested_provider_code"], "a6api")
         page.deleteLater()
 
     def test_login_has_no_database_settings(self) -> None:
@@ -2655,7 +2780,7 @@ class CollaborationPageTests(unittest.TestCase):
         paths = AppPaths(self.root / "history-tabs-data")
         paths.ensure()
         client = NanoBananaClient(lambda: "test-key")
-        history = HistoryTabsPage(
+        history = UnifiedHistoryPage(
             database,
             LibraryService(database, FileStore(paths), paths),
             TaskWorker(database, client, FileStore(paths)),
@@ -2663,9 +2788,199 @@ class CollaborationPageTests(unittest.TestCase):
             self.resolver,
             self.actor,
         )
-        self.assertEqual(history.tabs.tabText(0), "项目任务")
-        self.assertEqual(history.tabs.tabText(1), "普通创作")
+        self.assertFalse(hasattr(history, "tabs"))
         history.deleteLater()
+
+    def test_unified_history_merges_project_and_ordinary_records(self) -> None:
+        write_task_images(self.root)
+        task = make_task("approved")
+        product_root = self.root / task.project_relative_root
+        result_path = product_root / "AI成品" / "result.png"
+        result_path.parent.mkdir(parents=True)
+        Image.new("RGB", (30, 40), "orange").save(result_path)
+        result = GenerationResult(
+            id=30,
+            attempt_id=40,
+            result_index=0,
+            relative_path=result_path.relative_to(product_root).as_posix(),
+            thumbnail_relative_path=result_path.relative_to(
+                product_root
+            ).as_posix(),
+            content_hash="b" * 64,
+            mime="image/png",
+            width=30,
+            height=40,
+            is_final=True,
+        )
+        self.repository.tasks_by_id[task.id] = task
+        self.repository.attempt_results[40] = [result]
+        self.repository.project_attempt_history = [
+            {
+                "id": 40,
+                "task_id": task.id,
+                "attempt_no": 1,
+                "project_code": task.project_code,
+                "task_code": task.task_code,
+                "product_code": task.product_code,
+                "project_name": task.project_name,
+                "access_project_name": "春季项目",
+                "operator_name": "AI制作Amy",
+                "model": "gemini-3.1-flash-image",
+                "provider_name": "A6API",
+                "requested_provider_code": "a6api",
+                "requested_provider_name": "A6API",
+                "status": "succeeded",
+                "prompt_text": "项目历史提示词",
+                "aspect_ratio": "3:4",
+                "resolution": "2K",
+                "n": 1,
+                "created_at": datetime.now(),
+                "result_count": 1,
+            }
+        ]
+        self.repository.list_attempts = lambda _task_id: [
+            GenerationAttempt(
+                id=40,
+                task_id=task.id,
+                attempt_no=1,
+                operator_id=4,
+                model="gemini-3.1-flash-image",
+                prompt_text="项目历史提示词",
+                aspect_ratio="3:4",
+                resolution="2K",
+                n=1,
+                status=ATTEMPT_SUCCEEDED,
+                source_revision=1,
+                unit_price=Decimal("1.00"),
+                generated_image_count=1,
+                provider_code="a6api",
+                provider_name="A6API",
+                requested_provider_code="a6api",
+                requested_provider_name="A6API",
+                created_at=datetime.now(),
+            )
+        ]
+        paths = AppPaths(self.root / "unified-history-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        store = FileStore(paths)
+        database.create_task(
+            ImageRequest(
+                model="gemini-3.1-flash-image",
+                prompt="普通创作历史",
+                n=1,
+                aspect_ratio="3:4",
+                resolution="2K",
+                mode="text",
+            )
+        )
+        claimed = database.claim_next_queued()
+        database.transition_task(int(claimed["id"]), TASK_SUCCESS)
+        library = LibraryService(database, store, paths)
+        client = NanoBananaClient(lambda: "test-key")
+        page = UnifiedHistoryPage(
+            database,
+            library,
+            TaskWorker(database, client, store),
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        self.assertFalse(hasattr(page, "tabs"))
+        self.assertEqual(page.table.rowCount(), 2)
+        self.assertEqual(
+            {
+                page.table.item(row, 0).text()
+                for row in range(page.table.rowCount())
+            },
+            {"项目", "普通"},
+        )
+        page.type_filter.setCurrentIndex(
+            page.type_filter.findData("ordinary")
+        )
+        self.assertEqual(page.table.rowCount(), 1)
+        self.assertEqual(page.table.item(0, 0).text(), "普通")
+        page.type_filter.setCurrentIndex(0)
+        page.status_filter.setCurrentIndex(
+            page.status_filter.findData(ATTEMPT_SUCCEEDED)
+        )
+        self.assertEqual(page.table.rowCount(), 2)
+        page.status_filter.setCurrentIndex(0)
+        page.project_filter.setCurrentIndex(
+            page.project_filter.findData("春季项目")
+        )
+        self.assertEqual(page.table.rowCount(), 1)
+        self.assertEqual(page.table.item(0, 0).text(), "项目")
+        self.assertEqual(page.reference_strip.count(), 3)
+        self.assertEqual(page.result_strip.count(), 1)
+        self.assertEqual(
+            page.preview.current_path,
+            result_path.resolve(),
+        )
+        emitted: list[tuple[int, int]] = []
+        page.project_retry_requested.connect(
+            lambda task_id, attempt_id: emitted.append(
+                (task_id, attempt_id)
+            )
+        )
+        page._retry_current()
+        self.assertEqual(emitted, [(task.id, 40)])
+        with patch(
+            "yixin.ui.unified_history_page.show_saved_path"
+        ):
+            page._save_library()
+        self.assertEqual(len(database.list_works()), 1)
+        with patch.object(LargeImageDialog, "exec") as dialog_exec:
+            page._zoom_current()
+        dialog_exec.assert_called_once()
+        page.deleteLater()
+
+    def test_unified_history_cancels_only_queued_project_attempt(self) -> None:
+        task = make_task("claimed")
+        self.repository.tasks_by_id[task.id] = task
+        self.repository.project_attempt_history = [
+            {
+                "id": 50,
+                "task_id": task.id,
+                "attempt_no": 1,
+                "project_code": task.project_code,
+                "task_code": task.task_code,
+                "product_code": task.product_code,
+                "access_project_name": "春季项目",
+                "operator_name": "AI制作Amy",
+                "model": "gemini-3.1-flash-image",
+                "status": ATTEMPT_QUEUED,
+                "prompt_text": "排队任务",
+                "created_at": datetime.now(),
+                "result_count": 0,
+            }
+        ]
+        cancelled: list[int] = []
+        self.repository.cancel_queued_generation_attempt = (
+            lambda attempt_id, _actor: cancelled.append(attempt_id)
+        )
+        paths = AppPaths(self.root / "history-cancel-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        store = FileStore(paths)
+        client = NanoBananaClient(lambda: "test-key")
+        page = UnifiedHistoryPage(
+            database,
+            LibraryService(database, store, paths),
+            TaskWorker(database, client, store),
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        emitted: list[int] = []
+        page.project_attempt_cancelled.connect(emitted.append)
+        self.assertTrue(page.cancel_button.isEnabled())
+        page._cancel_current()
+        self.assertEqual(cancelled, [50])
+        self.assertEqual(emitted, [50])
+        page.deleteLater()
 
 
 if __name__ == "__main__":

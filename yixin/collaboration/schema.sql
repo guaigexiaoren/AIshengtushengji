@@ -239,6 +239,8 @@ CREATE TABLE IF NOT EXISTS generation_attempts (
     provider_code VARCHAR(64) NOT NULL DEFAULT '',
     provider_name VARCHAR(100) NOT NULL DEFAULT '',
     provider_model VARCHAR(160) NOT NULL DEFAULT '',
+    requested_provider_code VARCHAR(64) NOT NULL DEFAULT '',
+    requested_provider_name VARCHAR(100) NOT NULL DEFAULT '',
     created_at DATETIME(6) NOT NULL,
     started_at DATETIME(6) NULL,
     finished_at DATETIME(6) NULL,

@@ -74,7 +74,7 @@ TASK_EXPANDED = "expanded"
 TASK_CANCELLED = "cancelled"
 TASK_STATUS_LABELS = {
     TASK_AVAILABLE: "已提交",
-    TASK_CLAIMED: "制作中",
+    TASK_CLAIMED: "待制作",
     TASK_WORKING: "制作中",
     TASK_AWAITING_ACCEPTANCE: "待审核",
     TASK_RETURNED: "已退回",
@@ -105,6 +105,7 @@ ATTEMPT_QUEUED = "queued"
 ATTEMPT_RUNNING = "running"
 ATTEMPT_SUCCEEDED = "succeeded"
 ATTEMPT_FAILED = "failed"
+ATTEMPT_CANCELLED = "cancelled"
 
 
 @dataclass(frozen=True)
@@ -264,6 +265,8 @@ class GenerationAttempt:
     provider_code: str = ""
     provider_name: str = ""
     provider_model: str = ""
+    requested_provider_code: str = ""
+    requested_provider_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -331,6 +334,8 @@ class GenerationPairSpec:
     unit_price: Decimal
     garment_hashes: tuple[str, ...]
     skipped: bool = False
+    requested_provider_code: str = ""
+    requested_provider_name: str = ""
 
 
 @dataclass(frozen=True)

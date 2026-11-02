@@ -135,6 +135,9 @@ class ProjectGenerationWorker:
                 reference_images=references,
                 mode="dress_up",
                 central_attempt_id=attempt_id,
+                provider_code=(
+                    attempt.requested_provider_code or None
+                ),
             )
             api_result = self.client.generate(request)
             output_directory = self.resolver.output_directory(

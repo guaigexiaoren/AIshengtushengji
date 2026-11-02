@@ -43,10 +43,18 @@ class ProviderRouter:
         self.transport = transport
 
     def generate(self, request: ImageRequest) -> ImageApiResult:
-        routes = self.repository.list_provider_routes(
-            request.model,
-            provider_code=request.provider_code,
-        )
+        routes = self.repository.list_provider_routes(request.model)
+        if request.provider_code:
+            preferred = [
+                route
+                for route in routes
+                if route.provider_code == request.provider_code
+            ]
+            routes = preferred + [
+                route
+                for route in routes
+                if route.provider_code != request.provider_code
+            ]
         if not routes:
             if request.provider_code:
                 raise ConfigurationError("所选 API 平台没有配置当前模型")
@@ -117,7 +125,7 @@ class ProviderRouter:
                     error_code=exc.error_code,
                     raw_response=exc.raw_response,
                 )
-                if request.provider_code or not self._can_failover(exc):
+                if not self._can_failover(exc):
                     raise last_error
                 continue
             self._record_call(

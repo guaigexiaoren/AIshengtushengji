@@ -51,6 +51,12 @@ class EmptyCentralRepository:
     def list_provider_models(self, _provider_id, **_kwargs):
         return []
 
+    def list_provider_routes(self, _model, **_kwargs):
+        return []
+
+    def project_progress_counts(self, project_ids):
+        return {int(project_id): (0, 0) for project_id in project_ids}
+
     def list_model_prices(self):
         return {}
 

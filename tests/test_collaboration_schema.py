@@ -46,6 +46,8 @@ class CollaborationSchemaTests(unittest.TestCase):
             "default_protocol",
             "parent_task_id",
             "split_at",
+            "requested_provider_code",
+            "requested_provider_name",
         ):
             self.assertIn(column, schema)
         self.assertIn("utf8mb4", schema)

@@ -31,6 +31,7 @@ from .reports import (
 )
 from .types import (
     ATTEMPT_FAILED,
+    ATTEMPT_CANCELLED,
     ATTEMPT_QUEUED,
     ATTEMPT_RUNNING,
     ATTEMPT_SUCCEEDED,
@@ -69,7 +70,7 @@ from .types import (
     ROLE_ALLOWED_MENUS,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 LEGACY_SHARED_ROOT = (
     r"\\fe80--211-32ff-fe87-ba49.ipv6-literal.net\AI作图"
 )
@@ -184,6 +185,7 @@ class MySQLCentralRepository:
                     self._apply_schema_v3(cursor)
                     self._apply_schema_v4(cursor)
                     self._apply_schema_v5(cursor)
+                    self._apply_schema_v6(cursor)
                     self._apply_shared_root_update(cursor)
                     cursor.execute(
                         "INSERT IGNORE INTO schema_migrations(version, applied_at) "
@@ -392,6 +394,22 @@ class MySQLCentralRepository:
             )
             """
         )
+
+    @staticmethod
+    def _apply_schema_v6(cursor) -> None:
+        attempt_columns = {
+            "requested_provider_code":
+                "VARCHAR(64) NOT NULL DEFAULT ''",
+            "requested_provider_name":
+                "VARCHAR(100) NOT NULL DEFAULT ''",
+        }
+        for column, definition in attempt_columns.items():
+            _add_column_if_missing(
+                cursor,
+                "generation_attempts",
+                column,
+                definition,
+            )
 
     @staticmethod
     def _apply_shared_root_update(cursor) -> None:
@@ -2023,6 +2041,104 @@ class MySQLCentralRepository:
                     {},
                 )
 
+    def cancel_queued_generation_attempt(
+        self,
+        attempt_id: int,
+        actor: AuthUser,
+    ) -> None:
+        now = utc_now()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                attempt = self._attempt_row_for_update(cursor, attempt_id)
+                if (
+                    int(attempt["operator_id"]) != actor.id
+                    and actor.role != ROLE_ADMIN
+                ):
+                    raise PermissionDeniedError(
+                        "不能取消其他人的生成轮次"
+                    )
+                if attempt["status"] != ATTEMPT_QUEUED:
+                    raise StateConflictError("只有排队中的轮次可以取消")
+                task = self._task_row_for_update(
+                    cursor,
+                    int(attempt["task_id"]),
+                )
+                cursor.execute(
+                    """
+                    UPDATE generation_attempts
+                    SET status = %s, error_code = 'cancelled',
+                        error_message = '用户取消排队', finished_at = %s
+                    WHERE id = %s
+                    """,
+                    (ATTEMPT_CANCELLED, now, attempt_id),
+                )
+                cursor.execute(
+                    """
+                    UPDATE project_tasks
+                    SET status = %s, updated_at = %s
+                    WHERE id = %s AND status = %s
+                    """,
+                    (
+                        TASK_CLAIMED,
+                        now,
+                        int(attempt["task_id"]),
+                        TASK_WORKING,
+                    ),
+                )
+                self._update_project_status(
+                    cursor,
+                    int(attempt["project_id"]),
+                )
+                self._event(
+                    cursor,
+                    int(attempt["project_id"]),
+                    int(attempt["task_id"]),
+                    actor.id,
+                    "generation_cancelled",
+                    task["status"],
+                    task["status"],
+                    {"attempt_id": attempt_id},
+                )
+
+    def project_progress_counts(
+        self,
+        project_ids: Sequence[int],
+    ) -> dict[int, tuple[int, int]]:
+        clean_ids = tuple(
+            dict.fromkeys(int(value) for value in project_ids)
+        )
+        if not clean_ids:
+            return {}
+        placeholders = ", ".join(["%s"] * len(clean_ids))
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT project_id,
+                           COUNT(*) AS total_count,
+                           COALESCE(SUM(
+                               status IN (%s, %s)
+                           ), 0) AS completed_count
+                    FROM project_tasks
+                    WHERE project_id IN ({placeholders})
+                      AND status <> %s
+                    GROUP BY project_id
+                    """,
+                    (
+                        TASK_APPROVED,
+                        TASK_SKIPPED,
+                        *clean_ids,
+                        TASK_EXPANDED,
+                    ),
+                )
+                return {
+                    int(row["project_id"]): (
+                        int(row["completed_count"]),
+                        int(row["total_count"]),
+                    )
+                    for row in cursor.fetchall()
+                }
+
     def list_ai_generation_tasks(
         self,
         actor: AuthUser,
@@ -2061,7 +2177,7 @@ class MySQLCentralRepository:
                           SELECT 1
                           FROM generation_attempts failed
                           WHERE failed.task_id = t.id
-                            AND failed.status = %s
+                            AND failed.status IN (%s, %s)
                       )
                       AND NOT EXISTS (
                           SELECT 1
@@ -2083,10 +2199,11 @@ class MySQLCentralRepository:
         )
         params_with_attempts = [
             *params[:-1],
+            ATTEMPT_FAILED,
+            ATTEMPT_CANCELLED,
+            ATTEMPT_SUCCEEDED,
             ATTEMPT_QUEUED,
             ATTEMPT_RUNNING,
-            ATTEMPT_FAILED,
-            ATTEMPT_SUCCEEDED,
             limit,
         ]
         with self.connection() as connection:
@@ -2251,10 +2368,11 @@ class MySQLCentralRepository:
                                 task_id, attempt_no, operator_id, model,
                                 prompt_text, aspect_ratio, resolution, n,
                                 status, source_revision, unit_price,
-                                created_at
+                                requested_provider_code,
+                                requested_provider_name, created_at
                             ) VALUES (
                                 %s, 1, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s
+                                %s, %s, %s, %s, %s, %s
                             )
                             """,
                             (
@@ -2268,6 +2386,8 @@ class MySQLCentralRepository:
                                 ATTEMPT_QUEUED,
                                 int(source["source_revision"] or 1),
                                 pair.unit_price,
+                                pair.requested_provider_code,
+                                pair.requested_provider_name,
                                 now,
                             ),
                         )
@@ -2721,6 +2841,8 @@ class MySQLCentralRepository:
         resolution: str | None,
         n: int,
         unit_price: Decimal,
+        requested_provider_code: str = "",
+        requested_provider_name: str = "",
     ) -> GenerationAttempt:
         prompt = prompt.strip()
         if not prompt:
@@ -2751,10 +2873,12 @@ class MySQLCentralRepository:
                     INSERT INTO generation_attempts(
                         task_id, attempt_no, operator_id, model, prompt_text,
                         aspect_ratio, resolution, n, status, source_revision,
-                        unit_price,
+                        unit_price, requested_provider_code,
+                        requested_provider_name,
                         created_at, started_at
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s
                     )
                     """,
                     (
@@ -2769,6 +2893,8 @@ class MySQLCentralRepository:
                         ATTEMPT_RUNNING,
                         int(task.get("source_revision") or 1),
                         unit_price,
+                        requested_provider_code,
+                        requested_provider_name,
                         now,
                         now,
                     ),
@@ -2826,6 +2952,8 @@ class MySQLCentralRepository:
             unit_price=unit_price,
             generated_image_count=0,
             created_at=now,
+            requested_provider_code=requested_provider_code,
+            requested_provider_name=requested_provider_name,
         )
 
     def queue_generation_attempt(
@@ -2839,6 +2967,9 @@ class MySQLCentralRepository:
         resolution: str | None,
         n: int,
         unit_price: Decimal,
+        requested_provider_code: str = "",
+        requested_provider_name: str = "",
+        allow_reopen: bool = False,
     ) -> GenerationAttempt:
         prompt = prompt.strip()
         if not prompt:
@@ -2855,12 +2986,31 @@ class MySQLCentralRepository:
                     raise PermissionDeniedError("当前角色不能调用生图接口")
                 if int(task["assignee_id"] or 0) != actor.id:
                     raise PermissionDeniedError("请先领取该任务")
-                if task["status"] in (
-                    TASK_AWAITING_ACCEPTANCE,
-                    TASK_APPROVED,
-                    TASK_CANCELLED,
+                reopen = (
+                    task["status"] in (TASK_APPROVED, TASK_SKIPPED)
+                    and allow_reopen
+                )
+                if (
+                    task["status"] in (
+                        TASK_AWAITING_ACCEPTANCE,
+                        TASK_CANCELLED,
+                    )
+                    or (
+                        task["status"] in (TASK_APPROVED, TASK_SKIPPED)
+                        and not allow_reopen
+                    )
                 ):
                     raise StateConflictError("当前任务状态不能加入生成队列")
+                if reopen:
+                    cursor.execute(
+                        """
+                        UPDATE project_tasks
+                        SET status = %s, approved_at = NULL,
+                            final_quantity = 0, updated_at = %s
+                        WHERE id = %s
+                        """,
+                        (TASK_CLAIMED, now, task_id),
+                    )
                 cursor.execute(
                     "SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_no "
                     "FROM generation_attempts WHERE task_id = %s",
@@ -2872,9 +3022,11 @@ class MySQLCentralRepository:
                     INSERT INTO generation_attempts(
                         task_id, attempt_no, operator_id, model, prompt_text,
                         aspect_ratio, resolution, n, status, source_revision,
-                        unit_price, created_at
+                        unit_price, requested_provider_code,
+                        requested_provider_name, created_at
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s
                     )
                     """,
                     (
@@ -2889,6 +3041,8 @@ class MySQLCentralRepository:
                         ATTEMPT_QUEUED,
                         int(task["source_revision"] or 1),
                         unit_price,
+                        requested_provider_code,
+                        requested_provider_name,
                         now,
                     ),
                 )
@@ -2910,6 +3064,21 @@ class MySQLCentralRepository:
                         task_id,
                     ),
                 )
+                if reopen:
+                    self._update_project_status(
+                        cursor,
+                        int(task["project_id"]),
+                    )
+                    self._event(
+                        cursor,
+                        int(task["project_id"]),
+                        task_id,
+                        actor.id,
+                        "task_reopened_for_retry",
+                        task["status"],
+                        TASK_CLAIMED,
+                        {"attempt_id": attempt_id},
+                    )
                 self._event(
                     cursor,
                     int(task["project_id"]),
@@ -2936,6 +3105,8 @@ class MySQLCentralRepository:
             generated_image_count=0,
             operator_name=actor.display_name,
             created_at=now,
+            requested_provider_code=requested_provider_code,
+            requested_provider_name=requested_provider_name,
         )
 
     def claim_and_queue_generation(
@@ -2949,6 +3120,8 @@ class MySQLCentralRepository:
         resolution: str | None,
         n: int,
         unit_price: Decimal,
+        requested_provider_code: str = "",
+        requested_provider_name: str = "",
     ) -> GenerationAttempt:
         prompt = prompt.strip()
         if not prompt:
@@ -3016,9 +3189,11 @@ class MySQLCentralRepository:
                     INSERT INTO generation_attempts(
                         task_id, attempt_no, operator_id, model, prompt_text,
                         aspect_ratio, resolution, n, status, source_revision,
-                        unit_price, created_at
+                        unit_price, requested_provider_code,
+                        requested_provider_name, created_at
                     ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, %s, %s, %s, %s
                     )
                     """,
                     (
@@ -3033,6 +3208,8 @@ class MySQLCentralRepository:
                         ATTEMPT_QUEUED,
                         int(task["source_revision"] or 1),
                         unit_price,
+                        requested_provider_code,
+                        requested_provider_name,
                         now,
                     ),
                 )
@@ -3089,6 +3266,8 @@ class MySQLCentralRepository:
             generated_image_count=0,
             operator_name=actor.display_name,
             created_at=now,
+            requested_provider_code=requested_provider_code,
+            requested_provider_name=requested_provider_name,
         )
 
     def start_queued_generation_attempt(
@@ -4980,6 +5159,12 @@ def _generation_attempt(row: dict[str, Any]) -> GenerationAttempt:
         provider_code=row.get("provider_code") or "",
         provider_name=row.get("provider_name") or "",
         provider_model=row.get("provider_model") or "",
+        requested_provider_code=(
+            row.get("requested_provider_code") or ""
+        ),
+        requested_provider_name=(
+            row.get("requested_provider_name") or ""
+        ),
     )
 
 

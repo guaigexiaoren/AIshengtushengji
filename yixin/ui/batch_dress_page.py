@@ -856,7 +856,11 @@ class BatchDressPage(QWidget):
         param_layout.addWidget(self.count_spin)
         param_layout.addStretch(1)
         form.addRow("参数", params)
+        self._additional_settings_rows(form)
         return card
+
+    def _additional_settings_rows(self, _form: QFormLayout) -> None:
+        return
 
     def _build_prompt(self) -> QWidget:
         card = QGroupBox("换装提示词")
@@ -864,16 +868,7 @@ class BatchDressPage(QWidget):
         layout = QVBoxLayout(card)
         template_row = QHBoxLayout()
         template_row.setSpacing(5)
-        self.template_combo = QComboBox()
-        self.template_combo.setMinimumWidth(110)
-        self.template_combo.addItem("选择提示词模板", None)
-        save_template = QPushButton("保存当前")
-        manage_templates = QPushButton("管理")
-        for button in (save_template, manage_templates):
-            button.setStyleSheet("padding: 5px 8px;")
-        template_row.addWidget(self.template_combo, 1)
-        template_row.addWidget(save_template)
-        template_row.addWidget(manage_templates)
+        self._build_template_controls(template_row)
         layout.addLayout(template_row)
         self.prompt_edit = QTextEdit()
         self.prompt_edit.setMinimumHeight(96)
@@ -884,10 +879,22 @@ class BatchDressPage(QWidget):
             "保持人物身份和姿态，准确还原服装颜色、材质与纹理。"
         )
         layout.addWidget(self.prompt_edit)
+        return card
+
+    def _build_template_controls(self, layout: QHBoxLayout) -> None:
+        self.template_combo = QComboBox()
+        self.template_combo.setMinimumWidth(110)
+        self.template_combo.addItem("选择提示词模板", None)
+        save_template = QPushButton("保存当前")
+        manage_templates = QPushButton("管理")
+        for button in (save_template, manage_templates):
+            button.setStyleSheet("padding: 5px 8px;")
+        layout.addWidget(self.template_combo, 1)
+        layout.addWidget(save_template)
+        layout.addWidget(manage_templates)
         self.template_combo.currentIndexChanged.connect(self._apply_template)
         save_template.clicked.connect(self._quick_save_template)
         manage_templates.clicked.connect(self._manage_templates)
-        return card
 
     def showEvent(self, event) -> None:
         super().showEvent(event)

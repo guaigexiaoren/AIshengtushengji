@@ -647,6 +647,29 @@ class Database:
                 assets=assets,
             )
 
+    def create_external_work_with_assets(
+        self,
+        *,
+        folder_name: str,
+        title: str,
+        prompt: str,
+        model: str,
+        parameters: dict[str, Any],
+        assets: Sequence[tuple[str, int, StoredImage]],
+    ) -> int:
+        with self.connection() as connection:
+            return self._insert_work_with_assets(
+                connection,
+                task_id=None,
+                folder_name=folder_name,
+                title=title,
+                prompt=prompt,
+                model=model,
+                parameters=parameters,
+                raw_response=None,
+                assets=assets,
+            )
+
     @staticmethod
     def _insert_work_with_assets(
         connection: sqlite3.Connection,

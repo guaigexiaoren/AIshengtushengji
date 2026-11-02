@@ -38,7 +38,7 @@ from .batch_dress_page import BatchDressPage
 from .admin_page import AdminPage
 from .create_page import CreatePage
 from .dialogs import SettingsDialog
-from .history_page import HistoryTabsPage
+from .unified_history_page import UnifiedHistoryPage
 from .library_page import LibraryPage
 from .ai_generation_page import AIGenerationPage
 from .task_assignment_page import TaskAssignmentPage
@@ -197,7 +197,7 @@ class MainWindow(QMainWindow):
                 worker,
                 secret_store,
             )
-            self.history_page = HistoryTabsPage(
+            self.history_page = UnifiedHistoryPage(
                 database,
                 library_service,
                 worker,
@@ -298,6 +298,12 @@ class MainWindow(QMainWindow):
             self.create_page.library_changed.connect(self.library_page.refresh)
             self.history_page.library_changed.connect(self.library_page.refresh)
             self.history_page.retry_requested.connect(self._open_retry)
+            self.history_page.project_retry_requested.connect(
+                self._open_project_retry
+            )
+            self.history_page.project_attempt_cancelled.connect(
+                self.ai_generation_page.remove_cancelled_attempt
+            )
         self.worker.signals.task_changed.connect(self._on_task_changed)
         if self.actor.role in (ROLE_AI, ROLE_ADMIN):
             initial_page = (
@@ -417,6 +423,25 @@ class MainWindow(QMainWindow):
         self.create_page.prepare_retry(task_id)
         self.statusBar().showMessage(
             f"已载入任务 #{task_id}，修改参数后点击生成",
+            8000,
+        )
+
+    def _open_project_retry(
+        self,
+        task_id: int,
+        attempt_id: int,
+    ) -> None:
+        try:
+            self.ai_generation_page.prepare_history_retry(
+                task_id,
+                attempt_id,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "载入失败", str(exc))
+            return
+        self._select_page(self.ai_generation_page)
+        self.statusBar().showMessage(
+            "已载入项目子任务参数，请确认后手动加入生成队列",
             8000,
         )
 

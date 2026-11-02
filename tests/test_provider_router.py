@@ -298,6 +298,47 @@ class ProviderRouterTests(unittest.TestCase):
             ["failed", "succeeded"],
         )
 
+    def test_manual_provider_is_preferred_then_fails_over(self) -> None:
+        routes = [
+            self._route(
+                3,
+                "a6api",
+                "A6API",
+                PROTOCOL_OPENAI_IMAGES,
+            ),
+            self._route(
+                4,
+                "amux",
+                "Amux",
+                PROTOCOL_OPENAI_IMAGES,
+            ),
+        ]
+        seen: list[str] = []
+        image_b64 = base64.b64encode(png_bytes()).decode("ascii")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen.append(request.url.host)
+            if request.url.host == "amux.example":
+                return httpx.Response(500, json={"error": {"message": "繁忙"}})
+            return httpx.Response(
+                200,
+                json={"data": [{"b64_json": image_b64}]},
+            )
+
+        router = ProviderRouter(
+            FakeProviderRepository(routes),
+            FakeKeyStore({3: "sk-a6-123456", 4: "sk-amux-123456"}),
+            self.actor,
+            transport=httpx.MockTransport(handler),
+        )
+        request = replace(
+            self._request(refs=False),
+            provider_code="amux",
+        )
+        result = router.generate(request)
+        self.assertEqual(seen, ["amux.example", "a6api.example"])
+        self.assertEqual(result.provider_code, "a6api")
+
     def test_router_does_not_fail_over_after_timeout(self) -> None:
         routes = [
             self._route(
