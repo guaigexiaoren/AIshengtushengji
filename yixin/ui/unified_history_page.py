@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -50,15 +50,19 @@ from ..database import Database
 from ..library import LibraryService
 from ..local_export import export_original_image
 from ..settings import (
+    AUTO_STRATEGY_LABELS,
     LOCAL_SAVE_FIXED,
     LOCAL_SAVE_REFERENCE,
     AppSettings,
 )
 from ..storage import StoredImage
-from ..time_utils import utc_naive_to_local
+from ..time_utils import format_task_elapsed, utc_naive_to_local
 from ..worker import TaskWorker
+from ..paging import HistoryQuery, PageRequest, TaskQuery
+from .async_queries import get_query_runner
 from .date_filter import OptionalDateEdit
 from .image_preview import DualImagePreview
+from .pagination_bar import PaginationBar
 from .save_helpers import show_saved_path, show_saved_toast
 from .widgets import build_task_assets
 
@@ -129,6 +133,9 @@ class UnifiedHistoryPage(QWidget):
         resolver: SharedPathResolver,
         actor: AuthUser,
         parent: QWidget | None = None,
+        *,
+        auto_load: bool = True,
+        async_mode: bool = False,
     ) -> None:
         super().__init__(parent)
         self.database = database
@@ -137,14 +144,32 @@ class UnifiedHistoryPage(QWidget):
         self.repository = repository
         self.resolver = resolver
         self.actor = actor
+        self.async_mode = async_mode
         self.app_settings = AppSettings(database)
+        self.query_runner = (
+            get_query_runner() if self.async_mode else None
+        )
+        self._active_request = -1
+        self._active_detail_request = -1
+        self._project_names: list[str] = []
+        self._page_request = PageRequest()
+        self._sort_field = "created_at"
+        self._sort_direction = "desc"
+        self._keyword_timer = QTimer(self)
+        self._keyword_timer.setSingleShot(True)
+        self._keyword_timer.setInterval(350)
+        self._keyword_timer.timeout.connect(self._request_history_page)
         self.records: list[HistoryRecord] = []
         self._records_by_key: dict[str, HistoryRecord] = {}
         self.current_record: HistoryRecord | None = None
         self.current_assets: list = []
         self.current_selected_asset = None
         self._build()
-        self.refresh()
+        if self.query_runner is not None:
+            self.query_runner.succeeded.connect(self._query_succeeded)
+            self.query_runner.failed.connect(self._query_failed)
+        if auto_load:
+            self.refresh()
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
@@ -220,6 +245,9 @@ class UnifiedHistoryPage(QWidget):
         ):
             self.table.setColumnWidth(column, width)
         left_layout.addWidget(self.table, 1)
+        self.pagination = PaginationBar()
+        self.pagination.page_requested.connect(self._page_requested)
+        left_layout.addWidget(self.pagination)
         splitter.addWidget(left)
 
         right = QFrame()
@@ -239,10 +267,16 @@ class UnifiedHistoryPage(QWidget):
         right_layout.addWidget(self.detail_meta)
         right_layout.addWidget(self.prompt_view)
 
-        self.dual_preview = DualImagePreview(self.resolver)
+        self.dual_preview = DualImagePreview(
+            self.resolver,
+            async_thumbnails=self.async_mode,
+        )
         self.dual_preview.selection_changed.connect(
             self._preview_selected
         )
+        self.result_gallery = self.dual_preview.result_pane
+        self.reference_gallery = self.dual_preview.reference_pane
+        self.reference_strip = self.reference_gallery.list_widget
         self.preview = self.dual_preview.result_pane.preview
         right_layout.addWidget(self.dual_preview, 1)
         actions = QHBoxLayout()
@@ -267,20 +301,33 @@ class UnifiedHistoryPage(QWidget):
 
         refresh.clicked.connect(self.refresh)
         reset.clicked.connect(self._reset_filters)
-        self.project_filter.currentIndexChanged.connect(self._apply_filters)
-        self.product_search.textChanged.connect(self._apply_filters)
-        self.status_filter.currentIndexChanged.connect(self._apply_filters)
-        self.type_filter.currentIndexChanged.connect(self._apply_filters)
-        self.start_date.dateChanged.connect(self._apply_filters)
-        self.end_date.dateChanged.connect(self._apply_filters)
+        self.project_filter.currentIndexChanged.connect(self._filter_changed)
+        self.product_search.textChanged.connect(self._filter_changed)
+        self.status_filter.currentIndexChanged.connect(self._filter_changed)
+        self.type_filter.currentIndexChanged.connect(self._filter_changed)
+        self.start_date.dateChanged.connect(self._filter_changed)
+        self.end_date.dateChanged.connect(self._filter_changed)
         self.table.itemSelectionChanged.connect(self._selection_changed)
         self.cancel_button.clicked.connect(self._cancel_current)
         self.retry_button.clicked.connect(self._retry_current)
         self.save_local_button.clicked.connect(self._save_local)
         self.save_library_button.clicked.connect(self._save_library)
         self._set_actions(False)
+        if self.async_mode:
+            self.table.setSortingEnabled(False)
+            self.table.horizontalHeader().setSortIndicatorShown(True)
+            self.table.horizontalHeader().setSortIndicator(
+                7,
+                Qt.SortOrder.DescendingOrder,
+            )
+            self.table.horizontalHeader().sectionClicked.connect(
+                self._sort_requested
+            )
 
     def refresh(self) -> None:
+        if self.async_mode:
+            self._request_history_page()
+            return
         shared_root = self.repository.get_shared_setting("share_root")
         if shared_root:
             self.resolver = SharedPathResolver(shared_root)
@@ -306,6 +353,301 @@ class UnifiedHistoryPage(QWidget):
         )
         self._refresh_project_filter()
         self._apply_filters()
+
+    def _history_query(self) -> HistoryQuery:
+        return HistoryQuery(
+            keyword=self.product_search.text().strip(),
+            project_name=self.project_filter.currentData(),
+            status=self.status_filter.currentData(),
+            task_type=self.type_filter.currentData(),
+            start_date=self.start_date.python_date(),
+            end_date=self.end_date.python_date(),
+        )
+
+    @staticmethod
+    def _local_statuses(status: str | None) -> tuple[str, ...]:
+        mapping = {
+            ATTEMPT_QUEUED: TASK_QUEUED,
+            ATTEMPT_RUNNING: TASK_RUNNING,
+            ATTEMPT_SUCCEEDED: TASK_SUCCESS,
+            ATTEMPT_FAILED: TASK_FAILED,
+            ATTEMPT_CANCELLED: TASK_CANCELLED,
+        }
+        mapped = mapping.get(status or "")
+        return (mapped,) if mapped else ()
+
+    def _request_history_page(self) -> None:
+        self._active_detail_request = -1
+        self._set_actions(False)
+        query = self._history_query()
+        sort_page = PageRequest(
+            page=self._page_request.page,
+            page_size=100,
+            sort_field=self._sort_field,
+            sort_direction=self._sort_direction,
+        )
+        fetch_page = PageRequest(
+            page=1,
+            page_size=sort_page.page * sort_page.page_size,
+            sort_field=self._sort_field,
+            sort_direction=self._sort_direction,
+        )
+        self.detail_title.setText("正在加载历史记录…")
+
+        def load():
+            project_result = None
+            ordinary_result = None
+            project_names = list(self._project_names)
+            if query.task_type != "ordinary":
+                project_result = (
+                    self.repository.list_project_attempt_history_page(
+                        self.actor,
+                        query,
+                        fetch_page,
+                    )
+                )
+                if not project_names:
+                    project_names = (
+                        self.repository.list_access_project_names(
+                            self.actor
+                        )
+                    )
+            if query.task_type != "project" and not query.project_name:
+                ordinary_result = self.database.list_tasks_page(
+                    TaskQuery(
+                        keyword=query.keyword,
+                        statuses=self._local_statuses(query.status),
+                        start_date=query.start_date,
+                        end_date=query.end_date,
+                    ),
+                    fetch_page,
+                )
+            return query, project_result, ordinary_result, project_names
+
+        self._active_request = self.query_runner.submit(load)
+
+    def _query_succeeded(self, request_id: int, result) -> None:
+        if not self.async_mode:
+            return
+        if request_id == self._active_detail_request:
+            record = self.current_record
+            if record is None:
+                return
+            assets, model_reference_path, meta = result
+            self._render_record_detail(
+                record,
+                assets,
+                model_reference_path,
+                meta,
+            )
+            return
+        if request_id != self._active_request:
+            return
+        query, project_result, ordinary_result, project_names = result
+        if project_names:
+            self._project_names = list(project_names)
+        records = []
+        total = 0
+        if project_result is not None:
+            records.extend(
+                self._project_record(row)
+                for row in project_result.items
+            )
+            total += project_result.total
+        if ordinary_result is not None:
+            records.extend(
+                self._ordinary_record(task)
+                for task in ordinary_result.items
+            )
+            total += ordinary_result.total
+        total_pages = max(
+            1,
+            (total + self._page_request.page_size - 1)
+            // self._page_request.page_size,
+        )
+        if self._page_request.page > total_pages:
+            self._page_request = PageRequest(
+                page=total_pages,
+                page_size=100,
+                sort_field=self._sort_field,
+                sort_direction=self._sort_direction,
+            )
+            self._request_history_page()
+            return
+        reverse = self._sort_direction == "desc"
+
+        def sort_key(record: HistoryRecord):
+            values = {
+                "kind": record.kind_label,
+                "main_code": record.main_code,
+                "secondary_code": record.secondary_code,
+                "product_code": record.product_code,
+                "operator_name": record.operator_name,
+                "model": record.model,
+                "status": record.status_label,
+                "created_at": record.created_at,
+                "result_count": record.result_count,
+            }
+            primary = values.get(self._sort_field, record.created_at)
+            return primary, record.created_at, record.key
+
+        records.sort(key=sort_key, reverse=reverse)
+        start = (self._page_request.page - 1) * self._page_request.page_size
+        end = start + self._page_request.page_size
+        page_records = records[start:end]
+        self._render_history_page(page_records, total)
+        self._set_project_filter_names(project_names)
+
+    def _query_failed(self, request_id: int, message: str) -> None:
+        if not self.async_mode or request_id not in (
+            self._active_request,
+            self._active_detail_request,
+        ):
+            return
+        self.detail_title.setText("历史记录加载失败")
+        QMessageBox.warning(self, "读取历史记录失败", message)
+        if self.current_record is not None:
+            self._update_actions(self.current_record)
+
+    def _render_history_page(
+        self,
+        records: list[HistoryRecord],
+        total: int,
+    ) -> None:
+        current_key = (
+            self.current_record.key
+            if self.current_record is not None
+            else None
+        )
+        self.records = records
+        self._records_by_key = {
+            record.key: record for record in records
+        }
+        self.table.setRowCount(0)
+        selected_row = -1
+        pending_task_id = getattr(
+            self,
+            "_pending_show_task_id",
+            None,
+        )
+        for record in records:
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            values = (
+                record.kind_label,
+                record.main_code,
+                record.secondary_code,
+                record.product_code,
+                record.operator_name,
+                MODEL_LABELS.get(record.model, record.model),
+                record.status_label,
+                record.created_at.strftime("%Y-%m-%d %H:%M"),
+                str(record.result_count),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(HISTORY_KEY_ROLE, record.key)
+                    item.setData(HISTORY_RECORD_ROLE, record)
+                self.table.setItem(row, column, item)
+            if record.key == current_key:
+                selected_row = row
+            if (
+                pending_task_id is not None
+                and record.kind == "ordinary"
+                and record.task_id == pending_task_id
+            ):
+                selected_row = row
+        self.pagination.set_result(
+            total,
+            self._page_request.page,
+            self._page_request.page_size,
+        )
+        if records:
+            self.table.selectRow(selected_row if selected_row >= 0 else 0)
+            if pending_task_id is not None:
+                self._pending_show_task_id = None
+        else:
+            self.current_record = None
+            self.detail_title.setText("没有符合条件的历史记录")
+            self.detail_meta.clear()
+            self.prompt_view.clear()
+            self.dual_preview.clear()
+            self._set_actions(False)
+
+    def _set_project_filter_names(self, names: list[str]) -> None:
+        if not names:
+            return
+        selected = self.project_filter.currentData()
+        self.project_filter.blockSignals(True)
+        self.project_filter.clear()
+        self.project_filter.addItem("全部项目", None)
+        for name in names:
+            self.project_filter.addItem(name, name)
+        index = self.project_filter.findData(selected)
+        self.project_filter.setCurrentIndex(max(0, index))
+        self.project_filter.blockSignals(False)
+
+    def _filter_changed(self, *_args) -> None:
+        self._page_request = PageRequest(
+            page=1,
+            page_size=100,
+            sort_field=self._sort_field,
+            sort_direction=self._sort_direction,
+        )
+        if not self.async_mode:
+            self._apply_filters()
+            return
+        if self.sender() is self.product_search:
+            self._keyword_timer.start()
+        else:
+            self._request_history_page()
+
+    def _page_requested(self, page: int) -> None:
+        self._page_request = PageRequest(
+            page=page,
+            page_size=100,
+            sort_field=self._sort_field,
+            sort_direction=self._sort_direction,
+        )
+        if self.async_mode:
+            self._request_history_page()
+
+    def _sort_requested(self, column: int) -> None:
+        fields = {
+            0: "kind",
+            1: "main_code",
+            2: "secondary_code",
+            3: "product_code",
+            4: "operator_name",
+            5: "model",
+            6: "status",
+            7: "created_at",
+            8: "result_count",
+        }
+        field = fields.get(column)
+        if field is None:
+            return
+        if field == self._sort_field:
+            self._sort_direction = (
+                "asc" if self._sort_direction == "desc" else "desc"
+            )
+        else:
+            self._sort_field = field
+            self._sort_direction = "asc"
+        self.table.horizontalHeader().setSortIndicator(
+            column,
+            Qt.SortOrder.AscendingOrder
+            if self._sort_direction == "asc"
+            else Qt.SortOrder.DescendingOrder,
+        )
+        self._page_request = PageRequest(
+            page=1,
+            page_size=100,
+            sort_field=self._sort_field,
+            sort_direction=self._sort_direction,
+        )
+        self._request_history_page()
 
     def _project_record(self, row: dict) -> HistoryRecord:
         created = utc_naive_to_local(row["created_at"])
@@ -356,7 +698,7 @@ class UnifiedHistoryPage(QWidget):
             model=str(task.get("model") or ""),
             provider_name="自动/历史",
             prompt=prompt,
-            result_count=len(self.database.get_task_results(task["id"])),
+            result_count=int(task.get("result_count") or 0),
             raw=task,
         )
 
@@ -377,13 +719,25 @@ class UnifiedHistoryPage(QWidget):
         self.project_filter.blockSignals(False)
 
     def _reset_filters(self) -> None:
+        widgets = (
+            self.project_filter,
+            self.product_search,
+            self.status_filter,
+            self.type_filter,
+            self.start_date,
+            self.end_date,
+        )
+        for widget in widgets:
+            widget.blockSignals(True)
         self.project_filter.setCurrentIndex(0)
         self.product_search.clear()
         self.status_filter.setCurrentIndex(0)
         self.type_filter.setCurrentIndex(0)
         self.start_date.clear()
         self.end_date.clear()
-        self._apply_filters()
+        for widget in widgets:
+            widget.blockSignals(False)
+        self._filter_changed()
 
     def _apply_filters(self, *_args) -> None:
         project_name = self.project_filter.currentData()
@@ -479,20 +833,60 @@ class UnifiedHistoryPage(QWidget):
         return -1
 
     def show_task(self, task_id: int) -> None:
+        if self.async_mode:
+            self._pending_show_task_id = task_id
+            widgets = (
+                self.project_filter,
+                self.product_search,
+                self.status_filter,
+                self.type_filter,
+                self.start_date,
+                self.end_date,
+            )
+            for widget in widgets:
+                widget.blockSignals(True)
+            self.project_filter.setCurrentIndex(0)
+            self.product_search.setText(str(task_id))
+            self.status_filter.setCurrentIndex(0)
+            self.type_filter.setCurrentIndex(
+                self.type_filter.findData("ordinary")
+            )
+            self.start_date.clear()
+            self.end_date.clear()
+            for widget in widgets:
+                widget.blockSignals(False)
+            self._page_request = PageRequest(page=1, page_size=100)
+            self._request_history_page()
+            return
         row = self._find_task_row(task_id)
         if row < 0:
-            self._reset_filters()
+            self.refresh()
             row = self._find_task_row(task_id)
         if row >= 0:
             self.table.selectRow(row)
 
     def _load_record(self, record: HistoryRecord) -> None:
-        self.current_assets = []
+        if self.async_mode:
+            self._active_detail_request = self.query_runner.submit(
+                lambda: self._load_record_data(record)
+            )
+            self.detail_title.setText("正在加载历史详情…")
+            return
+        assets, model_reference_path, meta = self._load_record_data(record)
+        self._render_record_detail(
+            record,
+            assets,
+            model_reference_path,
+            meta,
+        )
+
+    def _load_record_data(self, record: HistoryRecord):
+        assets = []
         model_reference_path: Path | None = None
         if record.kind == "project":
             task = self.repository.get_task(record.task_id)
             if task is None:
-                return
+                return [], None, "任务不存在"
             references = [
                 StoredImage(
                     path=self.resolver.resolve_project_path(
@@ -536,7 +930,7 @@ class UnifiedHistoryPage(QWidget):
                         "result": result,
                     }
                 )
-            self.current_assets = build_task_assets(references, results)
+            assets = build_task_assets(references, results)
             provider_text = record.provider_name or "自动/历史"
             requested_provider = str(
                 record.raw.get("requested_provider_name") or ""
@@ -556,7 +950,7 @@ class UnifiedHistoryPage(QWidget):
             )
         else:
             task_id = int(record.task_id)
-            self.current_assets = build_task_assets(
+            assets = build_task_assets(
                 self.database.get_task_references(task_id),
                 self.database.get_task_results(task_id),
             )
@@ -566,7 +960,7 @@ class UnifiedHistoryPage(QWidget):
             ):
                 references = [
                     asset
-                    for asset in self.current_assets
+                    for asset in assets
                     if asset.is_reference
                 ]
                 if references:
@@ -579,11 +973,37 @@ class UnifiedHistoryPage(QWidget):
                 f"分辨率 {record.raw.get('resolution') or '自动'} · "
                 f"数量 {record.raw.get('n') or 0}"
             )
+            if record.raw.get("auto_strategy"):
+                meta += (
+                    "\n自动策略："
+                    + AUTO_STRATEGY_LABELS.get(
+                        str(record.raw["auto_strategy"]),
+                        str(record.raw["auto_strategy"]),
+                    )
+                )
+            if record.raw.get("auto_reason"):
+                meta += f"\n判断：{record.raw['auto_reason']}"
+        elapsed = format_task_elapsed(record.raw)
+        if elapsed != "—":
+            meta += f"\n总耗时：{elapsed}"
+        error_message = str(record.raw.get("error_message") or "")
+        if error_message:
+            meta += f"\n错误：{error_message}"
+        return assets, model_reference_path, meta
+
+    def _render_record_detail(
+        self,
+        record: HistoryRecord,
+        assets: list,
+        model_reference_path: Path | None,
+        meta: str,
+    ) -> None:
+        self.current_assets = assets
         self.detail_title.setText(record.main_code)
         self.detail_meta.setText(meta)
         self.prompt_view.setPlainText(record.prompt)
-        refs = [asset for asset in self.current_assets if asset.is_reference]
-        results = [asset for asset in self.current_assets if asset.is_result]
+        refs = [asset for asset in assets if asset.is_reference]
+        results = [asset for asset in assets if asset.is_result]
         result_items = [
             (
                 asset.thumbnail_path,
@@ -664,14 +1084,13 @@ class UnifiedHistoryPage(QWidget):
                 record.status == ATTEMPT_QUEUED
                 and owns_attempt
             )
-            task = self.repository.get_task(record.task_id)
             retry = bool(
-                task
-                and record.status
+                record.status
                 not in (ATTEMPT_QUEUED, ATTEMPT_RUNNING)
                 and (
                     self.actor.role == ROLE_ADMIN
-                    or task.assignee_id == self.actor.id
+                    or int(record.raw.get("assignee_id") or 0)
+                    == self.actor.id
                 )
             )
         self.cancel_button.setEnabled(cancel)

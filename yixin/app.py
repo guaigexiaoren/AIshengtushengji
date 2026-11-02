@@ -36,6 +36,7 @@ from .ui.localization import (
     install_chinese_dialog_filter,
     install_chinese_translations,
 )
+from .ui.async_queries import get_query_runner
 from .worker import TaskWorker
 
 
@@ -81,10 +82,6 @@ def run() -> int:
         if cancelled:
             logger.info("已将 %s 个用户停止等待的任务恢复为已取消", cancelled)
         file_store = FileStore(paths)
-        file_store.cleanup_temp(
-            database.active_temp_paths(),
-            days=TEMP_RETENTION_DAYS,
-        )
         database_config = MySQLConfig(**DATABASE)
         repository = MySQLCentralRepository(database_config)
         _ensure_central_schema(repository)
@@ -117,6 +114,7 @@ def run() -> int:
             repository=repository,
             resolver=resolver,
             actor=actor,
+            lazy_pages=True,
         )
     except StartupCancelled:
         return 0
@@ -136,19 +134,16 @@ def run() -> int:
 
     cleanup_timer = QTimer(window)
     cleanup_timer.setInterval(24 * 60 * 60 * 1000)
-    cleanup_timer.timeout.connect(cleanup_temp)
+    query_runner = get_query_runner()
+    cleanup_timer.timeout.connect(
+        lambda: query_runner.submit(cleanup_temp)
+    )
     cleanup_timer.start()
     app.aboutToQuit.connect(worker.shutdown)
 
     window.show()
     worker.start()
-    QTimer.singleShot(
-        0,
-        lambda: _cleanup_collaboration_candidates(
-            repository,
-            resolver,
-        ),
-    )
+    query_runner.submit(cleanup_temp)
     exit_code = app.exec()
     logger.info("应用退出")
     return exit_code

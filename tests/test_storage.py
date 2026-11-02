@@ -69,7 +69,7 @@ class StorageTests(unittest.TestCase):
             days=7,
             now=datetime.now(timezone.utc) + timedelta(seconds=1),
         )
-        self.assertIn(old, removed)
+        self.assertIn(old.resolve(), {path.resolve() for path in removed})
         self.assertFalse(old.exists())
         self.assertTrue(recent.exists())
         self.assertTrue(protected.exists())

@@ -225,12 +225,14 @@ class ImagePreviewPane(QWidget):
         *,
         resolver: SharedPathResolver | None = None,
         icon_size: int = 72,
+        async_thumbnails: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.role = role
         self.title = title
         self.resolver = resolver
+        self.async_thumbnails = async_thumbnails
         self.items: list[tuple[Path, Path, str, object]] = []
         self._zoom_dialog: LargeImageDialog | None = None
         layout = QVBoxLayout(self)
@@ -282,12 +284,14 @@ class ImagePreviewPane(QWidget):
                 )
             )
         self.title_label.setText(f"{self.title}（{len(self.items)}）")
-        self.list_widget.set_images(
-            [
-                (thumbnail_path, label, payload)
-                for thumbnail_path, _, label, payload in self.items
-            ]
-        )
+        thumbnail_items = [
+            (thumbnail_path, label, payload)
+            for thumbnail_path, _, label, payload in self.items
+        ]
+        if self.async_thumbnails:
+            self.list_widget.set_images_async(thumbnail_items)
+        else:
+            self.list_widget.set_images(thumbnail_items)
         if not self.items:
             self.preview.set_placeholder(f"暂无{self.title}")
             self.preview.set_image(None)
@@ -378,6 +382,7 @@ class DualImagePreview(QWidget):
     def __init__(
         self,
         resolver: SharedPathResolver | None = None,
+        async_thumbnails: bool = False,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -389,12 +394,14 @@ class DualImagePreview(QWidget):
             "结果图",
             resolver=resolver,
             icon_size=72,
+            async_thumbnails=async_thumbnails,
         )
         self.reference_pane = ImagePreviewPane(
             "reference",
             "参考图",
             resolver=resolver,
             icon_size=72,
+            async_thumbnails=async_thumbnails,
         )
         self.splitter.addWidget(self.result_pane)
         self.splitter.addWidget(self.reference_pane)

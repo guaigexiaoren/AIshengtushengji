@@ -380,7 +380,7 @@ class DatabaseLibraryTests(unittest.TestCase):
             ).fetchone()["value"]
         self.assertIn("source_path", columns)
         self.assertEqual(count, 1)
-        self.assertEqual(version, "3")
+        self.assertEqual(version, "4")
 
     def test_version_two_database_adds_auto_model_columns(self) -> None:
         legacy_path = Path(self.temp.name) / "legacy-v2" / "app.db"

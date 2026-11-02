@@ -130,7 +130,10 @@ class BatchDressTests(unittest.TestCase):
         images, errors = scan_image_inputs([root])
         self.assertEqual(errors, [])
         self.assertEqual(
-            [path.relative_to(root).as_posix() for path in images],
+        [
+            path.relative_to(root.resolve()).as_posix()
+            for path in images
+        ],
             ["2.png", "10.png", "子目录/1.png"],
         )
         self.assertLess(
@@ -175,8 +178,14 @@ class BatchDressTests(unittest.TestCase):
             ["2.png", "1.png"],
         )
         settings = AppSettings(self.database)
-        self.assertEqual(settings.input_folder(INPUT_BATCH_GARMENT), garment_root)
-        self.assertEqual(settings.input_folder(INPUT_BATCH_PERSON), person_root)
+        self.assertEqual(
+            settings.input_folder(INPUT_BATCH_GARMENT),
+            garment_root.resolve(),
+        )
+        self.assertEqual(
+            settings.input_folder(INPUT_BATCH_PERSON),
+            person_root.resolve(),
+        )
 
     def test_external_folder_drop_works_on_list_viewport_and_asset_group(
         self,

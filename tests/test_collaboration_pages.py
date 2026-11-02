@@ -53,6 +53,7 @@ if HAS_PYSIDE:
     from yixin.database import Database
     from yixin.library import LibraryService
     from yixin.models import ImageRequest
+    from yixin.paging import PageRequest, PageResult, TaskQuery
     from yixin.paths import AppPaths
     from yixin.security import SecretStore
     from yixin.settings import INPUT_MANUAL_UPLOAD, AppSettings
@@ -538,6 +539,49 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(requested, [[project.id]])
         page.deleteLater()
 
+    def test_assignment_page_async_pages_projects_and_tasks(self) -> None:
+        write_task_images(self.root)
+        project = make_project()
+        task = replace(make_task("available"), assignee_id=None)
+        self.repository.list_assignment_projects_page = (
+            lambda _actor, _query, page: PageResult(
+                [project],
+                1,
+                page.page,
+                page.page_size,
+            )
+        )
+        self.repository.list_board_tasks_for_project_page = (
+            lambda project_id, _actor, _statuses, _query, page: PageResult(
+                [task],
+                1,
+                page.page,
+                page.page_size,
+            )
+        )
+        page = TaskAssignmentPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            auto_load=False,
+            async_mode=True,
+        )
+        page.refresh()
+        loaded = False
+        for _ in range(100):
+            self.app.processEvents()
+            loaded = (
+                page.project_table.rowCount() == 1
+                and page.task_table.rowCount() == 1
+            )
+            if loaded:
+                break
+            QTest.qWait(10)
+        self.assertTrue(loaded)
+        self.assertIn("共 1 条", page.project_pagination.summary.text())
+        self.assertIn("共 1 条", page.task_pagination.summary.text())
+        page.deleteLater()
+
     def test_ai_generation_page_loads_subtask_and_toggles_skip(self) -> None:
         write_task_images(self.root)
         task = make_task("claimed")
@@ -608,6 +652,55 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertFalse(page.pairs[0].skipped)
         page.bottom_skip_button.click()
         self.assertTrue(page.pairs[0].skipped)
+        page.deleteLater()
+
+    def test_ai_generation_page_async_searches_first_hundred_tasks(
+        self,
+    ) -> None:
+        write_task_images(self.root)
+        task = make_task("claimed")
+        queries = []
+        self.repository.list_ai_generation_tasks_page = (
+            lambda _actor, query, page: (
+                queries.append((query, page))
+                or PageResult([task], 1, page.page, page.page_size)
+            )
+        )
+        paths = AppPaths(self.root / "ai-async-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: "test-key")
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            client,
+            SecretStore(paths.api_key_file),
+            database,
+            file_store,
+            LibraryService(database, file_store, paths),
+            TaskWorker(database, client, file_store),
+            SecretStore(paths.api_key_file),
+            auto_load=False,
+            async_mode=True,
+        )
+        page.refresh()
+        for _ in range(100):
+            self.app.processEvents()
+            if page.task_selector.count() == 2:
+                break
+            QTest.qWait(10)
+        self.assertEqual(page.task_selector.count(), 2)
+        self.assertEqual(queries[0][1].page_size, 100)
+        page.task_search_edit.setText("春季项目")
+        for _ in range(100):
+            self.app.processEvents()
+            if len(queries) >= 2:
+                break
+            QTest.qWait(10)
+        self.assertEqual(queries[-1][0].keyword, "春季项目")
         page.deleteLater()
 
     def test_ai_generation_page_splits_each_pair_into_child_task(self) -> None:
@@ -1388,6 +1481,199 @@ class CollaborationPageTests(unittest.TestCase):
             refresh.assert_called_once_with()
         window.close()
         window.deleteLater()
+
+    def test_main_window_creates_pages_only_when_first_visited(self) -> None:
+        paths = AppPaths(self.root / "lazy-window-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: None)
+        window = MainWindow(
+            paths=paths,
+            database=database,
+            file_store=file_store,
+            library_service=LibraryService(database, file_store, paths),
+            secret_store=SecretStore(paths.api_key_file),
+            worker=TaskWorker(database, client, file_store),
+            client=client,
+            repository=self.repository,
+            resolver=self.resolver,
+            actor=self.actor,
+            lazy_pages=True,
+        )
+        self.assertTrue(hasattr(window, "new_task_page"))
+        self.assertFalse(hasattr(window, "create_page"))
+        self.assertFalse(hasattr(window, "history_page"))
+        create_index = next(
+            index
+            for index in range(window.nav_list.count())
+            if window.nav_list.item(index).text() == "普通创作"
+        )
+        window.nav_list.setCurrentRow(create_index)
+        self.app.processEvents()
+        self.assertTrue(hasattr(window, "create_page"))
+        self.assertIs(
+            window.stack.currentWidget(),
+            window.create_page,
+        )
+        self.assertFalse(hasattr(window, "history_page"))
+        window.close()
+        window.deleteLater()
+
+    def test_lazy_main_window_uses_cache_until_page_is_dirty(self) -> None:
+        paths = AppPaths(self.root / "lazy-cache-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: None)
+        window = MainWindow(
+            paths=paths,
+            database=database,
+            file_store=file_store,
+            library_service=LibraryService(database, file_store, paths),
+            secret_store=SecretStore(paths.api_key_file),
+            worker=TaskWorker(database, client, file_store),
+            client=client,
+            repository=self.repository,
+            resolver=self.resolver,
+            actor=self.actor,
+            lazy_pages=True,
+        )
+        window.show()
+        self.app.processEvents()
+        QTest.qWait(20)
+        initial_index = next(
+            index
+            for index in range(window.nav_list.count())
+            if window.nav_list.item(index).text() == "AI提交"
+        )
+        create_index = next(
+            index
+            for index in range(window.nav_list.count())
+            if window.nav_list.item(index).text() == "普通创作"
+        )
+        with patch.object(window.new_task_page, "refresh") as refresh:
+            window.nav_list.setCurrentRow(create_index)
+            self.app.processEvents()
+            window.nav_list.setCurrentRow(initial_index)
+            self.app.processEvents()
+            refresh.assert_not_called()
+            window._mark_pages_dirty("AI提交")
+            window.nav_list.setCurrentRow(create_index)
+            window.nav_list.setCurrentRow(initial_index)
+            self.app.processEvents()
+            refresh.assert_called_once_with()
+        window.close()
+        window.deleteLater()
+
+    def test_submission_page_uses_async_paged_repository_queries(
+        self,
+    ) -> None:
+        write_task_images(self.root)
+        project = make_project()
+        task = make_task("approved")
+        project_queries = []
+        task_queries = []
+        self.repository.list_board_projects_page = (
+            lambda _actor, statuses, query, page: (
+                project_queries.append((statuses, query, page))
+                or PageResult([project], 125, page.page, page.page_size)
+            )
+        )
+        self.repository.list_board_tasks_for_project_page = (
+            lambda project_id, _actor, statuses, query, page: (
+                task_queries.append(
+                    (project_id, statuses, query, page)
+                )
+                or PageResult([task], 1, page.page, page.page_size)
+            )
+        )
+        page = SubmissionListPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            "records",
+            auto_load=False,
+            async_mode=True,
+        )
+        page.refresh()
+        for _ in range(100):
+            self.app.processEvents()
+            if page.task_table.rowCount():
+                break
+            QTest.qWait(10)
+        self.assertEqual(page.project_table.rowCount(), 1)
+        self.assertEqual(page.task_table.rowCount(), 1)
+        self.assertEqual(project_queries[0][2].page_size, 100)
+        self.assertEqual(task_queries[0][3].page_size, 100)
+        self.assertIn("共 125 条", page.project_pagination.summary.text())
+        page.project_pagination.next_button.click()
+        for _ in range(100):
+            self.app.processEvents()
+            if len(project_queries) >= 2:
+                break
+            QTest.qWait(10)
+        self.assertEqual(project_queries[-1][2].page, 2)
+        page.deleteLater()
+
+    def test_submission_page_ignores_stale_async_response(self) -> None:
+        import time
+
+        write_task_images(self.root)
+        project = make_project()
+        task = make_task("approved")
+        calls = []
+
+        def load_projects(_actor, _statuses, query, page):
+            calls.append(query.keyword)
+            if query.keyword == "旧":
+                time.sleep(0.08)
+                project_code = "旧任务"
+            else:
+                project_code = "新任务"
+            return PageResult(
+                [replace(project, project_code=project_code)],
+                1,
+                page.page,
+                page.page_size,
+            )
+
+        self.repository.list_board_projects_page = load_projects
+        self.repository.list_board_tasks_for_project_page = (
+            lambda _project_id, _actor, _statuses, _query, page: PageResult(
+                [task],
+                1,
+                page.page,
+                page.page_size,
+            )
+        )
+        page = SubmissionListPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            "records",
+            auto_load=False,
+            async_mode=True,
+        )
+        page.search_edit.setText("旧")
+        page._request_project_page()
+        page.search_edit.setText("新")
+        page._request_project_page()
+        for _ in range(100):
+            self.app.processEvents()
+            if page.project_table.rowCount() == 1:
+                break
+            QTest.qWait(10)
+        QTest.qWait(120)
+        self.app.processEvents()
+        self.assertEqual(
+            page.project_table.item(0, 0).text(),
+            "新任务",
+        )
+        self.assertEqual(set(calls), {"旧", "新"})
+        page.deleteLater()
 
     def test_ai_main_window_has_task_center_submenus(self) -> None:
         paths = AppPaths(self.root / "ai-window-data")
@@ -3127,6 +3413,104 @@ class CollaborationPageTests(unittest.TestCase):
         page._cancel_current()
         self.assertEqual(cancelled, [50])
         self.assertEqual(emitted, [50])
+        page.deleteLater()
+
+    def test_unified_history_async_page_and_detail_loading(self) -> None:
+        write_task_images(self.root)
+        task = make_task("approved")
+        product_root = self.root / task.project_relative_root
+        result_path = product_root / "AI成品" / "async-result.png"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (40, 50), "orange").save(result_path)
+        result = GenerationResult(
+            id=70,
+            attempt_id=80,
+            result_index=0,
+            relative_path=result_path.relative_to(product_root).as_posix(),
+            thumbnail_relative_path=result_path.relative_to(
+                product_root
+            ).as_posix(),
+            content_hash="d" * 64,
+            mime="image/png",
+            width=40,
+            height=50,
+            is_final=True,
+        )
+        row = {
+            "id": 80,
+            "task_id": task.id,
+            "assignee_id": task.assignee_id,
+            "attempt_no": 1,
+            "project_code": task.project_code,
+            "task_code": task.task_code,
+            "product_code": task.product_code,
+            "project_name": task.project_name,
+            "access_project_name": "春季项目",
+            "operator_name": "AI制作Amy",
+            "model": task.model,
+            "provider_name": "A6API",
+            "status": ATTEMPT_SUCCEEDED,
+            "prompt_text": "异步历史详情",
+            "aspect_ratio": "3:4",
+            "resolution": "2K",
+            "n": 1,
+            "created_at": datetime.now(),
+            "result_count": 1,
+        }
+        self.repository.tasks_by_id[task.id] = task
+        self.repository.attempt_results[80] = [result]
+        self.repository.list_project_attempt_history_page = (
+            lambda _actor, _query, page: PageResult(
+                [row],
+                1,
+                page.page,
+                page.page_size,
+            )
+        )
+        self.repository.list_access_project_names = (
+            lambda _actor: ["春季项目"]
+        )
+        paths = AppPaths(self.root / "async-history-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        database.list_tasks_page = (
+            lambda _query, page: PageResult(
+                [],
+                0,
+                page.page,
+                page.page_size,
+            )
+        )
+        store = FileStore(paths)
+        client = NanoBananaClient(lambda: "test-key")
+        page = UnifiedHistoryPage(
+            database,
+            LibraryService(database, store, paths),
+            TaskWorker(database, client, store),
+            self.repository,
+            self.resolver,
+            self.actor,
+            auto_load=False,
+            async_mode=True,
+        )
+        page.refresh()
+        loaded = False
+        for _ in range(150):
+            self.app.processEvents()
+            loaded = (
+                page.table.rowCount() == 1
+                and page.dual_preview.result_pane.list_widget.count() == 1
+            )
+            if loaded:
+                break
+            QTest.qWait(10)
+        self.assertTrue(loaded)
+        self.assertIn("共 1 条", page.pagination.summary.text())
+        self.assertEqual(
+            page.project_filter.findData("春季项目") >= 0,
+            True,
+        )
         page.deleteLater()
 
     def test_large_image_dialog_supports_pan_and_zoom(self) -> None:

@@ -19,6 +19,7 @@ from ..constants import (
     PROVIDER_PROTOCOLS,
 )
 from ..private_config import SHARED_ROOT
+from ..paging import HistoryQuery, PageRequest, PageResult, TaskQuery
 from ..security import validate_api_key
 from ..time_utils import local_to_utc_naive
 from .api_keys import ApiKeyError, decrypt_api_key, encrypt_api_key
@@ -70,7 +71,7 @@ from .types import (
     ROLE_ALLOWED_MENUS,
 )
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 LEGACY_SHARED_ROOT = (
     r"\\fe80--211-32ff-fe87-ba49.ipv6-literal.net\AI作图"
 )
@@ -187,6 +188,7 @@ class MySQLCentralRepository:
                     self._apply_schema_v5(cursor)
                     self._apply_schema_v6(cursor)
                     self._apply_schema_v7(cursor)
+                    self._apply_schema_v8(cursor)
                     self._apply_shared_root_update(cursor)
                     cursor.execute(
                         "INSERT IGNORE INTO schema_migrations(version, applied_at) "
@@ -429,6 +431,39 @@ class MySQLCentralRepository:
             WHERE role IN (%s, %s)
             """,
             (ROLE_OPERATIONS, ROLE_ADMIN),
+        )
+
+    @staticmethod
+    def _apply_schema_v8(cursor) -> None:
+        _add_index_if_missing(
+            cursor,
+            "projects",
+            "idx_projects_scope_name_date",
+            "(project_scope, project_name, source_date, id)",
+        )
+        _add_index_if_missing(
+            cursor,
+            "projects",
+            "idx_projects_created_id",
+            "(created_at, id)",
+        )
+        _add_index_if_missing(
+            cursor,
+            "project_tasks",
+            "idx_project_tasks_project_status_created",
+            "(project_id, status, created_at, id)",
+        )
+        _add_index_if_missing(
+            cursor,
+            "project_tasks",
+            "idx_project_tasks_assignee_status_created",
+            "(assignee_id, status, created_at, id)",
+        )
+        _add_index_if_missing(
+            cursor,
+            "generation_attempts",
+            "idx_attempts_created_id",
+            "(created_at, id)",
         )
         cursor.execute(
             """
@@ -1709,6 +1744,268 @@ class MySQLCentralRepository:
                 )
                 return [_project_record(row) for row in cursor.fetchall()]
 
+    def list_board_projects_page(
+        self,
+        actor: AuthUser,
+        statuses: Sequence[str],
+        query: TaskQuery,
+        page: PageRequest,
+    ) -> PageResult[ProjectRecord]:
+        clean_statuses = tuple(dict.fromkeys(str(value) for value in statuses))
+        if not clean_statuses:
+            return PageResult([], 0, page.page, page.page_size)
+        status_placeholders = ", ".join(["%s"] * len(clean_statuses))
+        task_conditions = [
+            "t.project_id = p.id",
+            f"t.status IN ({status_placeholders})",
+        ]
+        task_params: list[Any] = list(clean_statuses)
+        if query.start_date is not None:
+            task_conditions.append("t.created_at >= %s")
+            task_params.append(
+                local_to_utc_naive(
+                    datetime.combine(query.start_date, time.min)
+                )
+            )
+        if query.end_date is not None:
+            task_conditions.append("t.created_at <= %s")
+            task_params.append(
+                local_to_utc_naive(
+                    datetime.combine(query.end_date, time.max)
+                )
+            )
+        keyword = query.keyword.strip()
+        if keyword:
+            pattern = f"%{keyword}%"
+            task_conditions.append(
+                "("
+                "t.task_code LIKE %s OR "
+                "p.project_code LIKE %s OR p.product_code LIKE %s OR "
+                "p.name LIKE %s OR p.note LIKE %s OR "
+                "owner.display_name LIKE %s OR "
+                "COALESCE(assignee.display_name, '') LIKE %s"
+                ")"
+            )
+            task_params.extend((pattern,) * 7)
+        conditions = [
+            "EXISTS ("
+            "SELECT 1 FROM project_tasks t "
+            "LEFT JOIN users assignee ON assignee.id = t.assignee_id "
+            "WHERE "
+            + " AND ".join(task_conditions)
+            + ")"
+        ]
+        params = list(task_params)
+        if actor.role == ROLE_OPERATIONS:
+            conditions.extend(
+                (
+                    "p.owner_id = %s",
+                    """
+                    EXISTS (
+                        SELECT 1 FROM user_project_access upa
+                        WHERE upa.user_id = %s
+                          AND upa.project_scope = p.project_scope
+                          AND upa.project_name = p.project_name
+                    )
+                    """,
+                )
+            )
+            params.extend((actor.id, actor.id))
+        where_sql = " AND ".join(conditions)
+        sort_fields = {
+            "project_code": "p.project_code",
+            "product_code": "p.product_code",
+            "owner_name": "owner.display_name",
+            "source_date": "p.source_date",
+            "status": "p.status",
+            "created_at": "p.created_at",
+            "is_urgent": "p.is_urgent",
+            "progress": "approved_count / GREATEST(task_count, 1)",
+        }
+        sort_field = sort_fields.get(page.sort_field, "p.created_at")
+        direction = "ASC" if page.sort_direction == "asc" else "DESC"
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT COUNT(*) AS count
+                    FROM projects p
+                    JOIN users owner ON owner.id = p.owner_id
+                    WHERE {where_sql}
+                    """,
+                    tuple(params),
+                )
+                total = int(cursor.fetchone()["count"])
+                cursor.execute(
+                    f"""
+                    SELECT p.*, owner.display_name AS owner_name,
+                           COUNT(t.id) AS task_count,
+                           COALESCE(SUM(t.status = %s), 0)
+                               AS approved_count,
+                           COALESCE(SUM(t.status = %s), 0)
+                               AS awaiting_count,
+                           COALESCE(p.is_urgent, 0) AS urgent_count
+                    FROM projects p
+                    JOIN users owner ON owner.id = p.owner_id
+                    LEFT JOIN project_tasks t
+                      ON t.project_id = p.id AND t.status <> %s
+                    WHERE {where_sql}
+                    GROUP BY p.id, owner.display_name
+                    ORDER BY {sort_field} {direction}, p.id {direction}
+                    LIMIT %s OFFSET %s
+                    """,
+                    (
+                        TASK_APPROVED,
+                        TASK_AWAITING_ACCEPTANCE,
+                        TASK_EXPANDED,
+                        *params,
+                        page.page_size,
+                        page.offset,
+                    ),
+                )
+                rows = cursor.fetchall()
+        return PageResult(
+            [_project_record(row) for row in rows],
+            total,
+            page.page,
+            page.page_size,
+        )
+
+    def list_access_project_names(self, actor: AuthUser) -> list[str]:
+        conditions = ["p.project_name <> ''"]
+        params: list[Any] = []
+        if actor.role == ROLE_OPERATIONS:
+            conditions.extend(
+                (
+                    "p.owner_id = %s",
+                    """
+                    EXISTS (
+                        SELECT 1 FROM user_project_access upa
+                        WHERE upa.user_id = %s
+                          AND upa.project_scope = p.project_scope
+                          AND upa.project_name = p.project_name
+                    )
+                    """,
+                )
+            )
+            params.extend((actor.id, actor.id))
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT DISTINCT p.project_name
+                    FROM projects p
+                    WHERE
+                    """
+                    + " AND ".join(conditions)
+                    + " ORDER BY p.project_name",
+                    tuple(params),
+                )
+                return [
+                    str(row["project_name"])
+                    for row in cursor.fetchall()
+                ]
+
+    def list_board_tasks_for_project_page(
+        self,
+        project_id: int,
+        actor: AuthUser,
+        statuses: Sequence[str],
+        query: TaskQuery,
+        page: PageRequest,
+    ) -> PageResult[ProjectTask]:
+        clean_statuses = tuple(dict.fromkeys(str(value) for value in statuses))
+        if not clean_statuses:
+            return PageResult([], 0, page.page, page.page_size)
+        placeholders = ", ".join(["%s"] * len(clean_statuses))
+        conditions = [
+            "t.project_id = %s",
+            f"t.status IN ({placeholders})",
+        ]
+        params: list[Any] = [project_id, *clean_statuses]
+        if query.start_date is not None:
+            conditions.append("t.created_at >= %s")
+            params.append(
+                local_to_utc_naive(
+                    datetime.combine(query.start_date, time.min)
+                )
+            )
+        if query.end_date is not None:
+            conditions.append("t.created_at <= %s")
+            params.append(
+                local_to_utc_naive(
+                    datetime.combine(query.end_date, time.max)
+                )
+            )
+        keyword = query.keyword.strip()
+        if keyword:
+            pattern = f"%{keyword}%"
+            conditions.append(
+                "("
+                "t.task_code LIKE %s OR p.project_code LIKE %s OR "
+                "p.product_code LIKE %s OR p.name LIKE %s OR "
+                "p.note LIKE %s OR "
+                "COALESCE(assignee.display_name, '') LIKE %s"
+                ")"
+            )
+            params.extend((pattern,) * 6)
+        if actor.role == ROLE_OPERATIONS:
+            conditions.extend(
+                (
+                    "p.owner_id = %s",
+                    """
+                    EXISTS (
+                        SELECT 1 FROM user_project_access upa
+                        WHERE upa.user_id = %s
+                          AND upa.project_scope = p.project_scope
+                          AND upa.project_name = p.project_name
+                    )
+                    """,
+                )
+            )
+            params.extend((actor.id, actor.id))
+        where_sql = " AND ".join(conditions)
+        sort_fields = {
+            "task_code": "t.task_code",
+            "status": "t.status",
+            "assignee_name": "assignee.display_name",
+            "created_at": "t.created_at",
+            "updated_at": "t.updated_at",
+            "garment_count": (
+                "JSON_LENGTH(COALESCE(garment_sets.garments_json, JSON_ARRAY()))"
+            ),
+            "is_urgent": "p.is_urgent",
+        }
+        sort_field = sort_fields.get(page.sort_field, "t.created_at")
+        direction = "ASC" if page.sort_direction == "asc" else "DESC"
+        count_from = """
+            FROM project_tasks t
+            JOIN projects p ON p.id = t.project_id
+            LEFT JOIN users assignee ON assignee.id = t.assignee_id
+        """
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT COUNT(*) AS count {count_from} "
+                    f"WHERE {where_sql}",
+                    tuple(params),
+                )
+                total = int(cursor.fetchone()["count"])
+                cursor.execute(
+                    self._task_select_sql()
+                    + f" WHERE {where_sql}"
+                    + f" ORDER BY {sort_field} {direction}, t.id {direction}"
+                    + " LIMIT %s OFFSET %s",
+                    (*params, page.page_size, page.offset),
+                )
+                rows = cursor.fetchall()
+        return PageResult(
+            [_project_task(row) for row in rows],
+            total,
+            page.page,
+            page.page_size,
+        )
+
     def get_project(self, project_id: int) -> ProjectRecord | None:
         with self.connection() as connection:
             with connection.cursor() as cursor:
@@ -1937,6 +2234,111 @@ class MySQLCentralRepository:
                     _project_record(row)
                     for row in cursor.fetchall()
                 ]
+
+    def list_assignment_projects_page(
+        self,
+        actor: AuthUser,
+        query: TaskQuery,
+        page: PageRequest,
+    ) -> PageResult[ProjectRecord]:
+        if actor.role not in (ROLE_AI, ROLE_ADMIN):
+            raise PermissionDeniedError("当前角色不能查看待分配任务")
+        conditions = [
+            "p.status NOT IN (%s, %s)",
+            "t.status <> %s",
+        ]
+        params: list[Any] = [
+            PROJECT_COMPLETED,
+            PROJECT_CANCELLED,
+            TASK_EXPANDED,
+        ]
+        if query.start_date is not None:
+            conditions.append("p.created_at >= %s")
+            params.append(
+                local_to_utc_naive(
+                    datetime.combine(query.start_date, time.min)
+                )
+            )
+        if query.end_date is not None:
+            conditions.append("p.created_at <= %s")
+            params.append(
+                local_to_utc_naive(
+                    datetime.combine(query.end_date, time.max)
+                )
+            )
+        keyword = query.keyword.strip()
+        if keyword:
+            pattern = f"%{keyword}%"
+            conditions.append(
+                "("
+                "p.project_code LIKE %s OR p.product_code LIKE %s OR "
+                "p.name LIKE %s OR p.project_name LIKE %s OR "
+                "p.note LIKE %s"
+                ")"
+            )
+            params.extend((pattern,) * 5)
+        where_sql = " AND ".join(conditions)
+        base = f"""
+            SELECT p.*, owner.display_name AS owner_name,
+                   COUNT(t.id) AS task_count,
+                   COALESCE(SUM(t.status = %s), 0)
+                       AS approved_count,
+                   COALESCE(SUM(t.status = %s), 0)
+                       AS awaiting_count,
+                   COALESCE(p.is_urgent, 0) AS urgent_count,
+                   COALESCE(SUM(
+                       t.status = %s AND t.assignee_id IS NULL
+                   ), 0) AS available_count
+            FROM projects p
+            JOIN users owner ON owner.id = p.owner_id
+            JOIN project_tasks t ON t.project_id = p.id
+            WHERE {where_sql}
+            GROUP BY p.id, owner.display_name
+            HAVING task_count > 0
+               AND available_count = task_count
+        """
+        base_params = (
+            TASK_APPROVED,
+            TASK_AWAITING_ACCEPTANCE,
+            TASK_AVAILABLE,
+            *params,
+        )
+        sort_fields = {
+            "project_code": "p.project_code",
+            "product_code": "p.product_code",
+            "project_name": "p.project_name",
+            "task_count": "task_count",
+            "is_urgent": "p.is_urgent",
+            "created_at": "p.created_at",
+        }
+        sort_field = sort_fields.get(
+            page.sort_field,
+            "p.source_date",
+        )
+        direction = "ASC" if page.sort_direction == "asc" else "DESC"
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"SELECT COUNT(*) AS count FROM ({base}) matched",
+                    base_params,
+                )
+                total = int(cursor.fetchone()["count"])
+                cursor.execute(
+                    base
+                    + f"""
+                    ORDER BY p.is_urgent DESC, {sort_field} {direction},
+                             p.id {direction}
+                    LIMIT %s OFFSET %s
+                    """,
+                    (*base_params, page.page_size, page.offset),
+                )
+                rows = cursor.fetchall()
+        return PageResult(
+            [_project_record(row) for row in rows],
+            total,
+            page.page,
+            page.page_size,
+        )
 
     def claim_projects(
         self,
@@ -2243,6 +2645,135 @@ class MySQLCentralRepository:
                     _project_task(row)
                     for row in cursor.fetchall()
                 ]
+
+    def list_ai_generation_tasks_page(
+        self,
+        actor: AuthUser,
+        query: TaskQuery,
+        page: PageRequest,
+    ) -> PageResult[ProjectTask]:
+        if actor.role not in (ROLE_AI, ROLE_ADMIN):
+            raise PermissionDeniedError("当前角色不能进入 AI 生图")
+        conditions = [
+            "t.status NOT IN (%s, %s, %s, %s, %s)",
+            "p.status NOT IN (%s, %s)",
+        ]
+        params: list[Any] = [
+            TASK_APPROVED,
+            TASK_SKIPPED,
+            TASK_CANCELLED,
+            TASK_EXPANDED,
+            TASK_AWAITING_ACCEPTANCE,
+            PROJECT_COMPLETED,
+            PROJECT_CANCELLED,
+        ]
+        if actor.role != ROLE_ADMIN:
+            conditions.append("t.assignee_id = %s")
+            params.append(actor.id)
+        if query.start_date is not None:
+            conditions.append("t.created_at >= %s")
+            params.append(
+                local_to_utc_naive(
+                    datetime.combine(query.start_date, time.min)
+                )
+            )
+        if query.end_date is not None:
+            conditions.append("t.created_at <= %s")
+            params.append(
+                local_to_utc_naive(
+                    datetime.combine(query.end_date, time.max)
+                )
+            )
+        keyword = query.keyword.strip()
+        if keyword:
+            pattern = f"%{keyword}%"
+            conditions.append(
+                "("
+                "t.task_code LIKE %s OR p.project_code LIKE %s OR "
+                "p.product_code LIKE %s OR p.name LIKE %s OR "
+                "p.project_name LIKE %s OR "
+                "COALESCE(assignee.display_name, '') LIKE %s"
+                ")"
+            )
+            params.extend((pattern,) * 6)
+        scope_sql = (
+            " WHERE "
+            + " AND ".join(conditions)
+            + """
+              AND (
+                  t.parent_task_id IS NULL
+                  OR (
+                      t.parent_task_id IS NOT NULL
+                      AND EXISTS (
+                          SELECT 1
+                          FROM generation_attempts failed
+                          WHERE failed.task_id = t.id
+                            AND failed.status IN (%s, %s)
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM generation_attempts succeeded
+                          WHERE succeeded.task_id = t.id
+                            AND succeeded.status = %s
+                      )
+                  )
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM generation_attempts active
+                  WHERE active.task_id = t.id
+                    AND active.status IN (%s, %s)
+              )
+            """
+        )
+        base = self._task_select_sql() + scope_sql
+        base_params = (
+            *params,
+            ATTEMPT_FAILED,
+            ATTEMPT_CANCELLED,
+            ATTEMPT_SUCCEEDED,
+            ATTEMPT_QUEUED,
+            ATTEMPT_RUNNING,
+        )
+        sort_fields = {
+            "task_code": "t.task_code",
+            "product_code": "p.product_code",
+            "project_name": "p.project_name",
+            "status": "t.status",
+            "created_at": "t.created_at",
+        }
+        sort_field = sort_fields.get(page.sort_field, "t.created_at")
+        direction = "ASC" if page.sort_direction == "asc" else "DESC"
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM project_tasks t
+                    JOIN projects p ON p.id = t.project_id
+                    LEFT JOIN users assignee
+                      ON assignee.id = t.assignee_id
+                    """
+                    + scope_sql,
+                    base_params,
+                )
+                total = int(cursor.fetchone()["count"])
+                cursor.execute(
+                    base
+                    + f"""
+                    ORDER BY p.is_urgent DESC, {sort_field} {direction},
+                             p.id, t.task_no
+                    LIMIT %s OFFSET %s
+                    """,
+                    (*base_params, page.page_size, page.offset),
+                )
+                rows = cursor.fetchall()
+        return PageResult(
+            [_project_task(row) for row in rows],
+            total,
+            page.page,
+            page.page_size,
+        )
 
     def split_and_queue_generations(
         self,
@@ -4187,6 +4718,111 @@ class MySQLCentralRepository:
                 )
                 return [dict(row) for row in cursor.fetchall()]
 
+    def list_project_attempt_history_page(
+        self,
+        actor: AuthUser,
+        query: HistoryQuery,
+        page: PageRequest,
+    ) -> PageResult[dict[str, Any]]:
+        if actor.role not in (ROLE_AI, ROLE_ADMIN):
+            raise PermissionDeniedError("当前角色不能查看项目生成历史")
+        conditions = ["1 = 1"]
+        params: list[Any] = []
+        if query.project_name:
+            conditions.append("p.project_name = %s")
+            params.append(query.project_name)
+        if query.status:
+            conditions.append("ga.status = %s")
+            params.append(query.status)
+        if query.start_date is not None:
+            conditions.append("ga.created_at >= %s")
+            params.append(
+                local_to_utc_naive(
+                    datetime.combine(query.start_date, time.min)
+                )
+            )
+        if query.end_date is not None:
+            conditions.append("ga.created_at <= %s")
+            params.append(
+                local_to_utc_naive(
+                    datetime.combine(query.end_date, time.max)
+                )
+            )
+        keyword = query.keyword.strip()
+        if keyword:
+            pattern = f"%{keyword}%"
+            conditions.append(
+                "("
+                "ga.prompt_text LIKE %s OR ga.model LIKE %s OR "
+                "ga.provider_name LIKE %s OR t.task_code LIKE %s OR "
+                "p.project_code LIKE %s OR p.product_code LIKE %s OR "
+                "p.name LIKE %s OR p.project_name LIKE %s OR "
+                "u.display_name LIKE %s"
+                ")"
+            )
+            params.extend((pattern,) * 9)
+        where_sql = " AND ".join(conditions)
+        base = f"""
+            SELECT ga.*, u.display_name AS operator_name,
+                   t.task_code, t.project_id, t.assignee_id,
+                   p.project_code, p.product_code,
+                   p.name AS project_name,
+                   p.project_name AS access_project_name,
+                   COUNT(gr.id) AS result_count
+            FROM generation_attempts ga
+            JOIN project_tasks t ON t.id = ga.task_id
+            JOIN projects p ON p.id = t.project_id
+            JOIN users u ON u.id = ga.operator_id
+            LEFT JOIN generation_results gr ON gr.attempt_id = ga.id
+            WHERE {where_sql}
+            GROUP BY ga.id, u.display_name, t.task_code,
+                     t.project_id, p.project_code, p.product_code,
+                     p.name, p.project_name, t.assignee_id
+        """
+        sort_fields = {
+            "created_at": "ga.created_at",
+            "status": "ga.status",
+            "main_code": "p.project_code",
+            "secondary_code": "t.task_code",
+            "product_code": "p.product_code",
+            "operator_name": "u.display_name",
+            "model": "ga.model",
+            "kind": "'project'",
+            "result_count": "result_count",
+        }
+        sort_field = sort_fields.get(page.sort_field, "ga.created_at")
+        direction = "ASC" if page.sort_direction == "asc" else "DESC"
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count
+                    FROM generation_attempts ga
+                    JOIN project_tasks t ON t.id = ga.task_id
+                    JOIN projects p ON p.id = t.project_id
+                    JOIN users u ON u.id = ga.operator_id
+                    WHERE
+                    """
+                    + where_sql,
+                    tuple(params),
+                )
+                total = int(cursor.fetchone()["count"])
+                cursor.execute(
+                    base
+                    + f"""
+                    ORDER BY {sort_field} {direction}, ga.id {direction}
+                    LIMIT %s OFFSET %s
+                    """,
+                    (*params, page.page_size, page.offset),
+                )
+                rows = cursor.fetchall()
+        return PageResult(
+            [dict(row) for row in rows],
+            total,
+            page.page,
+            page.page_size,
+        )
+
     def list_attempt_results(self, attempt_id: int) -> list[GenerationResult]:
         with self.connection() as connection:
             with connection.cursor() as cursor:
@@ -5020,6 +5656,28 @@ def _add_column_if_missing(
     if int(cursor.fetchone()["count"]) == 0:
         cursor.execute(
             f"ALTER TABLE `{table}` ADD COLUMN `{column}` {definition}"
+        )
+
+
+def _add_index_if_missing(
+    cursor,
+    table: str,
+    index: str,
+    columns: str,
+) -> None:
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+          AND INDEX_NAME = %s
+        """,
+        (table, index),
+    )
+    if int(cursor.fetchone()["count"]) == 0:
+        cursor.execute(
+            f"CREATE INDEX `{index}` ON `{table}` {columns}"
         )
 
 

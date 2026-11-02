@@ -92,6 +92,9 @@ class CreatePage(QWidget):
         worker: TaskWorker,
         secret_store: SecretStore,
         parent: QWidget | None = None,
+        *,
+        auto_load: bool = True,
+        async_thumbnails: bool = False,
     ) -> None:
         super().__init__(parent)
         self.database = database
@@ -99,6 +102,7 @@ class CreatePage(QWidget):
         self.library_service = library_service
         self.worker = worker
         self.secret_store = secret_store
+        self.async_thumbnails = async_thumbnails
         self.app_settings = AppSettings(database)
         self.local_save_controller = LocalSaveController(
             self,
@@ -136,8 +140,9 @@ class CreatePage(QWidget):
         self.worker.signals.task_changed.connect(self._on_task_changed)
         self.mode_combo.currentIndexChanged.connect(self._update_reference_visibility)
         self.reference_strip.currentRowChanged.connect(self._preview_reference)
-        self.refresh_templates()
-        self.refresh_queue()
+        if auto_load:
+            self.refresh_templates()
+            self.refresh_queue()
         self._update_reference_list()
         self._update_reference_visibility()
         self.elapsed_timer = QTimer(self)
@@ -406,7 +411,10 @@ class CreatePage(QWidget):
             (image.path, f"参考 {index + 1}", image)
             for index, image in enumerate(self.reference_images)
         ]
-        self.reference_strip.set_images(items)
+        if self.async_thumbnails:
+            self.reference_strip.set_images_async(items)
+        else:
+            self.reference_strip.set_images(items)
         self.reference_count_label.setText(
             f"已选择 {len(self.reference_images)} / 14 张 · "
             "可直接拖入图片 · 拖动缩略图可调整顺序"
@@ -650,6 +658,10 @@ class CreatePage(QWidget):
     def _clear_references(self) -> None:
         self.reference_images.clear()
         self._update_reference_list()
+
+    def refresh(self) -> None:
+        self.refresh_templates()
+        self.refresh_queue()
 
     def refresh_templates(self) -> None:
         selected = self.template_combo.currentData()
@@ -944,7 +956,10 @@ class CreatePage(QWidget):
             (asset.thumbnail_path, asset.label, asset)
             for asset in self.current_assets
         ]
-        self.asset_strip.set_images(items)
+        if self.async_thumbnails:
+            self.asset_strip.set_images_async(items)
+        else:
+            self.asset_strip.set_images(items)
         self.compare_button.setEnabled(
             any(asset.is_reference for asset in self.current_assets)
             and any(asset.is_result for asset in self.current_assets)

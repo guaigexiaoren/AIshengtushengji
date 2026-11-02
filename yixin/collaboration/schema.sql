@@ -48,7 +48,11 @@ CREATE TABLE IF NOT EXISTS projects (
     CONSTRAINT fk_projects_urgent_by FOREIGN KEY (urgent_by)
         REFERENCES users(id),
     INDEX idx_projects_status_deadline (status, deadline),
-    INDEX idx_projects_owner_created (owner_id, created_at)
+    INDEX idx_projects_owner_created (owner_id, created_at),
+    INDEX idx_projects_scope_name_date (
+        project_scope, project_name, source_date, id
+    ),
+    INDEX idx_projects_created_id (created_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS user_menu_permissions (
@@ -211,7 +215,13 @@ CREATE TABLE IF NOT EXISTS project_tasks (
     UNIQUE KEY uk_project_task_no (project_id, task_no),
     INDEX idx_project_tasks_status_created (status, created_at),
     INDEX idx_project_tasks_assignee_status (assignee_id, status),
-    INDEX idx_project_tasks_parent (parent_task_id)
+    INDEX idx_project_tasks_parent (parent_task_id),
+    INDEX idx_project_tasks_project_status_created (
+        project_id, status, created_at, id
+    ),
+    INDEX idx_project_tasks_assignee_status_created (
+        assignee_id, status, created_at, id
+    )
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS generation_attempts (
@@ -253,7 +263,8 @@ CREATE TABLE IF NOT EXISTS generation_attempts (
     UNIQUE KEY uk_generation_attempt_no (task_id, attempt_no),
     INDEX idx_generation_attempts_task_created (task_id, created_at),
     INDEX idx_generation_attempts_operator_created (operator_id, created_at),
-    INDEX idx_generation_attempts_provider_created (provider_id, created_at)
+    INDEX idx_generation_attempts_provider_created (provider_id, created_at),
+    INDEX idx_attempts_created_id (created_at, id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS generation_provider_calls (

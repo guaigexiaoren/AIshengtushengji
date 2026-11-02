@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -130,16 +132,24 @@ class MainWindow(QMainWindow):
         repository: MySQLCentralRepository,
         resolver: SharedPathResolver,
         actor: AuthUser,
+        lazy_pages: bool = False,
     ) -> None:
         super().__init__()
         self.paths = paths
         self.database = database
+        self.file_store = file_store
+        self.library_service = library_service
         self.secret_store = secret_store
         self.worker = worker
         self.client = client
         self.repository = repository
         self.resolver = resolver
         self.actor = actor
+        self.lazy_pages = lazy_pages
+        self._page_factories: dict[str, Callable[[], QWidget]] = {}
+        self._page_attributes: dict[str, str] = {}
+        self._page_indices: dict[str, int] = {}
+        self._dirty_pages: set[str] = set()
         self._initial_data_loaded = False
         self._initial_load_scheduled = False
         self.setWindowIcon(QApplication.instance().windowIcon())
@@ -149,91 +159,6 @@ class MainWindow(QMainWindow):
 
         self.stack = QStackedWidget()
         self.page_specs: list[tuple[str, QWidget]] = []
-        self.new_task_page = TaskCreatePage(
-            repository,
-            resolver,
-            actor,
-            auto_load=False,
-        )
-        self.page_specs.append(("AI提交", self.new_task_page))
-        if self.actor.role in (ROLE_OPERATIONS, ROLE_ADMIN):
-            self.submission_records_page = SubmissionListPage(
-                repository,
-                resolver,
-                actor,
-                "records",
-                auto_load=False,
-            )
-            self.page_specs.append(
-                ("提交记录", self.submission_records_page)
-            )
-        if self.actor.role in (ROLE_AI, ROLE_ADMIN):
-            self.assignment_page = TaskAssignmentPage(
-                repository,
-                resolver,
-                actor,
-                auto_load=False,
-            )
-            self.ai_generation_page = AIGenerationPage(
-                repository,
-                resolver,
-                actor,
-                client,
-                secret_store,
-                database,
-                file_store,
-                library_service,
-                worker,
-                secret_store,
-                auto_load=False,
-            )
-            self.page_specs.extend(
-                [
-                    ("待分配", self.assignment_page),
-                    ("AI生图", self.ai_generation_page),
-                ]
-            )
-            self.assignment_page.projects_claimed.connect(
-                lambda _count: self.ai_generation_page.refresh()
-            )
-            self.create_page = CreatePage(
-                database,
-                file_store,
-                library_service,
-                worker,
-                secret_store,
-            )
-            self.batch_dress_page = BatchDressPage(
-                database,
-                file_store,
-                library_service,
-                worker,
-                secret_store,
-            )
-            self.history_page = UnifiedHistoryPage(
-                database,
-                library_service,
-                worker,
-                repository,
-                resolver,
-                actor,
-            )
-            self.library_page = LibraryPage(database, library_service)
-            self.page_specs.extend(
-                [
-                    ("普通创作", self.create_page),
-                    ("批量换装", self.batch_dress_page),
-                    ("历史记录", self.history_page),
-                    ("作品库", self.library_page),
-                ]
-            )
-        if self.actor.role == ROLE_ADMIN:
-            self.admin_page = AdminPage(
-                repository,
-                actor,
-                auto_load=False,
-            )
-            self.page_specs.append(("管理控制台", self.admin_page))
         role_allowed = set(
             ROLE_ALLOWED_MENUS.get(self.actor.role, ())
         )
@@ -253,12 +178,13 @@ class MainWindow(QMainWindow):
             "作品库": "library",
             "管理控制台": "admin",
         }
-        self.page_specs = [
+        role_specs = self._available_page_specs()
+        available_specs = [
             spec
-            for spec in self.page_specs
+            for spec in role_specs
             if label_keys.get(spec[0]) in allowed_menu_keys
         ]
-        if not self.page_specs:
+        if not available_specs:
             empty_page = QWidget()
             empty_layout = QVBoxLayout(empty_page)
             empty_layout.addStretch(1)
@@ -269,8 +195,39 @@ class MainWindow(QMainWindow):
             empty_message.setStyleSheet("color:#60708a;font-size:16px;")
             empty_layout.addWidget(empty_message)
             empty_layout.addStretch(1)
-            self.page_specs.append(("无可用菜单", empty_page))
-        for _, page in self.page_specs:
+            available_specs = [
+                ("无可用菜单", lambda: empty_page, "")
+            ]
+        specs_to_register = (
+            role_specs
+            if not self.lazy_pages
+            else available_specs
+        )
+        for label, factory, attribute in specs_to_register:
+            self._page_factories[label] = factory
+            self._page_attributes[label] = attribute
+        if not self.lazy_pages:
+            available_labels = {
+                label for label, _, _ in available_specs
+            }
+            for label, _factory, _attribute in role_specs:
+                if label not in available_labels:
+                    self._create_page(label)
+        labels = [label for label, _, _ in available_specs]
+        initial_label = labels[0]
+        if self.actor.role == ROLE_AI and "AI生图" in labels:
+            initial_label = "AI生图"
+        elif self.actor.role == ROLE_ADMIN and "AI提交" in labels:
+            initial_label = "AI提交"
+        self._initial_page_label = initial_label
+        for label, _factory, _attribute in available_specs:
+            if self.lazy_pages and label != initial_label:
+                page = QWidget()
+                page.setProperty("lazy_page_placeholder", True)
+            else:
+                page = self._create_page(label)
+            self._page_indices[label] = len(self.page_specs)
+            self.page_specs.append((label, page))
             self.stack.addWidget(page)
 
         central = QWidget()
@@ -296,40 +253,216 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(self._base_status_message)
 
         self.nav_list.currentRowChanged.connect(self._nav_changed)
-        if hasattr(self, "create_page"):
-            self.create_page.settings_requested.connect(self.open_settings)
-            self.batch_dress_page.settings_requested.connect(self.open_settings)
-            self.batch_dress_page.tasks_enqueued.connect(self._on_batch_enqueued)
-            self.ai_generation_page.tasks_enqueued.connect(
-                self._on_batch_enqueued
-            )
-            self.create_page.templates_changed.connect(
-                self.batch_dress_page.refresh_templates
-            )
-            self.batch_dress_page.templates_changed.connect(
-                self.create_page.refresh_templates
-            )
-            self.create_page.library_changed.connect(self.library_page.refresh)
-            self.history_page.library_changed.connect(self.library_page.refresh)
-            self.history_page.retry_requested.connect(self._open_retry)
-            self.history_page.project_retry_requested.connect(
-                self._open_project_retry
-            )
-            self.history_page.project_attempt_cancelled.connect(
-                self.ai_generation_page.remove_cancelled_attempt
-            )
         self.worker.signals.task_changed.connect(self._on_task_changed)
-        if self.actor.role in (ROLE_AI, ROLE_ADMIN):
-            initial_page = (
-                self.ai_generation_page
-                if self.actor.role == ROLE_AI
-                else self.new_task_page
+        initial_index = self._page_indices[self._initial_page_label]
+        self.nav_list.setCurrentRow(initial_index)
+
+    def _available_page_specs(
+        self,
+    ) -> list[tuple[str, Callable[[], QWidget], str]]:
+        specs: list[tuple[str, Callable[[], QWidget], str]] = [
+            (
+                "AI提交",
+                lambda: TaskCreatePage(
+                    self.repository,
+                    self.resolver,
+                    self.actor,
+                    auto_load=False,
+                    async_mode=self.lazy_pages,
+                ),
+                "new_task_page",
             )
-        else:
-            initial_page = self.new_task_page
-        if all(page is not initial_page for _, page in self.page_specs):
-            initial_page = self.page_specs[0][1]
-        self._select_page(initial_page)
+        ]
+        if self.actor.role in (ROLE_OPERATIONS, ROLE_ADMIN):
+            specs.append(
+                (
+                    "提交记录",
+                    lambda: SubmissionListPage(
+                        self.repository,
+                        self.resolver,
+                        self.actor,
+                        "records",
+                        auto_load=False,
+                        async_mode=self.lazy_pages,
+                    ),
+                    "submission_records_page",
+                )
+            )
+        if self.actor.role in (ROLE_AI, ROLE_ADMIN):
+            specs.extend(
+                [
+                    (
+                        "待分配",
+                        lambda: TaskAssignmentPage(
+                            self.repository,
+                            self.resolver,
+                            self.actor,
+                            auto_load=False,
+                            async_mode=self.lazy_pages,
+                        ),
+                        "assignment_page",
+                    ),
+                    (
+                        "AI生图",
+                        lambda: AIGenerationPage(
+                            self.repository,
+                            self.resolver,
+                            self.actor,
+                            self.client,
+                            self.secret_store,
+                            self.database,
+                            self.file_store,
+                            self.library_service,
+                            self.worker,
+                            self.secret_store,
+                            auto_load=False,
+                            async_mode=self.lazy_pages,
+                        ),
+                        "ai_generation_page",
+                    ),
+                    (
+                        "普通创作",
+                        lambda: CreatePage(
+                            self.database,
+                            self.file_store,
+                            self.library_service,
+                            self.worker,
+                            self.secret_store,
+                            auto_load=not self.lazy_pages,
+                            async_thumbnails=self.lazy_pages,
+                        ),
+                        "create_page",
+                    ),
+                    (
+                        "批量换装",
+                        lambda: BatchDressPage(
+                            self.database,
+                            self.file_store,
+                            self.library_service,
+                            self.worker,
+                            self.secret_store,
+                            auto_load=not self.lazy_pages,
+                            async_thumbnails=self.lazy_pages,
+                        ),
+                        "batch_dress_page",
+                    ),
+                    (
+                        "历史记录",
+                        lambda: UnifiedHistoryPage(
+                            self.database,
+                            self.library_service,
+                            self.worker,
+                            self.repository,
+                            self.resolver,
+                            self.actor,
+                            auto_load=not self.lazy_pages,
+                            async_mode=self.lazy_pages,
+                        ),
+                        "history_page",
+                    ),
+                    (
+                        "作品库",
+                        lambda: LibraryPage(
+                            self.database,
+                            self.library_service,
+                            auto_load=not self.lazy_pages,
+                        ),
+                        "library_page",
+                    ),
+                ]
+            )
+        if self.actor.role == ROLE_ADMIN:
+            specs.append(
+                (
+                    "管理控制台",
+                    lambda: AdminPage(
+                        self.repository,
+                        self.actor,
+                        auto_load=False,
+                    ),
+                    "admin_page",
+                )
+            )
+        return specs
+
+    def _create_page(self, label: str) -> QWidget:
+        page = self._page_factories[label]()
+        attribute = self._page_attributes.get(label)
+        if attribute:
+            setattr(self, attribute, page)
+        self._wire_page(label, page)
+        return page
+
+    def _wire_page(self, label: str, page: QWidget) -> None:
+        if label == "待分配":
+            page.projects_claimed.connect(self._on_projects_claimed)
+        elif label == "AI生图":
+            page.tasks_enqueued.connect(self._on_batch_enqueued)
+        elif label == "普通创作":
+            page.settings_requested.connect(self.open_settings)
+            page.templates_changed.connect(self._on_templates_changed)
+            page.library_changed.connect(self._on_library_changed)
+        elif label == "批量换装":
+            page.settings_requested.connect(self.open_settings)
+            page.tasks_enqueued.connect(self._on_batch_enqueued)
+            page.templates_changed.connect(self._on_templates_changed)
+        elif label == "历史记录":
+            page.library_changed.connect(self._on_library_changed)
+            page.retry_requested.connect(self._open_retry)
+            page.project_retry_requested.connect(self._open_project_retry)
+            page.project_attempt_cancelled.connect(
+                self._on_project_attempt_cancelled
+            )
+
+    def _on_projects_claimed(self, _count: int) -> None:
+        self._mark_pages_dirty("AI生图", "提交记录", "历史记录")
+
+    def _on_templates_changed(self) -> None:
+        for label in ("普通创作", "批量换装", "AI生图"):
+            page = self._existing_page(label)
+            refresh = getattr(page, "refresh_templates", None)
+            if callable(refresh):
+                refresh()
+
+    def _on_library_changed(self) -> None:
+        self._mark_pages_dirty("作品库")
+
+    def _on_project_attempt_cancelled(self, attempt_id: int) -> None:
+        self._mark_pages_dirty("AI生图", "历史记录")
+        page = self._existing_page("AI生图")
+        remove = getattr(page, "remove_cancelled_attempt", None)
+        if callable(remove):
+            remove(attempt_id)
+
+    def _existing_page(self, label: str) -> QWidget | None:
+        index = self._page_indices.get(label)
+        if index is None:
+            return None
+        page = self.page_specs[index][1]
+        return (
+            None
+            if bool(page.property("lazy_page_placeholder"))
+            else page
+        )
+
+    def _ensure_page(self, label: str) -> QWidget:
+        page = self._existing_page(label)
+        if page is not None:
+            return page
+        index = self._page_indices[label]
+        placeholder = self.stack.widget(index)
+        page = self._create_page(label)
+        self.stack.removeWidget(placeholder)
+        self.stack.insertWidget(index, page)
+        placeholder.deleteLater()
+        self.page_specs[index] = (label, page)
+        self._dirty_pages.add(label)
+        return page
+
+    def _mark_pages_dirty(self, *labels: str) -> None:
+        for label in labels:
+            if label in self._page_indices:
+                self._dirty_pages.add(label)
 
     def _build_sidebar(self) -> QWidget:
         sidebar = QFrame()
@@ -401,17 +534,25 @@ class MainWindow(QMainWindow):
     def _nav_changed(self, index: int) -> None:
         if not 0 <= index < len(self.page_specs):
             return
-        self.stack.setCurrentIndex(index)
+        label = self.page_specs[index][0]
+        created = False
+        if self.lazy_pages:
+            created = self._existing_page(label) is None
+            page = self._ensure_page(label)
+            self.stack.setCurrentWidget(page)
+        else:
+            self.stack.setCurrentIndex(index)
+            page = self.page_specs[index][1]
         if not self._initial_data_loaded:
             return
-        page = self.page_specs[index][1]
-        self._refresh_page(page)
+        if not self.lazy_pages or created or label in self._dirty_pages:
+            self._refresh_page(page)
+            self._dirty_pages.discard(label)
 
     def _refresh_page(self, page: QWidget) -> None:
         refresh = getattr(page, "refresh", None)
         if callable(refresh):
             self.statusBar().showMessage("正在加载数据…")
-            QApplication.processEvents()
             refresh()
             self.statusBar().showMessage(self._base_status_message)
 
@@ -426,8 +567,14 @@ class MainWindow(QMainWindow):
         if self._initial_data_loaded:
             return
         self._initial_data_loaded = True
-        page = self.page_specs[self.nav_list.currentRow()][1]
+        label = self.page_specs[self.nav_list.currentRow()][0]
+        page = (
+            self._ensure_page(label)
+            if self.lazy_pages
+            else self.page_specs[self.nav_list.currentRow()][1]
+        )
         self._refresh_page(page)
+        self._dirty_pages.discard(label)
 
     def open_settings(self) -> None:
         dialog = SettingsDialog(self.database, self)
@@ -438,27 +585,43 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             f"任务 #{task_id}：{label} · 数据目录：{self.paths.root}", 8000
         )
+        self._mark_pages_dirty(
+            "提交记录",
+            "AI生图",
+            "历史记录",
+            "作品库",
+        )
 
     def _on_batch_enqueued(self, count: int) -> None:
         self.statusBar().showMessage(
             f"批量换装已加入 {count} 个排队任务 · 数据目录：{self.paths.root}",
             8000,
         )
+        self._mark_pages_dirty(
+            "提交记录",
+            "AI生图",
+            "历史记录",
+            "作品库",
+        )
 
     def _open_retry(self, task_id: int) -> None:
-        if not hasattr(self, "create_page"):
-            return
         task = self.database.get_task(task_id)
         if task and task["mode"] in (MODE_DRESS_UP, MODE_FREE_COMPOSE):
-            self._select_page(self.batch_dress_page)
-            self.batch_dress_page.prepare_retry(task_id)
+            if "批量换装" not in self._page_indices:
+                return
+            page = self._ensure_page("批量换装")
+            self._select_page(page)
+            page.prepare_retry(task_id)
             self.statusBar().showMessage(
                 f"已载入批量换装任务 #{task_id}，修改后重新生成",
                 8000,
             )
             return
-        self._select_page(self.create_page)
-        self.create_page.prepare_retry(task_id)
+        if "普通创作" not in self._page_indices:
+            return
+        page = self._ensure_page("普通创作")
+        self._select_page(page)
+        page.prepare_retry(task_id)
         self.statusBar().showMessage(
             f"已载入任务 #{task_id}，修改参数后点击生成",
             8000,
@@ -469,25 +632,23 @@ class MainWindow(QMainWindow):
         task_id: int,
         attempt_id: int,
     ) -> None:
-        if not any(
-            page is self.ai_generation_page
-            for _, page in self.page_specs
-        ):
+        if "AI生图" not in self._page_indices:
             QMessageBox.warning(
                 self,
                 "没有AI生图权限",
                 "当前账号没有AI生图菜单权限，无法载入项目重试。",
             )
             return
+        page = self._ensure_page("AI生图")
         try:
-            self.ai_generation_page.prepare_history_retry(
+            page.prepare_history_retry(
                 task_id,
                 attempt_id,
             )
         except Exception as exc:
             QMessageBox.warning(self, "载入失败", str(exc))
             return
-        self._select_page(self.ai_generation_page)
+        self._select_page(page)
         self.statusBar().showMessage(
             "已载入项目子任务参数，请确认后手动加入生成队列",
             8000,
@@ -500,9 +661,10 @@ class MainWindow(QMainWindow):
                 return
 
     def closeEvent(self, event) -> None:
+        ai_page = self._existing_page("AI生图")
         project_running = bool(
-            hasattr(self, "ai_generation_page")
-            and self.ai_generation_page.is_generating()
+            ai_page is not None
+            and ai_page.is_generating()
         )
         if self.database.has_running_tasks() or project_running:
             answer = QMessageBox.warning(

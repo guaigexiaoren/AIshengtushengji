@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import tempfile
+import time
 import unittest
 from datetime import date
 from pathlib import Path
@@ -18,6 +19,8 @@ if HAS_PYSIDE:
     from yixin.collaboration.shared_paths import SharedPathResolver
     from yixin.collaboration.types import ROLE_ADMIN, AuthUser
     from yixin.ui.async_thumbnails import ThumbnailLoader
+    from yixin.ui.async_queries import AsyncQueryRunner
+    from yixin.ui.widgets import ImageStrip
     from yixin.ui.task_create_page import TaskCreatePage
 
 
@@ -109,6 +112,108 @@ class AsyncThumbnailTests(unittest.TestCase):
                 QTest.qWait(10)
             self.assertTrue(loaded)
             page.deleteLater()
+
+    def test_new_task_page_scans_network_folder_in_background(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            today = date.today()
+            product = (
+                root
+                / "内部项目"
+                / "春季项目"
+                / f"{today.month}.{today.day}"
+                / "ASYNC"
+            )
+            (product / "衣服图").mkdir(parents=True)
+            (product / "模特图").mkdir(parents=True)
+            Image.new("RGB", (30, 40), "red").save(
+                product / "衣服图" / "衣服1.png"
+            )
+            Image.new("RGB", (30, 40), "blue").save(
+                product / "模特图" / "模特1.png"
+            )
+            page = TaskCreatePage(
+                FakeCentralRepository(),
+                SharedPathResolver(root),
+                AuthUser(
+                    1,
+                    "admin",
+                    "系统管理员",
+                    ROLE_ADMIN,
+                ),
+                auto_load=False,
+                async_mode=True,
+            )
+            page.refresh()
+            loaded = False
+            for _ in range(150):
+                self.app.processEvents()
+                loaded = page.product_table.rowCount() == 1
+                if loaded:
+                    break
+                QTest.qWait(10)
+            self.assertTrue(loaded)
+            self.assertEqual(page.product_table.item(0, 2).text(), "ASYNC")
+            thumbnails_loaded = False
+            for _ in range(150):
+                self.app.processEvents()
+                thumbnails_loaded = (
+                    page.garment_list.count() == 1
+                    and page.model_list.count() == 1
+                    and not page.garment_list.item(0).icon().isNull()
+                    and not page.model_list.item(0).icon().isNull()
+                )
+                if thumbnails_loaded:
+                    break
+                QTest.qWait(10)
+            self.assertTrue(thumbnails_loaded)
+            page.deleteLater()
+
+    def test_image_strip_adds_items_before_thumbnail_is_ready(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            image_path = Path(temp) / "strip.png"
+            Image.new("RGB", (600, 800), "green").save(image_path)
+            strip = ImageStrip(icon_size=72)
+            strip.set_images_async(
+                [(image_path, "衣服 1", image_path)]
+            )
+            self.assertEqual(strip.count(), 1)
+            loaded = False
+            for _ in range(100):
+                self.app.processEvents()
+                loaded = not strip.item(0).icon().isNull()
+                if loaded:
+                    break
+                QTest.qWait(10)
+            self.assertTrue(loaded)
+            strip.deleteLater()
+
+    def test_async_query_runner_returns_latest_request_result(
+        self,
+    ) -> None:
+        runner = AsyncQueryRunner()
+        results = []
+        runner.succeeded.connect(
+            lambda request_id, result: results.append(
+                (request_id, result)
+            )
+        )
+        first = runner.submit(lambda: (time.sleep(0.06), "old")[1])
+        second = runner.submit(lambda: "new")
+        for _ in range(100):
+            self.app.processEvents()
+            if len(results) == 2:
+                break
+            QTest.qWait(10)
+        self.assertEqual(
+            {request_id for request_id, _ in results},
+            {first, second},
+        )
+        self.assertIn((second, "new"), results)
 
 
 if __name__ == "__main__":

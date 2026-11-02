@@ -405,6 +405,8 @@ class ImageStrip(QListWidget):
         self.setIconSize(QSize(icon_size, icon_size))
         self.setGridSize(QSize(icon_size + 18, icon_size + 34))
         self.setFixedHeight(icon_size + 54)
+        self._thumbnail_contexts: dict[int, QListWidgetItem] = {}
+        self._thumbnail_loader = None
 
     def set_images(self, items: list[tuple[str | Path, str, object]]) -> None:
         self.clear()
@@ -418,6 +420,62 @@ class ImageStrip(QListWidget):
             self.addItem(item)
         if self.count():
             self.setCurrentRow(0)
+
+    def set_images_async(
+        self,
+        items: list[tuple[str | Path, str, object]],
+    ) -> None:
+        if self._thumbnail_loader is None:
+            from .async_thumbnails import get_thumbnail_loader
+
+            self._thumbnail_loader = get_thumbnail_loader()
+            self._thumbnail_loader.thumbnail_ready.connect(
+                self._thumbnail_ready
+            )
+            self._thumbnail_loader.thumbnail_failed.connect(
+                self._thumbnail_failed
+            )
+        self.clear()
+        self._thumbnail_contexts.clear()
+        for path, label, data in items:
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, data)
+            item.setToolTip(str(path))
+            self.addItem(item)
+            request = self._thumbnail_loader.request_thumbnail(
+                path,
+                self.iconSize(),
+            )
+            self._thumbnail_contexts[request.request_id] = item
+        if self.count():
+            self.setCurrentRow(0)
+
+    def _thumbnail_ready(
+        self,
+        request_id: int,
+        _path: str,
+        image: QImage,
+    ) -> None:
+        item = self._thumbnail_contexts.pop(request_id, None)
+        if item is None:
+            return
+        pixmap = QPixmap.fromImage(
+            image.scaled(
+                self.iconSize(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        if not pixmap.isNull():
+            item.setIcon(QIcon(pixmap))
+
+    def _thumbnail_failed(
+        self,
+        request_id: int,
+        _path: str,
+        _message: str,
+    ) -> None:
+        self._thumbnail_contexts.pop(request_id, None)
 
 
 class ReorderableImageStrip(ImageStrip):

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PySide6.QtCore import (
+    QCoreApplication,
     QObject,
     QRunnable,
     QSize,
@@ -149,5 +150,7 @@ _thumbnail_loader: ThumbnailLoader | None = None
 def get_thumbnail_loader() -> ThumbnailLoader:
     global _thumbnail_loader
     if _thumbnail_loader is None:
-        _thumbnail_loader = ThumbnailLoader()
+        _thumbnail_loader = ThumbnailLoader(
+            QCoreApplication.instance()
+        )
     return _thumbnail_loader

@@ -6,7 +6,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QMimeData, QPoint, QSize, QTimer, Qt, Signal
-from PySide6.QtGui import QDrag, QIcon
+from PySide6.QtGui import QDrag, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -56,6 +56,7 @@ from ..storage import FileStore, ImageValidationError
 from ..worker import TaskWorker
 from .crop import CropDialog
 from .dialogs import LibraryPickerDialog, TemplateManagerDialog
+from .async_thumbnails import get_thumbnail_loader
 from .widgets import (
     load_scaled_pixmap,
     scan_image_inputs,
@@ -146,9 +147,16 @@ class BatchAssetList(QListWidget):
     files_dropped = Signal(object)
     garment_dropped = Signal(str, int)
 
-    def __init__(self, role: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        role: str,
+        parent: QWidget | None = None,
+        *,
+        async_thumbnails: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.role = role
+        self.async_thumbnails = async_thumbnails
         self.setObjectName("ImageStrip")
         self.setViewMode(QListView.ViewMode.IconMode)
         self.setResizeMode(QListView.ResizeMode.Adjust)
@@ -166,6 +174,19 @@ class BatchAssetList(QListWidget):
         self._drag_start: QPoint | None = None
         self._drag_row: int | None = None
         self._drag_active = False
+        self._thumbnail_contexts: dict[int, QListWidgetItem] = {}
+        self._thumbnail_loader = (
+            get_thumbnail_loader()
+            if self.async_thumbnails
+            else None
+        )
+        if self._thumbnail_loader is not None:
+            self._thumbnail_loader.thumbnail_ready.connect(
+                self._thumbnail_ready
+            )
+            self._thumbnail_loader.thumbnail_failed.connect(
+                self._thumbnail_failed
+            )
         self.viewport().installEventFilter(self)
         self.installEventFilter(self)
 
@@ -179,22 +200,57 @@ class BatchAssetList(QListWidget):
 
         self.blockSignals(True)
         self.clear()
+        self._thumbnail_contexts.clear()
         for index, image in enumerate(assets):
             item = QListWidgetItem(
                 f"{ROLE_LABELS[self.role]} {index + 1}\n{image.original_name}"
             )
-            pixmap = load_scaled_pixmap(image.path, self.iconSize())
-            if not pixmap.isNull():
-                item.setIcon(QIcon(pixmap))
             item.setData(Qt.ItemDataRole.UserRole, image)
             item.setToolTip(
                 f"{ROLE_LABELS[self.role]} {index + 1}\n"
                 f"{image.original_name}\n{image.path}"
             )
             self.addItem(item)
+            if self.async_thumbnails:
+                request = self._thumbnail_loader.request_thumbnail(
+                    image.path,
+                    self.iconSize(),
+                )
+                self._thumbnail_contexts[request.request_id] = item
+            else:
+                pixmap = load_scaled_pixmap(image.path, self.iconSize())
+                if not pixmap.isNull():
+                    item.setIcon(QIcon(pixmap))
             if selected_hash and image.content_hash == selected_hash:
                 self.setCurrentItem(item)
         self.blockSignals(False)
+
+    def _thumbnail_ready(
+        self,
+        request_id: int,
+        _path: str,
+        image,
+    ) -> None:
+        item = self._thumbnail_contexts.pop(request_id, None)
+        if item is None:
+            return
+        pixmap = QPixmap.fromImage(
+            image.scaled(
+                self.iconSize(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        if not pixmap.isNull():
+            item.setIcon(QIcon(pixmap))
+
+    def _thumbnail_failed(
+        self,
+        request_id: int,
+        _path: str,
+        _message: str,
+    ) -> None:
+        self._thumbnail_contexts.pop(request_id, None)
 
     def mousePressEvent(self, event) -> None:
         super().mousePressEvent(event)
@@ -753,6 +809,8 @@ class BatchDressPage(QWidget):
         allow_pair_skip: bool = False,
         allow_bottom_skip: bool = False,
         generate_button_text: str = "生成全部配对并加入队列",
+        auto_load: bool = True,
+        async_thumbnails: bool = False,
     ) -> None:
         super().__init__(parent)
         self.database = database
@@ -769,6 +827,7 @@ class BatchDressPage(QWidget):
         self._pair_layout_pending = False
         self._pair_panel_height = 0
         self.allow_pair_skip = allow_pair_skip
+        self.async_thumbnails = async_thumbnails
         self.allow_bottom_skip = allow_bottom_skip
         self.generate_button_text = generate_button_text
         self.selected_pair_key = None
@@ -806,7 +865,8 @@ class BatchDressPage(QWidget):
         outer.addWidget(self.pair_group)
         self.submit_card = self._build_submit()
         outer.addWidget(self.submit_card)
-        self.refresh_templates()
+        if auto_load:
+            self.refresh_templates()
         QTimer.singleShot(0, self._update_pair_panel_height)
 
     def resizeEvent(self, event) -> None:
@@ -934,6 +994,9 @@ class BatchDressPage(QWidget):
         super().showEvent(event)
         self.refresh_templates()
 
+    def refresh(self) -> None:
+        self.refresh_templates()
+
     def refresh_templates(self) -> None:
         if not hasattr(self, "template_combo"):
             return
@@ -1054,7 +1117,10 @@ class BatchDressPage(QWidget):
         buttons.addWidget(clear)
         layout.addLayout(buttons)
 
-        asset_list = BatchAssetList(role)
+        asset_list = BatchAssetList(
+            role,
+            async_thumbnails=self.async_thumbnails,
+        )
         layout.addWidget(asset_list, 1)
         count_label = QLabel(f"已选择 0 / {MAX_BATCH_ASSETS} 张")
         count_label.setStyleSheet("color:#6d7a91;")
@@ -1749,6 +1815,7 @@ class BatchDressPage(QWidget):
         if not self.pairs:
             self.selected_pair_key = None
             self.pair_cards.clear()
+            self.pair_host.setMinimumHeight(0)
             self._update_bottom_skip_button()
             empty = QLabel(
                 "还没有配对。选择服装后点击人物，或把左侧服装缩略图拖到右侧人物上。"
@@ -1787,7 +1854,14 @@ class BatchDressPage(QWidget):
             0,
             lambda: scrollbar.setValue(min(scroll_value, scrollbar.maximum())),
         )
+        QTimer.singleShot(0, self._update_pair_host_height)
         self._update_bottom_skip_button()
+
+    def _update_pair_host_height(self) -> None:
+        self.pair_grid.activate()
+        self.pair_host.setMinimumHeight(
+            self.pair_grid.sizeHint().height()
+        )
 
     def _enqueue_all(self) -> None:
         if not self.secret_store.load():

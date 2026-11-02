@@ -13,8 +13,10 @@ from yixin.collaboration.types import (
     ProjectDraft,
     ATTEMPT_QUEUED,
     TASK_APPROVED,
+    TASK_AVAILABLE,
     TASK_CLAIMED,
 )
+from yixin.paging import PageRequest, TaskQuery
 
 
 MYSQL_ENV = {
@@ -216,6 +218,32 @@ class MySQLIntegrationTests(unittest.TestCase):
             self.assertFalse(repository.get_project(project_id).is_urgent)
             repository.set_project_urgent(project_id, operator, True)
             project = repository.get_project(project_id)
+            board_page = repository.list_board_projects_page(
+                operator,
+                (TASK_AVAILABLE, TASK_CLAIMED),
+                TaskQuery(keyword="集成货号"),
+                PageRequest(page=1, page_size=100),
+            )
+            self.assertEqual(board_page.total, 1)
+            self.assertEqual(board_page.items[0].id, project_id)
+            self.assertIn(
+                "集成项目",
+                repository.list_access_project_names(operator),
+            )
+            task_page = repository.list_board_tasks_for_project_page(
+                project_id,
+                operator,
+                (TASK_AVAILABLE, TASK_CLAIMED),
+                TaskQuery(keyword="集成"),
+                PageRequest(page=1, page_size=100),
+            )
+            self.assertEqual(task_page.total, 6)
+            assignment_page = repository.list_assignment_projects_page(
+                ai_one,
+                TaskQuery(keyword="集成货号"),
+                PageRequest(page=1, page_size=100),
+            )
+            self.assertEqual(assignment_page.total, 1)
             self.assertRegex(
                 project.project_code,
                 r"^集成运营-集成货号-\d{3,}$",

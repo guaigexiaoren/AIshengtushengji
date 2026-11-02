@@ -60,6 +60,7 @@ from ..collaboration.types import (
 )
 from ..storage import SUPPORTED_IMAGE_SUFFIXES, atomic_copy_file, image_metadata
 from .async_thumbnails import ThumbnailLoader, get_thumbnail_loader
+from .async_queries import get_query_runner
 from .widgets import load_scaled_pixmap, scan_image_inputs
 
 
@@ -362,11 +363,17 @@ class TaskCreatePage(QWidget):
         parent: QWidget | None = None,
         *,
         auto_load: bool = True,
+        async_mode: bool = False,
     ) -> None:
         super().__init__(parent)
         self.repository = repository
         self.resolver = resolver
         self.actor = actor
+        self.async_mode = async_mode
+        self.query_runner = (
+            get_query_runner() if async_mode else None
+        )
+        self._active_scan_request = -1
         self.states: dict[str, ProductDraftState] = {}
         self.current_state: ProductDraftState | None = None
         self.account_directory: AccountDirectory | None = None
@@ -385,6 +392,9 @@ class TaskCreatePage(QWidget):
             self._asset_thumbnail_failed
         )
         self._build()
+        if self.query_runner is not None:
+            self.query_runner.succeeded.connect(self._query_succeeded)
+            self.query_runner.failed.connect(self._query_failed)
         if auto_load:
             self.refresh()
 
@@ -657,6 +667,27 @@ class TaskCreatePage(QWidget):
     def _scan_directory(self) -> None:
         if self.account_directory is None:
             return
+        if self.async_mode:
+            account_directory = self.account_directory
+            self.scan_summary.setText("正在扫描共享盘货号目录…")
+            self.create_button.setEnabled(False)
+
+            def load():
+                products = scan_product_folders(account_directory.path)
+                existing = {
+                    product.product_code: (
+                        self.repository.find_tasks_by_product(
+                            self.actor.id,
+                            account_directory.source_date,
+                            product.product_code,
+                        )
+                    )
+                    for product in products
+                }
+                return products, existing
+
+            self._active_scan_request = self.query_runner.submit(load)
+            return
         try:
             products = scan_product_folders(self.account_directory.path)
         except Exception as exc:
@@ -678,6 +709,45 @@ class TaskCreatePage(QWidget):
                 existing_tasks=existing,
             )
         self._refresh_product_table()
+        self._finish_scan_selection()
+
+    def _query_succeeded(self, request_id: int, result) -> None:
+        if (
+            not self.async_mode
+            or request_id != self._active_scan_request
+        ):
+            return
+        products, existing = result
+        self.states = {}
+        for product in products:
+            self.states[product.product_code] = ProductDraftState(
+                product_code=product.product_code,
+                path=product.path,
+                garments=list(product.garments),
+                models=list(product.models),
+                errors=list(product.errors),
+                existing_tasks=list(
+                    existing.get(product.product_code, [])
+                ),
+            )
+        self._refresh_product_table()
+        self._finish_scan_selection()
+
+    def _query_failed(self, request_id: int, message: str) -> None:
+        if (
+            not self.async_mode
+            or request_id != self._active_scan_request
+        ):
+            return
+        self.scan_summary.setText("共享盘扫描失败")
+        self.create_button.setEnabled(False)
+        QMessageBox.warning(self, "扫描失败", message)
+
+    def _finish_scan_selection(self) -> None:
+        self.create_button.setEnabled(
+            self.actor.role in (ROLE_OPERATIONS, ROLE_ADMIN)
+            and bool(self.states)
+        )
         if self.product_table.rowCount():
             self.product_table.selectRow(0)
         else:

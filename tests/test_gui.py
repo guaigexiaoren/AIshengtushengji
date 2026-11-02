@@ -303,7 +303,12 @@ class GuiFlowTests(unittest.TestCase):
             [image.original_name for image in page.reference_images],
             ["2.png", "10.png"],
         )
-        self.assertEqual(AppSettings(self.database).input_folder(INPUT_CREATE_REFERENCE), root)
+        self.assertEqual(
+            AppSettings(self.database).input_folder(
+                INPUT_CREATE_REFERENCE
+            ),
+            root.resolve(),
+        )
         warning.assert_called_once()
 
     def test_reference_input_paths_are_remembered_per_scope(self) -> None:
@@ -321,8 +326,14 @@ class GuiFlowTests(unittest.TestCase):
             return_value=([str(image)], ""),
         ) as dialog:
             page._add_local_references()
-        self.assertEqual(dialog.call_args.args[2], str(create_folder))
-        self.assertEqual(settings.input_folder(INPUT_CREATE_REFERENCE), create_folder)
+        self.assertEqual(
+            Path(dialog.call_args.args[2]).resolve(),
+            create_folder.resolve(),
+        )
+        self.assertEqual(
+            settings.input_folder(INPUT_CREATE_REFERENCE),
+            create_folder.resolve(),
+        )
 
         settings.set_input_folder(INPUT_BATCH_GARMENT, garment_folder)
         settings.set_input_folder(INPUT_BATCH_PERSON, person_folder)
@@ -338,18 +349,36 @@ class GuiFlowTests(unittest.TestCase):
         ) as dialog:
             batch._add_image_files("garment")
             batch._add_image_files("person")
-        self.assertEqual(dialog.call_args_list[0].args[2], str(garment_folder))
-        self.assertEqual(dialog.call_args_list[1].args[2], str(person_folder))
-        self.assertEqual(settings.input_folder(INPUT_BATCH_GARMENT), garment_folder)
-        self.assertEqual(settings.input_folder(INPUT_BATCH_PERSON), person_folder)
+        self.assertEqual(
+            Path(dialog.call_args_list[0].args[2]).resolve(),
+            garment_folder.resolve(),
+        )
+        self.assertEqual(
+            Path(dialog.call_args_list[1].args[2]).resolve(),
+            person_folder.resolve(),
+        )
+        self.assertEqual(
+            settings.input_folder(INPUT_BATCH_GARMENT),
+            garment_folder.resolve(),
+        )
+        self.assertEqual(
+            settings.input_folder(INPUT_BATCH_PERSON),
+            person_folder.resolve(),
+        )
 
         with patch(
             "yixin.ui.create_page.QFileDialog.getExistingDirectory",
             return_value="",
         ) as folder_dialog:
             page._add_local_reference_folder()
-        self.assertEqual(folder_dialog.call_args.args[2], str(create_folder))
-        self.assertEqual(settings.input_folder(INPUT_CREATE_REFERENCE), create_folder)
+        self.assertEqual(
+            Path(folder_dialog.call_args.args[2]).resolve(),
+            create_folder.resolve(),
+        )
+        self.assertEqual(
+            settings.input_folder(INPUT_CREATE_REFERENCE),
+            create_folder.resolve(),
+        )
 
         dragged_folder = Path(self.temp.name) / "拖入上次目录"
         dragged_folder.mkdir()
@@ -358,7 +387,7 @@ class GuiFlowTests(unittest.TestCase):
             page._on_reference_files_dropped([dragged_folder])
         self.assertEqual(
             settings.input_folder(INPUT_CREATE_REFERENCE),
-            dragged_folder,
+            dragged_folder.resolve(),
         )
 
     def test_queue_is_below_generate_and_inside_scroll_content(self) -> None:
@@ -432,15 +461,22 @@ class GuiFlowTests(unittest.TestCase):
 
         history = self.window.history_page
         history.show_task(task["id"])
-        history_labels = [
-            history.asset_strip.item(index).text()
-            for index in range(history.asset_strip.count())
+        reference_labels = [
+            history.reference_strip.item(index).text()
+            for index in range(history.reference_strip.count())
         ]
-        self.assertEqual(history_labels, labels)
-        history.asset_strip.setCurrentRow(0)
+        result_labels = [
+            history.result_gallery.list_widget.item(index).text()
+            for index in range(history.result_gallery.list_widget.count())
+        ]
+        self.assertEqual(reference_labels, ["参考 1", "参考 2"])
+        self.assertEqual(result_labels, ["结果 1", "结果 2"])
+        reference_item = history.reference_strip.item(0)
+        history.reference_strip.itemClicked.emit(reference_item)
         self.assertFalse(history.save_local_button.isEnabled())
         self.assertFalse(history.save_library_button.isEnabled())
-        history.asset_strip.setCurrentRow(2)
+        result_strip = history.result_gallery.list_widget
+        result_strip.itemClicked.emit(result_strip.item(0))
         self.assertTrue(history.save_local_button.isEnabled())
         self.assertTrue(history.save_library_button.isEnabled())
 
@@ -816,9 +852,7 @@ class GuiFlowTests(unittest.TestCase):
         history = self.window.history_page
         history.refresh()
         history.show_task(task_id)
-        self.assertIn("5分12秒", history.elapsed_label.text())
-        row = history._find_task_row(task_id)
-        self.assertEqual(history.table.item(row, 3).text(), "5分12秒")
+        self.assertIn("总耗时：5分12秒", history.detail_meta.text())
 
     def test_history_error_is_merged_into_hidden_top_label(self) -> None:
         success_id = self.database.create_task(
@@ -844,19 +878,11 @@ class GuiFlowTests(unittest.TestCase):
             error_message="服务端错误：参数无效",
         )
         history = self.window.history_page
-        self.assertFalse(hasattr(history, "error_view"))
 
         history.show_task(success_id)
-        self.assertTrue(history.error_label.isHidden())
+        self.assertNotIn("错误：", history.detail_meta.text())
         history.show_task(failure_id)
-        self.assertFalse(history.error_label.isHidden())
-        self.assertIn("服务端错误：参数无效", history.error_label.text())
-        self.assertEqual(
-            history.error_label.textInteractionFlags()
-            & Qt.TextInteractionFlag.TextSelectableByMouse,
-            Qt.TextInteractionFlag.TextSelectableByMouse,
-        )
-        self.assertTrue(history.error_label.wordWrap())
+        self.assertIn("错误：服务端错误：参数无效", history.detail_meta.text())
 
     def test_crop_canvas_returns_pixel_box(self) -> None:
         source = make_image(Path(self.temp.name) / "canvas-crop.png")

@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QTextEdit,
@@ -36,11 +37,13 @@ from ..constants import (
 from ..database import Database
 from ..library import LibraryService
 from ..model_router import choose_model
+from ..paging import PageRequest, TaskQuery
 from ..security import SecretStore
 from ..settings import AUTO_STRATEGY_QUALITY
 from ..storage import FileStore
 from ..worker import TaskWorker
 from .batch_dress_page import BatchDressPage, DressTaskGroup
+from .async_queries import get_query_runner
 
 
 class AIGenerationPage(BatchDressPage):
@@ -61,6 +64,7 @@ class AIGenerationPage(BatchDressPage):
         parent: QWidget | None = None,
         *,
         auto_load: bool = True,
+        async_mode: bool = False,
     ) -> None:
         self.repository = repository
         self.resolver = resolver
@@ -76,6 +80,11 @@ class AIGenerationPage(BatchDressPage):
         self.api_providers = []
         self.project_progress: dict[int, tuple[int, int]] = {}
         self.force_direct_retry_task_id: int | None = None
+        self.async_mode = async_mode
+        self.query_runner = (
+            get_query_runner() if async_mode else None
+        )
+        self._active_task_request = -1
         super().__init__(
             database,
             file_store,
@@ -86,12 +95,25 @@ class AIGenerationPage(BatchDressPage):
             allow_pair_skip=True,
             allow_bottom_skip=True,
             generate_button_text="加入队列",
+            auto_load=False,
+            async_thumbnails=async_mode,
         )
         self.task_selector.currentIndexChanged.connect(
             self._task_changed
         )
         self.task_refresh_button.clicked.connect(self.refresh)
-        self._refresh_providers()
+        self._task_search_timer = QTimer(self)
+        self._task_search_timer.setSingleShot(True)
+        self._task_search_timer.setInterval(350)
+        self._task_search_timer.timeout.connect(
+            self._request_generation_tasks
+        )
+        self.task_search_edit.textChanged.connect(
+            lambda: self._task_search_timer.start()
+        )
+        if self.query_runner is not None:
+            self.query_runner.succeeded.connect(self._query_succeeded)
+            self.query_runner.failed.connect(self._query_failed)
         self.queue_timer = QTimer(self)
         self.queue_timer.setInterval(1200)
         self.queue_timer.timeout.connect(self._refresh_queue_state)
@@ -111,6 +133,10 @@ class AIGenerationPage(BatchDressPage):
         title_row.addWidget(title)
         title_row.addStretch(1)
         title_row.addWidget(QLabel("子任务"))
+        self.task_search_edit = QLineEdit()
+        self.task_search_edit.setPlaceholderText("搜索任务、货号或项目")
+        self.task_search_edit.setFixedWidth(180)
+        title_row.addWidget(self.task_search_edit)
         self.task_selector = QComboBox()
         self.task_selector.setMinimumWidth(420)
         title_row.addWidget(self.task_selector)
@@ -153,13 +179,17 @@ class AIGenerationPage(BatchDressPage):
         return card
 
     def _refresh_providers(self) -> None:
-        selected = self.provider_combo.currentData()
         try:
-            self.api_providers = self.repository.list_api_providers(
+            providers = self.repository.list_api_providers(
                 include_disabled=False
             )
         except Exception:
-            self.api_providers = []
+            providers = []
+        self._apply_providers(providers)
+
+    def _apply_providers(self, providers) -> None:
+        selected = self.provider_combo.currentData()
+        self.api_providers = list(providers)
         self.provider_combo.blockSignals(True)
         self.provider_combo.clear()
         self.provider_combo.addItem("自动选择", "")
@@ -173,9 +203,13 @@ class AIGenerationPage(BatchDressPage):
         self.provider_combo.blockSignals(False)
 
     def refresh(self) -> None:
-        self._refresh_providers()
+        if not self.async_mode:
+            self._refresh_providers()
         self.refresh_templates()
-        self._refresh_generation_tasks()
+        if self.async_mode:
+            self._request_generation_tasks()
+        else:
+            self._refresh_generation_tasks()
         self._resume_queued_jobs()
         self._pump_queue()
 
@@ -185,6 +219,9 @@ class AIGenerationPage(BatchDressPage):
         self._pump_queue()
 
     def _refresh_generation_tasks(self) -> None:
+        if self.async_mode:
+            self._request_generation_tasks()
+            return
         try:
             tasks = self.repository.list_ai_generation_tasks(
                 self.actor
@@ -227,6 +264,99 @@ class AIGenerationPage(BatchDressPage):
             else (1 if tasks else 0)
         )
         self.task_selector.setCurrentIndex(max(0, target))
+        self.task_selector.blockSignals(False)
+        if target < 0:
+            self._clear_generation_editor()
+        elif current_id is None:
+            self._task_changed()
+        else:
+            self.current_task = self._generation_tasks_by_id.get(
+                current_id
+            )
+
+    def _request_generation_tasks(self) -> None:
+        page = PageRequest(page=1, page_size=100)
+        query = TaskQuery(
+            keyword=self.task_search_edit.text().strip()
+        )
+        self.task_status_label.setText("正在加载子任务…")
+        self.task_selector.setEnabled(False)
+
+        def load():
+            result = self.repository.list_ai_generation_tasks_page(
+                self.actor,
+                query,
+                page,
+            )
+            project_ids = tuple(
+                task.project_id for task in result.items
+            )
+            try:
+                progress = self.repository.project_progress_counts(
+                    project_ids
+                )
+            except Exception:
+                progress = {}
+            providers = list(self.api_providers)
+            if not providers:
+                try:
+                    providers = self.repository.list_api_providers(
+                        include_disabled=False
+                    )
+                except Exception:
+                    providers = []
+            return result.items, progress, providers
+
+        self._active_task_request = self.query_runner.submit(load)
+
+    def _query_succeeded(self, request_id: int, result) -> None:
+        if not self.async_mode or request_id != self._active_task_request:
+            return
+        tasks, progress, providers = result
+        self._apply_providers(providers)
+        self._render_generation_tasks(tasks, progress)
+
+    def _query_failed(self, request_id: int, message: str) -> None:
+        if not self.async_mode or request_id != self._active_task_request:
+            return
+        self.task_selector.setEnabled(True)
+        self.task_status_label.setText("子任务加载失败")
+        QMessageBox.warning(self, "读取AI生图任务失败", message)
+
+    def _render_generation_tasks(
+        self,
+        tasks: list[ProjectTask],
+        progress: dict[int, tuple[int, int]],
+    ) -> None:
+        current_id = self.task_selector.currentData()
+        self.generation_tasks = list(tasks)
+        self.project_progress = progress
+        self._generation_tasks_by_id = {
+            task.id: task for task in tasks
+        }
+        self.task_selector.blockSignals(True)
+        self.task_selector.clear()
+        self.task_selector.addItem("请选择子任务", None)
+        for task in tasks:
+            completed, total = self.project_progress.get(
+                task.project_id,
+                (0, 0),
+            )
+            label = (
+                f"{task.task_code} · {task.product_code or task.project_name}"
+                f" · 主任务 {completed}/{total}"
+                f" · {TASK_STATUS_LABELS.get(task.status, task.status)}"
+            )
+            if task.parent_task_id is not None:
+                label += " · 失败重试"
+            self.task_selector.addItem(label, task.id)
+        target = (
+            self.task_selector.findData(current_id)
+            if current_id is not None
+            else (1 if tasks else 0)
+        )
+        self.task_selector.setCurrentIndex(max(0, target))
+        self.task_selector.setEnabled(True)
         self.task_selector.blockSignals(False)
         if target < 0:
             self._clear_generation_editor()

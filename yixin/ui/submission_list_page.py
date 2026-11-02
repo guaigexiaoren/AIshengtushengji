@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
@@ -36,9 +36,12 @@ from ..collaboration.types import (
     ProjectTask,
 )
 from ..time_utils import utc_naive_to_local
+from ..paging import PageRequest, PageResult, TaskQuery
+from .async_queries import get_query_runner
 from .date_filter import OptionalDateEdit
 from .dialogs import CompareDialog
 from .image_preview import DualImagePreview
+from .pagination_bar import PaginationBar
 from .subtask_source_dialog import SubtaskSourceDialog
 
 
@@ -81,12 +84,31 @@ class SubmissionListPage(QWidget):
         parent: QWidget | None = None,
         *,
         auto_load: bool = True,
+        async_mode: bool = False,
     ) -> None:
         super().__init__(parent)
         self.repository = repository
         self.resolver = resolver
         self.actor = actor
         self.view_mode = view_mode
+        self.async_mode = async_mode
+        self.query_runner = (
+            get_query_runner() if self.async_mode else None
+        )
+        self._active_result_request = -1
+        self._active_result_task_id: int | None = None
+        self._project_page = PageRequest()
+        self._task_page = PageRequest()
+        self._project_total = 0
+        self._task_total = 0
+        self._project_sort_field = "created_at"
+        self._project_sort_direction = "desc"
+        self._task_sort_field = "created_at"
+        self._task_sort_direction = "desc"
+        self._keyword_timer = QTimer(self)
+        self._keyword_timer.setSingleShot(True)
+        self._keyword_timer.setInterval(350)
+        self._keyword_timer.timeout.connect(self._async_filter_requested)
         self.projects: list[ProjectRecord] = []
         self._projects_all: list[ProjectRecord] = []
         self.tasks: list[ProjectTask] = []
@@ -94,6 +116,9 @@ class SubmissionListPage(QWidget):
         self._projects_by_id: dict[int, ProjectRecord] = {}
         self._tasks_by_id: dict[int, ProjectTask] = {}
         self._build()
+        if self.query_runner is not None:
+            self.query_runner.succeeded.connect(self._query_succeeded)
+            self.query_runner.failed.connect(self._query_failed)
         if auto_load:
             self.refresh()
 
@@ -156,6 +181,11 @@ class SubmissionListPage(QWidget):
             self.project_table.setColumnHidden(6, True)
         self.project_table.itemSelectionChanged.connect(self._project_selected)
         outer.addWidget(self.project_table)
+        self.project_pagination = PaginationBar()
+        self.project_pagination.page_requested.connect(
+            self._project_page_requested
+        )
+        outer.addWidget(self.project_pagination)
 
         body = QSplitter(Qt.Orientation.Horizontal)
         left = QWidget()
@@ -207,6 +237,11 @@ class SubmissionListPage(QWidget):
                 self._edit_task_from_item
             )
         left_layout.addWidget(self.task_table, 1)
+        self.task_pagination = PaginationBar()
+        self.task_pagination.page_requested.connect(
+            self._task_page_requested
+        )
+        left_layout.addWidget(self.task_pagination)
         self.info_line = QLabel("选择一个子任务查看详情")
         self.info_line.setWordWrap(False)
         self.info_line.setTextInteractionFlags(
@@ -243,7 +278,10 @@ class SubmissionListPage(QWidget):
         self.review_actions.setVisible(self.view_mode == "pending")
         preview_layout.addWidget(self.review_actions)
 
-        self.dual_preview = DualImagePreview(self.resolver)
+        self.dual_preview = DualImagePreview(
+            self.resolver,
+            async_thumbnails=self.async_mode,
+        )
         self.preview_splitter = self.dual_preview.splitter
         self.result_panel = self.dual_preview.result_pane
         self.reference_panel = self.dual_preview.reference_pane
@@ -259,16 +297,40 @@ class SubmissionListPage(QWidget):
         body.addWidget(preview_panel)
         body.setSizes([700, 620])
         outer.addWidget(body, 1)
-        self.search_edit.textChanged.connect(self._apply_filters)
-        self.start_date_edit.dateChanged.connect(self._apply_filters)
-        self.end_date_edit.dateChanged.connect(self._apply_filters)
+        self.search_edit.textChanged.connect(self._filter_changed)
+        self.start_date_edit.dateChanged.connect(self._filter_changed)
+        self.end_date_edit.dateChanged.connect(self._filter_changed)
         reset_filter.clicked.connect(self._reset_filters)
+        if self.async_mode:
+            self.project_table.setSortingEnabled(False)
+            self.task_table.setSortingEnabled(False)
+            project_header = self.project_table.horizontalHeader()
+            task_header = self.task_table.horizontalHeader()
+            project_header.setSortIndicatorShown(True)
+            task_header.setSortIndicatorShown(True)
+            project_header.setSortIndicator(
+                5,
+                Qt.SortOrder.DescendingOrder,
+            )
+            task_header.setSortIndicator(
+                5,
+                Qt.SortOrder.DescendingOrder,
+            )
+            project_header.sectionClicked.connect(
+                self._project_sort_requested
+            )
+            task_header.sectionClicked.connect(
+                self._task_sort_requested
+            )
 
     @staticmethod
     def _optional_date_edit(placeholder: str) -> OptionalDateEdit:
         return OptionalDateEdit(placeholder)
 
     def refresh(self) -> None:
+        if self.async_mode:
+            self._request_project_page()
+            return
         try:
             shared_root = self.repository.get_shared_setting("share_root")
             if shared_root:
@@ -303,11 +365,400 @@ class SubmissionListPage(QWidget):
         ]
         self._apply_filters()
 
+    def _task_query(self) -> TaskQuery:
+        return TaskQuery(
+            keyword=self.search_edit.text().strip(),
+            statuses=VIEW_STATUSES[self.view_mode],
+            start_date=self.start_date_edit.python_date(),
+            end_date=self.end_date_edit.python_date(),
+        )
+
+    def _request_project_page(self) -> None:
+        self._active_task_request = -1
+        self._active_result_request = -1
+        selected_id = (
+            self._current_project().id
+            if self._current_project() is not None
+            else None
+        )
+        query = self._task_query()
+        page = PageRequest(
+            page=self._project_page.page,
+            page_size=100,
+            sort_field=self._project_sort_field,
+            sort_direction=self._project_sort_direction,
+        )
+        self.info_line.setText("正在加载任务，请稍候…")
+        self.urgent_button.setEnabled(False)
+        self._pending_project_selection = selected_id
+        self._active_project_request = self.query_runner.submit(
+            lambda: (
+                self.repository.list_board_projects_page(
+                    self.actor,
+                    query.statuses,
+                    query,
+                    page,
+                )
+            )
+        )
+
+    def _request_task_page(
+        self,
+        project: ProjectRecord,
+        *,
+        preserve_selection: bool = True,
+    ) -> None:
+        self._active_result_request = -1
+        current = self._current_task()
+        self._pending_task_selection = (
+            current.id if preserve_selection and current is not None else None
+        )
+        self.tasks = []
+        self._tasks_by_id = {}
+        self.task_table.blockSignals(True)
+        self.task_table.setRowCount(0)
+        self.task_table.blockSignals(False)
+        self.task_pagination.set_result(0, 1, 100)
+        self.reference_gallery.clear()
+        self.result_gallery.clear()
+        self._update_actions()
+        query = self._task_query()
+        page = PageRequest(
+            page=self._task_page.page,
+            page_size=100,
+            sort_field=self._task_sort_field,
+            sort_direction=self._task_sort_direction,
+        )
+        self.info_line.setText("正在加载子任务，请稍候…")
+        self._active_task_request = self.query_runner.submit(
+            lambda: self.repository.list_board_tasks_for_project_page(
+                project.id,
+                self.actor,
+                query.statuses,
+                query,
+                page,
+            )
+        )
+
+    def _query_succeeded(self, request_id: int, result) -> None:
+        if not self.async_mode:
+            return
+        if request_id == getattr(self, "_active_project_request", -1):
+            self._render_project_page(result)
+            return
+        if request_id == getattr(self, "_active_task_request", -1):
+            self._render_task_page(result)
+            return
+        if request_id == getattr(self, "_active_result_request", -1):
+            task = self._current_task()
+            if task is not None and task.id == self._active_result_task_id:
+                self.result_gallery.set_task(task, result)
+                self._update_preview_counts()
+                self._update_actions()
+
+    def _query_failed(self, request_id: int, message: str) -> None:
+        if not self.async_mode or request_id not in (
+            getattr(self, "_active_project_request", -1),
+            getattr(self, "_active_task_request", -1),
+            getattr(self, "_active_result_request", -1),
+        ):
+            return
+        self.info_line.setText(f"加载失败：{message}")
+        QMessageBox.warning(self, "读取任务失败", message)
+        self._update_actions()
+
+    def _render_project_page(
+        self,
+        result: PageResult[ProjectRecord],
+    ) -> None:
+        if result.total and result.page > result.total_pages:
+            self._project_page = PageRequest(
+                page=result.total_pages,
+                page_size=100,
+                sort_field=self._project_sort_field,
+                sort_direction=self._project_sort_direction,
+            )
+            self._request_project_page()
+            return
+        self.projects = list(result.items)
+        self._projects_by_id = {
+            project.id: project for project in self.projects
+        }
+        self._project_total = result.total
+        self._project_page = PageRequest(
+            page=result.page,
+            page_size=result.page_size,
+            sort_field=self._project_sort_field,
+            sort_direction=self._project_sort_direction,
+        )
+        self.project_table.blockSignals(True)
+        self.project_table.setRowCount(0)
+        for project in self.projects:
+            row = self.project_table.rowCount()
+            self.project_table.insertRow(row)
+            values = (
+                project.project_code,
+                project.product_code or project.name,
+                project.owner_name,
+                project.source_date.isoformat()
+                if project.source_date
+                else "",
+                PROJECT_STATUS_LABELS.get(project.status, project.status),
+                f"{project.approved_count}/{project.task_count}",
+                "是" if project.is_urgent else "否",
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, project.id)
+                self.project_table.setItem(row, column, item)
+        self.project_table.blockSignals(False)
+        self.project_pagination.set_result(
+            result.total,
+            result.page,
+            result.page_size,
+        )
+        if not self.projects:
+            self.tasks = []
+            self.task_table.setRowCount(0)
+            self._task_total = 0
+            self.task_pagination.set_result(0, 1, 100)
+            self.info_line.setText("当前状态下没有任务")
+            self.reference_strip.clear()
+            self.reference_preview.set_image(None)
+            self.reference_preview.set_placeholder("尚无参考图")
+            self.result_gallery.set_task(self._empty_task(), [])
+            self._update_preview_counts()
+            self._update_actions()
+            return
+        target_id = getattr(self, "_pending_project_selection", None)
+        target_row = next(
+            (
+                row
+                for row, project in enumerate(self.projects)
+                if project.id == target_id
+            ),
+            0,
+        )
+        self.project_table.selectRow(target_row)
+        self._project_selected()
+
+    def _render_task_page(
+        self,
+        result: PageResult[ProjectTask],
+    ) -> None:
+        if result.total and result.page > result.total_pages:
+            project = self._current_project()
+            if project is not None:
+                self._task_page = PageRequest(
+                    page=result.total_pages,
+                    page_size=100,
+                    sort_field=self._task_sort_field,
+                    sort_direction=self._task_sort_direction,
+                )
+                self._request_task_page(project)
+            return
+        current_id = getattr(self, "_pending_task_selection", None)
+        self.tasks = list(result.items)
+        self._tasks_by_id = {task.id: task for task in self.tasks}
+        self._task_total = result.total
+        self._task_page = PageRequest(
+            page=result.page,
+            page_size=result.page_size,
+            sort_field=self._task_sort_field,
+            sort_direction=self._task_sort_direction,
+        )
+        self.task_table.blockSignals(True)
+        self.task_table.setRowCount(0)
+        project = self._current_project()
+        for task in self.tasks:
+            row = self.task_table.rowCount()
+            self.task_table.insertRow(row)
+            values = (
+                task.task_code,
+                str(len(task.garment_assets)),
+                task.assignee_name or "未分配",
+                TASK_STATUS_LABELS.get(task.status, task.status),
+                "是" if project and project.is_urgent else "否",
+                utc_naive_to_local(task.created_at).strftime(
+                    "%Y-%m-%d %H:%M"
+                ),
+                utc_naive_to_local(
+                    task.submitted_at
+                    or task.returned_at
+                    or task.created_at
+                ).strftime("%Y-%m-%d %H:%M"),
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, task.id)
+                self.task_table.setItem(row, column, item)
+        self.task_table.blockSignals(False)
+        self.task_pagination.set_result(
+            result.total,
+            result.page,
+            result.page_size,
+        )
+        if self.tasks:
+            target_row = next(
+                (
+                    row
+                    for row, task in enumerate(self.tasks)
+                    if task.id == current_id
+                ),
+                0,
+            )
+            self.task_table.selectRow(target_row)
+            self._task_selected()
+            self._pending_task_selection = None
+        else:
+            self.info_line.setText("当前筛选条件下没有子任务")
+            self.reference_strip.clear()
+            self.reference_preview.set_image(None)
+            self.reference_preview.set_placeholder("尚无参考图")
+            self.result_gallery.clear()
+            self._update_preview_counts()
+            self._update_actions()
+
+    def _filter_changed(self, *_args) -> None:
+        self._project_page = PageRequest(
+            page=1,
+            page_size=100,
+            sort_field=self._project_sort_field,
+            sort_direction=self._project_sort_direction,
+        )
+        self._task_page = PageRequest(
+            page=1,
+            page_size=100,
+            sort_field=self._task_sort_field,
+            sort_direction=self._task_sort_direction,
+        )
+        if not self.async_mode:
+            self._apply_filters()
+            return
+        if self.sender() is self.search_edit:
+            self._keyword_timer.start()
+        else:
+            self._async_filter_requested()
+
+    def _async_filter_requested(self) -> None:
+        if self.async_mode:
+            self._request_project_page()
+
+    def _project_page_requested(self, page: int) -> None:
+        self._project_page = PageRequest(
+            page=page,
+            page_size=100,
+            sort_field=self._project_sort_field,
+            sort_direction=self._project_sort_direction,
+        )
+        if self.async_mode:
+            self._request_project_page()
+
+    def _task_page_requested(self, page: int) -> None:
+        self._task_page = PageRequest(
+            page=page,
+            page_size=100,
+            sort_field=self._task_sort_field,
+            sort_direction=self._task_sort_direction,
+        )
+        project = self._current_project()
+        if self.async_mode and project is not None:
+            self._request_task_page(project)
+
+    def _project_sort_requested(self, column: int) -> None:
+        fields = {
+            0: "project_code",
+            1: "product_code",
+            2: "owner_name",
+            3: "source_date",
+            4: "status",
+            5: "progress",
+            6: "is_urgent",
+        }
+        sort_field = fields.get(column)
+        if sort_field is None:
+            return
+        if sort_field == self._project_sort_field:
+            self._project_sort_direction = (
+                "asc"
+                if self._project_sort_direction == "desc"
+                else "desc"
+            )
+        else:
+            self._project_sort_field = sort_field
+            self._project_sort_direction = "asc"
+        self.project_table.horizontalHeader().setSortIndicator(
+            column,
+            Qt.SortOrder.AscendingOrder
+            if self._project_sort_direction == "asc"
+            else Qt.SortOrder.DescendingOrder,
+        )
+        self._project_page = PageRequest(
+            page=1,
+            page_size=100,
+            sort_field=self._project_sort_field,
+            sort_direction=self._project_sort_direction,
+        )
+        self._request_project_page()
+
+    def _task_sort_requested(self, column: int) -> None:
+        fields = {
+            0: "task_code",
+            1: "garment_count",
+            2: "assignee_name",
+            3: "status",
+            4: "is_urgent",
+            5: "created_at",
+            6: "updated_at",
+        }
+        sort_field = fields.get(column)
+        if sort_field is None:
+            return
+        if sort_field == self._task_sort_field:
+            self._task_sort_direction = (
+                "asc" if self._task_sort_direction == "desc" else "desc"
+            )
+        else:
+            self._task_sort_field = sort_field
+            self._task_sort_direction = "asc"
+        self.task_table.horizontalHeader().setSortIndicator(
+            column,
+            Qt.SortOrder.AscendingOrder
+            if self._task_sort_direction == "asc"
+            else Qt.SortOrder.DescendingOrder,
+        )
+        self._task_page = PageRequest(
+            page=1,
+            page_size=100,
+            sort_field=self._task_sort_field,
+            sort_direction=self._task_sort_direction,
+        )
+        project = self._current_project()
+        if project is not None:
+            self._request_task_page(
+                project,
+                preserve_selection=False,
+            )
+
     def _reset_filters(self) -> None:
+        for widget in (
+            self.search_edit,
+            self.start_date_edit,
+            self.end_date_edit,
+        ):
+            widget.blockSignals(True)
         self.search_edit.clear()
         self.start_date_edit.clear()
         self.end_date_edit.clear()
-        self._apply_filters()
+        for widget in (
+            self.search_edit,
+            self.start_date_edit,
+            self.end_date_edit,
+        ):
+            widget.blockSignals(False)
+        self._filter_changed()
 
     def _apply_filters(self, *_args) -> None:
         statuses = set(VIEW_STATUSES[self.view_mode])
@@ -399,6 +850,15 @@ class SubmissionListPage(QWidget):
     def _project_selected(self) -> None:
         project = self._current_project()
         if project is None:
+            return
+        if self.async_mode:
+            self._task_page = PageRequest(
+                page=1,
+                page_size=100,
+                sort_field=self._task_sort_field,
+                sort_direction=self._task_sort_direction,
+            )
+            self._request_task_page(project)
             return
         statuses = set(VIEW_STATUSES[self.view_mode])
         keyword = self.search_edit.text().strip().casefold()
@@ -535,7 +995,13 @@ class SubmissionListPage(QWidget):
         )
         self.info_line.setToolTip(project.project_relative_root)
         self._set_reference_preview(task)
-        if self.view_mode != "submitted":
+        if self.view_mode != "submitted" and self.async_mode:
+            self.result_gallery.clear()
+            self._active_result_task_id = task.id
+            self._active_result_request = self.query_runner.submit(
+                lambda task_id=task.id: self.repository.list_results(task_id)
+            )
+        elif self.view_mode != "submitted":
             self.result_gallery.set_task(
                 task,
                 self.repository.list_results(task.id),

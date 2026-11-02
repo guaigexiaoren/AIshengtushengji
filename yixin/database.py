@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import contextmanager
+from datetime import datetime, time
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 
@@ -15,10 +16,12 @@ from .constants import (
     TASK_SUCCESS,
 )
 from .models import ImageRequest, StoredImage
+from .paging import PageRequest, PageResult, TaskQuery
 from .storage import utc_now_iso
+from .time_utils import local_to_utc_naive
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class StateTransitionError(RuntimeError):
@@ -180,6 +183,22 @@ class Database:
                 connection.execute("ALTER TABLE tasks ADD COLUMN auto_strategy TEXT")
             if "auto_reason" not in task_columns:
                 connection.execute("ALTER TABLE tasks ADD COLUMN auto_reason TEXT")
+            if "created_at" not in task_columns:
+                connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN created_at TEXT NOT NULL DEFAULT ''"
+                )
+            if "updated_at" not in task_columns:
+                connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
+                )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_created_id "
+                "ON tasks(created_at, id)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_tasks_status_created "
+                "ON tasks(status, created_at)"
+            )
             self._seed_builtin_templates(connection)
             connection.execute(
                 "INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', ?)",
@@ -518,9 +537,96 @@ class Database:
     def list_tasks(self, limit: int = 200) -> list[dict[str, Any]]:
         with self.connection() as connection:
             rows = connection.execute(
-                "SELECT * FROM tasks ORDER BY id DESC LIMIT ?", (limit,)
+                """
+                SELECT tasks.*,
+                       (
+                           SELECT COUNT(*)
+                           FROM task_results
+                           WHERE task_results.task_id = tasks.id
+                       ) AS result_count
+                FROM tasks
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def list_tasks_page(
+        self,
+        query: TaskQuery,
+        page: PageRequest,
+    ) -> PageResult[dict[str, Any]]:
+        sort_fields = {
+            "id": "id",
+            "status": "status",
+            "mode": "mode",
+            "model": "model",
+            "created_at": "created_at",
+            "updated_at": "updated_at",
+            "kind": "'ordinary'",
+            "result_count": "result_count",
+        }
+        sort_field = sort_fields.get(page.sort_field, "created_at")
+        direction = "ASC" if page.sort_direction == "asc" else "DESC"
+        conditions = ["1 = 1"]
+        params: list[Any] = []
+        keyword = query.keyword.strip()
+        if keyword:
+            pattern = f"%{keyword}%"
+            conditions.append(
+                "("
+                "CAST(id AS TEXT) LIKE ? OR prompt LIKE ? OR "
+                "model LIKE ? OR mode LIKE ?"
+                ")"
+            )
+            params.extend((pattern, pattern, pattern, pattern))
+        if query.statuses:
+            placeholders = ", ".join("?" for _ in query.statuses)
+            conditions.append(f"status IN ({placeholders})")
+            params.extend(query.statuses)
+        if query.start_date is not None:
+            start = local_to_utc_naive(
+                datetime.combine(query.start_date, time.min)
+            ).isoformat(timespec="seconds")
+            conditions.append("created_at >= ?")
+            params.append(start)
+        if query.end_date is not None:
+            end_date = query.end_date
+            end = local_to_utc_naive(
+                datetime.combine(end_date, time.max)
+            ).isoformat(timespec="seconds")
+            conditions.append("created_at <= ?")
+            params.append(end)
+        where_sql = " AND ".join(conditions)
+        with self.connection() as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM tasks WHERE {where_sql}",
+                    tuple(params),
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                f"""
+                SELECT tasks.*,
+                       (
+                           SELECT COUNT(*)
+                           FROM task_results
+                           WHERE task_results.task_id = tasks.id
+                       ) AS result_count
+                FROM tasks
+                WHERE {where_sql}
+                ORDER BY {sort_field} {direction}, id {direction}
+                LIMIT ? OFFSET ?
+                """,
+                (*params, page.page_size, page.offset),
+            ).fetchall()
+        return PageResult(
+            items=[dict(row) for row in rows],
+            total=total,
+            page=page.page,
+            page_size=page.page_size,
+        )
 
     def get_task_references(self, task_id: int) -> list[StoredImage]:
         with self.connection() as connection:

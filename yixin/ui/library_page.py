@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import QSize, Qt, QUrl, Signal
-from PySide6.QtGui import QDesktopServices, QIcon
+from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QFrame,
     QFileDialog,
@@ -28,9 +28,9 @@ from .widgets import (
     SUPPORTED_REFERENCE_SUFFIXES,
     ImageStrip,
     ImageView,
-    load_scaled_pixmap,
     scan_image_inputs,
 )
+from .async_thumbnails import get_thumbnail_loader
 
 
 def _drop_inputs(mime) -> list[Path]:
@@ -130,6 +130,8 @@ class LibraryPage(QWidget):
         database: Database,
         library_service: LibraryService,
         parent: QWidget | None = None,
+        *,
+        auto_load: bool = True,
     ) -> None:
         super().__init__(parent)
         self.database = database
@@ -137,6 +139,9 @@ class LibraryPage(QWidget):
         self.current_work_id: int | None = None
         self.current_assets: list[dict] = []
         self._refreshing_tags = False
+        self._cover_generation = 0
+        self._cover_contexts: dict[int, tuple[int, int]] = {}
+        self._thumbnail_loader = None
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         root = QVBoxLayout(self)
@@ -236,7 +241,8 @@ class LibraryPage(QWidget):
         upload_folder.clicked.connect(self._upload_image_folder)
         left.files_dropped.connect(self._import_manual_inputs)
         self.work_list.files_dropped.connect(self._import_manual_inputs)
-        self.refresh()
+        if auto_load:
+            self.refresh()
 
     def _upload_image_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -291,6 +297,9 @@ class LibraryPage(QWidget):
             QMessageBox.information(self, "导入失败", "没有图片导入成功。")
 
     def refresh(self) -> None:
+        self._cover_generation += 1
+        generation = self._cover_generation
+        self._cover_contexts.clear()
         checked_tags = self._checked_tags()
         works = self.database.list_works(
             search=self.search_edit.text(),
@@ -305,9 +314,22 @@ class LibraryPage(QWidget):
             item.setData(Qt.ItemDataRole.UserRole, work)
             cover = work.get("cover_path")
             if cover and Path(cover).is_file():
-                pixmap = load_scaled_pixmap(cover, QSize(190, 190))
-                if not pixmap.isNull():
-                    item.setIcon(QIcon(pixmap))
+                if self._thumbnail_loader is None:
+                    self._thumbnail_loader = get_thumbnail_loader()
+                    self._thumbnail_loader.thumbnail_ready.connect(
+                        self._cover_thumbnail_ready
+                    )
+                    self._thumbnail_loader.thumbnail_failed.connect(
+                        self._cover_thumbnail_failed
+                    )
+                request = self._thumbnail_loader.request_thumbnail(
+                    cover,
+                    QSize(190, 190),
+                )
+                self._cover_contexts[request.request_id] = (
+                    int(work["id"]),
+                    generation,
+                )
             item.setToolTip(work["title"])
             self.work_list.addItem(item)
             if work["id"] == selected_id:
@@ -317,6 +339,42 @@ class LibraryPage(QWidget):
         self.work_list.blockSignals(False)
         self._refresh_tags()
         self._selection_changed()
+
+    def _cover_thumbnail_ready(
+        self,
+        request_id: int,
+        _path: str,
+        image,
+    ) -> None:
+        context = self._cover_contexts.pop(request_id, None)
+        if context is None:
+            return
+        work_id, generation = context
+        if generation != self._cover_generation:
+            return
+        for index in range(self.work_list.count()):
+            item = self.work_list.item(index)
+            work = item.data(Qt.ItemDataRole.UserRole)
+            if int(work["id"]) != work_id:
+                continue
+            pixmap = QPixmap.fromImage(
+                image.scaled(
+                    QSize(190, 190),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+            if not pixmap.isNull():
+                item.setIcon(QIcon(pixmap))
+            return
+
+    def _cover_thumbnail_failed(
+        self,
+        request_id: int,
+        _path: str,
+        _message: str,
+    ) -> None:
+        self._cover_contexts.pop(request_id, None)
 
     def _refresh_tags(self) -> None:
         selected = set(self._checked_tags())
