@@ -190,14 +190,23 @@ class LibraryPickerDialog(QDialog):
         database: Database,
         max_select: int,
         parent: QWidget | None = None,
+        *,
+        show_limit: bool = True,
     ) -> None:
         super().__init__(parent)
         self.database = database
         self.max_select = max_select
+        self.show_limit = show_limit
         self.setWindowTitle("从作品库选择参考图")
         self.resize(860, 600)
         layout = QVBoxLayout(self)
-        tip = QLabel(f"最多还可选择 {max_select} 张。按住 Ctrl 可多选。")
+        tip = QLabel(
+            (
+                f"最多还可选择 {max_select} 张。按住 Ctrl 可多选。"
+                if self.show_limit
+                else "按住 Ctrl 可多选。"
+            )
+        )
         layout.addWidget(tip)
         self.list_widget = QListWidget()
         self.list_widget.setViewMode(QListWidget.ViewMode.IconMode)
@@ -239,7 +248,13 @@ class LibraryPickerDialog(QDialog):
     def _accept(self) -> None:
         if len(self.list_widget.selectedItems()) > self.max_select:
             QMessageBox.warning(
-                self, "超过上限", f"本次最多只能再选择 {self.max_select} 张参考图。"
+                self,
+                "超过上限",
+                (
+                    f"本次最多只能再选择 {self.max_select} 张参考图。"
+                    if self.show_limit
+                    else "选择数量超过当前剩余可用额度，请减少图片。"
+                ),
             )
             return
         if not self.list_widget.selectedItems():

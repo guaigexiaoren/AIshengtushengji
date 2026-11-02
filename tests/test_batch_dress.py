@@ -320,6 +320,11 @@ class BatchDressTests(unittest.TestCase):
         )
 
     def test_fifty_asset_limit_and_duplicate_content_hash(self) -> None:
+        self.assertNotIn("50", self.page.garment_count_label.text())
+        self.assertNotIn(
+            "50",
+            self.page.garment_list.parentWidget().title(),
+        )
         root = Path(self.temp.name) / "大量服装"
         root.mkdir()
         for index in range(51):
@@ -330,6 +335,17 @@ class BatchDressTests(unittest.TestCase):
         self.assertEqual(len(self.page.garment_assets), 50)
         self.assertEqual(self.page.garment_list.count(), 50)
         self.assertGreaterEqual(information.call_count, 1)
+        self.assertNotIn("50", self.page.garment_count_label.text())
+        self.assertTrue(
+            all(
+                "50" not in " ".join(
+                    str(arg)
+                    for arg in call.args
+                    if isinstance(arg, str)
+                )
+                for call in information.call_args_list
+            )
+        )
 
     def test_click_pairing_direction_and_duplicate_pair(self) -> None:
         garment_one = self._image("服装1.png", (20, 40, 80))

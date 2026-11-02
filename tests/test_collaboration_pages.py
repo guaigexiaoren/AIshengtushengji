@@ -75,7 +75,8 @@ if HAS_PYSIDE:
         UnifiedHistoryPage,
     )
     from yixin.ui.image_preview import (
-        LargeImageDialog,
+        ImageCompareView,
+        ImagePreviewPane,
     )
     from yixin.ui.date_filter import OptionalDateEdit
     from yixin.ui.task_center_page import TaskCenterPage
@@ -3362,11 +3363,17 @@ class CollaborationPageTests(unittest.TestCase):
         ):
             page._save_library()
         self.assertEqual(len(database.list_works()), 1)
-        with patch(
-            "yixin.ui.image_preview.LargeImageDialog"
-        ) as dialog_cls:
-            page.dual_preview.result_pane._open_zoom()
-        dialog_cls.return_value.exec.assert_called_once()
+        result_pane = page.dual_preview.result_pane
+        reference_pane = page.dual_preview.reference_pane
+        self.assertIsInstance(
+            result_pane.preview,
+            ImageCompareView,
+        )
+        self.assertFalse(hasattr(result_pane, "_zoom_dialog"))
+        reference_strip.setCurrentRow(0)
+        reference_strip.setCurrentRow(1)
+        self.app.processEvents()
+        self.assertEqual(len(reference_pane.preview.images), 2)
         page.deleteLater()
 
     def test_unified_history_cancels_only_queued_project_attempt(self) -> None:
@@ -3513,26 +3520,73 @@ class CollaborationPageTests(unittest.TestCase):
         )
         page.deleteLater()
 
-    def test_large_image_dialog_supports_pan_and_zoom(self) -> None:
-        image_path = self.root / "zoom-history.png"
-        Image.new("RGB", (320, 240), "purple").save(image_path)
-        dialog = LargeImageDialog(image_path)
+    def test_image_compare_view_supports_pan_swap_and_zoom(self) -> None:
+        first_path = self.root / "compare-left.png"
+        second_path = self.root / "compare-right.png"
+        Image.new("RGB", (320, 240), "purple").save(first_path)
+        Image.new("RGB", (280, 320), "orange").save(second_path)
+        view = ImageCompareView()
+        view.set_images(
+            [
+                (first_path, "左图"),
+                (second_path, "右图"),
+            ]
+        )
         self.assertEqual(
-            dialog.view.dragMode(),
+            view.view.dragMode(),
             QGraphicsView.DragMode.ScrollHandDrag,
         )
-        dialog._set_scale(0.01)
-        self.assertEqual(dialog._scale, 0.1)
-        dialog._set_scale(8)
-        self.assertEqual(dialog._scale, 4.0)
-        dialog._fit_to_window()
-        self.assertGreater(dialog._scale, 0)
-        dialog._release_resources()
-        self.assertIsNone(dialog.view.scene())
-        self.assertIsNone(dialog.pixmap_item)
-        self.assertTrue(dialog._pixmap.isNull())
-        dialog.close()
-        dialog.deleteLater()
+        self.assertEqual(len(view.images), 2)
+        first_paths = [path for path, _label in view.images]
+        view.swap_images()
+        self.assertEqual(
+            [path for path, _label in view.images],
+            list(reversed(first_paths)),
+        )
+        view.set_zoom(0.01)
+        self.assertEqual(view._scale, 0.1)
+        view.set_zoom(8)
+        self.assertEqual(view._scale, 4.0)
+        view.fit_to_window()
+        self.assertGreater(view._scale, 0)
+        view.exit_comparison()
+        self.assertEqual(len(view.images), 1)
+        view.deleteLater()
+
+    def test_image_preview_uses_first_left_and_replaces_right(self) -> None:
+        paths = []
+        for index, color in enumerate(("red", "green", "blue"), start=1):
+            path = self.root / f"pair-{index}.png"
+            Image.new("RGB", (80, 100), color).save(path)
+            paths.append(path)
+        pane = ImagePreviewPane("result", "结果图")
+        pane.set_images(
+            [
+                (path, f"结果 {index}", index)
+                for index, path in enumerate(paths, start=1)
+            ],
+            default_row=0,
+        )
+        self.assertEqual(len(pane.preview.images), 1)
+        self.assertEqual(pane.preview.images[0][0], paths[0])
+        pane.list_widget.itemClicked.emit(pane.list_widget.item(1))
+        self.assertEqual(
+            [path for path, _label in pane.preview.images],
+            [paths[0], paths[1]],
+        )
+        pane.list_widget.itemClicked.emit(pane.list_widget.item(2))
+        self.assertEqual(
+            [path for path, _label in pane.preview.images],
+            [paths[0], paths[2]],
+        )
+        pane.preview.swap_images()
+        self.assertEqual(
+            [path for path, _label in pane.preview.images],
+            [paths[2], paths[0]],
+        )
+        pane.preview.exit_comparison()
+        self.assertEqual(len(pane.preview.images), 1)
+        pane.deleteLater()
 
 
 if __name__ == "__main__":

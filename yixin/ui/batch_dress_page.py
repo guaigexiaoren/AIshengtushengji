@@ -1082,7 +1082,7 @@ class BatchDressPage(QWidget):
 
     def _make_asset_group(self, role: str) -> tuple[QWidget, BatchAssetList]:
         group = BatchAssetDropGroup(
-            f"{ROLE_LABELS[role]}素材（最多 {MAX_BATCH_ASSETS} 张）"
+            f"{ROLE_LABELS[role]}素材"
         )
         group.setObjectName("Card")
         group.setAcceptDrops(True)
@@ -1122,7 +1122,7 @@ class BatchDressPage(QWidget):
             async_thumbnails=self.async_thumbnails,
         )
         layout.addWidget(asset_list, 1)
-        count_label = QLabel(f"已选择 0 / {MAX_BATCH_ASSETS} 张")
+        count_label = QLabel("已选择 0 张")
         count_label.setStyleSheet("color:#6d7a91;")
         layout.addWidget(count_label)
         if role == "garment":
@@ -1257,7 +1257,11 @@ class BatchDressPage(QWidget):
             if role == "garment"
             else self.person_count_label
         )
-        count_label.setText(f"已选择 {len(assets)} / {MAX_BATCH_ASSETS} 张")
+        count_label.setText(
+            "已达到素材上限"
+            if len(assets) >= MAX_BATCH_ASSETS
+            else f"已选择 {len(assets)} 张"
+        )
         if role == "garment" and self.selected_garment not in assets:
             self.selected_garment = None
         self._update_asset_actions()
@@ -1404,7 +1408,7 @@ class BatchDressPage(QWidget):
             QMessageBox.information(
                 self,
                 "已达到上限",
-                f"{ROLE_LABELS[role]}素材最多 {MAX_BATCH_ASSETS} 张。",
+                "已达到素材上限，超出图片未导入。",
             )
             return
 
@@ -1431,11 +1435,17 @@ class BatchDressPage(QWidget):
             added += 1
 
         self._refresh_role(role)
-        summary = [f"已添加 {added} 张{ROLE_LABELS[role]}图片"]
+        summary = [
+            (
+                "已添加素材，已达到上限"
+                if added >= MAX_BATCH_ASSETS
+                else f"已添加 {added} 张{ROLE_LABELS[role]}图片"
+            )
+        ]
         if duplicate_count:
             summary.append(f"跳过 {duplicate_count} 张重复图片")
         if overflow:
-            summary.append(f"因上限未导入 {overflow} 张")
+            summary.append("超出上限的图片未导入")
         message = "，".join(summary) + "。"
         self.feedback_label.setText(message)
         if invalid_messages:
@@ -1453,7 +1463,7 @@ class BatchDressPage(QWidget):
             QMessageBox.information(
                 self,
                 "已达到上限",
-                f"{ROLE_LABELS[role]}素材最多 {MAX_BATCH_ASSETS} 张。",
+                "已达到素材上限，超出图片未导入。",
             )
             return
         scope = INPUT_BATCH_GARMENT if role == "garment" else INPUT_BATCH_PERSON
@@ -1484,10 +1494,15 @@ class BatchDressPage(QWidget):
             QMessageBox.information(
                 self,
                 "已达到上限",
-                f"{ROLE_LABELS[role]}素材最多 {MAX_BATCH_ASSETS} 张。",
+                "已达到素材上限，超出图片未导入。",
             )
             return
-        dialog = LibraryPickerDialog(self.database, remaining, self)
+        dialog = LibraryPickerDialog(
+            self.database,
+            remaining,
+            self,
+            show_limit=False,
+        )
         if dialog.exec() != dialog.DialogCode.Accepted:
             return
         self._append_assets(
