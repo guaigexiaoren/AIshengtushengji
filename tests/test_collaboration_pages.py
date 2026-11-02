@@ -1252,10 +1252,10 @@ class CollaborationPageTests(unittest.TestCase):
                 center.submit_button.text(),
             ],
             [
-                "重试任务",
-                "保存图片",
-                "上传修后图",
-                "查看/对比成品",
+                "载入参数",
+                "保存当前成品",
+                "上传PS成品",
+                "与原模特图对比",
                 "提交验收",
             ],
         )
@@ -1563,7 +1563,7 @@ class CollaborationPageTests(unittest.TestCase):
                 "结果数",
             ],
         )
-        self.assertEqual(center.queue_refresh_button.text(), "刷新")
+        self.assertEqual(center.queue_refresh_button.text(), "立即刷新")
         self.assertIs(
             center.generation_splitter.widget(1).findChild(QTableWidget),
             center.queue_table,
@@ -1596,12 +1596,27 @@ class CollaborationPageTests(unittest.TestCase):
                 "添加图片",
                 "添加文件夹",
                 "从作品库添加",
-                "裁剪",
-                "恢复",
+                "裁剪当前图",
+                "恢复原图",
                 "移除所选",
-                "清空",
+                "清空素材",
             ],
         )
+        self.assertFalse(center.skip_button.isEnabled())
+        self.assertFalse(center.add_source_library_button.isEnabled())
+        self.assertTrue(center.crop_source_button.isEnabled())
+        self.assertTrue(center.restore_source_button.isEnabled())
+        self.assertTrue(center.remove_source_button.isEnabled())
+        self.assertTrue(center.clear_sources_button.isEnabled())
+        center.source_strip.clearSelection()
+        center.source_strip.setCurrentRow(-1)
+        center._update_controls()
+        self.assertFalse(center.crop_source_button.isEnabled())
+        self.assertFalse(center.restore_source_button.isEnabled())
+        self.assertFalse(center.remove_source_button.isEnabled())
+        self.assertTrue(center.clear_sources_button.isEnabled())
+        center.source_strip.setCurrentRow(0)
+        center._update_controls()
         self.assertIsNone(center.template_combo.currentData())
         self.assertEqual(
             center.prompt_edit.toPlainText(),
@@ -1674,6 +1689,8 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(center.local_state.garments, ())
         self.assertIsNone(center.local_state.model)
         self.assertFalse(center.generate_button.isEnabled())
+        self.assertTrue(center.restore_source_button.isEnabled())
+        self.assertFalse(center.clear_sources_button.isEnabled())
         center._restore_source()
         self.assertEqual(len(center.local_state.garments), 2)
         self.assertIsNotNone(center.local_state.model)
@@ -1991,7 +2008,7 @@ class CollaborationPageTests(unittest.TestCase):
 
     def test_task_center_groups_progress_and_filters(self) -> None:
         write_task_images(self.root)
-        working = make_task("working")
+        working = make_task("awaiting_acceptance")
         approved = replace(
             working,
             id=12,
@@ -2123,7 +2140,7 @@ class CollaborationPageTests(unittest.TestCase):
 
     def test_task_center_skip_remaining_marks_project_tasks(self) -> None:
         write_task_images(self.root)
-        working = make_task("working")
+        working = make_task("awaiting_acceptance")
         remaining = [
             replace(
                 working,
@@ -2158,9 +2175,10 @@ class CollaborationPageTests(unittest.TestCase):
             center.upload_button.text(),
             center.compare_button.text(),
             center.submit_button.text(),
-            center.skip_button.text(),
         ]
-        self.assertEqual(button_names[-2:], ["提交验收", "剩余不制作"])
+        self.assertEqual(button_names[-1], "提交验收")
+        self.assertEqual(center.skip_button.text(), "结束剩余子任务")
+        self.assertTrue(center.skip_button.isEnabled())
         with (
             patch(
                 "yixin.ui.task_center_page.QInputDialog.getMultiLineText",

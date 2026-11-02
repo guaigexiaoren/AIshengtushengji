@@ -196,6 +196,7 @@ class TaskCenterPage(QWidget):
         header.addLayout(title_box, 1)
         self.include_finished = QCheckBox("显示已完成")
         refresh = QPushButton("刷新")
+        refresh.setToolTip("重新读取全部任务数据")
         refresh.clicked.connect(self.refresh)
         header.addWidget(self.include_finished)
         header.addWidget(refresh)
@@ -246,9 +247,19 @@ class TaskCenterPage(QWidget):
         project_host = QWidget()
         project_layout = QVBoxLayout(project_host)
         project_layout.setContentsMargins(0, 0, 0, 0)
+        project_header = QHBoxLayout()
         project_title = QLabel("任务列表")
         project_title.setStyleSheet("font-size:16px;font-weight:700;")
-        project_layout.addWidget(project_title)
+        project_header.addWidget(project_title)
+        project_header.addStretch(1)
+        self.skip_button = QPushButton("结束剩余子任务")
+        self.skip_button.setObjectName("DangerButton")
+        self.skip_button.setToolTip(
+            "将把未完成子任务标记为无需制作"
+        )
+        self.skip_button.clicked.connect(self._skip_remaining)
+        project_header.addWidget(self.skip_button)
+        project_layout.addLayout(project_header)
         self.project_table = QTableWidget(0, 5)
         self.project_table.setHorizontalHeaderLabels(
             ["任务编码", "货号", "子任务进度", "状态", "创建时间"]
@@ -331,10 +342,12 @@ class TaskCenterPage(QWidget):
         self.add_source_files_button = QPushButton("添加图片")
         self.add_source_folder_button = QPushButton("添加文件夹")
         self.add_source_library_button = QPushButton("从作品库添加")
-        self.crop_source_button = QPushButton("裁剪")
-        self.restore_source_button = QPushButton("恢复")
+        self.crop_source_button = QPushButton("裁剪当前图")
+        self.restore_source_button = QPushButton("恢复原图")
         self.remove_source_button = QPushButton("移除所选")
-        self.clear_sources_button = QPushButton("清空")
+        self.clear_sources_button = QPushButton("清空素材")
+        self.clear_sources_button.setObjectName("DangerButton")
+        self.clear_sources_button.setToolTip("清空当前任务的全部本机参考图")
         source_actions_host = QWidget()
         source_actions_host.setMinimumHeight(34)
         source_actions = QHBoxLayout(source_actions_host)
@@ -348,10 +361,12 @@ class TaskCenterPage(QWidget):
             self.crop_source_button,
             self.restore_source_button,
             self.remove_source_button,
-            self.clear_sources_button,
         ):
             button.setStyleSheet("padding:5px 7px;")
             source_actions.addWidget(button)
+        source_actions.addSpacing(10)
+        self.clear_sources_button.setStyleSheet("padding:5px 7px;")
+        source_actions.addWidget(self.clear_sources_button)
         top_layout.addWidget(source_actions_host)
         self.local_source_hint = QLabel()
         self.local_source_hint.hide()
@@ -475,7 +490,10 @@ class TaskCenterPage(QWidget):
         self.queue_hint = QLabel()
         self.queue_hint.setStyleSheet("color:#60708a;")
         queue_footer.addWidget(self.queue_hint, 1)
-        self.queue_refresh_button = QPushButton("刷新")
+        self.queue_refresh_button = QPushButton("立即刷新")
+        self.queue_refresh_button.setToolTip(
+            "只刷新当前主任务的生成队列"
+        )
         self.queue_refresh_button.clicked.connect(self._refresh_queue)
         queue_footer.addWidget(self.queue_refresh_button)
         queue_layout.addLayout(queue_footer)
@@ -504,26 +522,28 @@ class TaskCenterPage(QWidget):
         self.gallery.list_widget.itemChanged.connect(self._selection_changed)
         layout.addWidget(self.gallery, 1)
         button_row = QHBoxLayout()
-        self.retry_button = QPushButton("重试任务")
-        self.save_button = QPushButton("保存图片")
-        self.upload_button = QPushButton("上传修后图")
-        self.compare_button = QPushButton("查看/对比成品")
+        self.retry_button = QPushButton("载入参数")
+        self.save_button = QPushButton("保存当前成品")
+        self.upload_button = QPushButton("上传PS成品")
+        self.compare_button = QPushButton("与原模特图对比")
         self.submit_button = QPushButton("提交验收")
-        self.skip_button = QPushButton("剩余不制作")
         self.submit_button.setObjectName("PrimaryButton")
+        self.retry_button.setToolTip(
+            "载入该子任务已保存的提示词和参数，不会自动发起付费请求"
+        )
+        self.save_button.setToolTip("保存当前大图对应的原分辨率成品")
+        self.upload_button.setToolTip("上传经过 PS 处理的最终成品")
         self.retry_button.clicked.connect(self._retry_task)
         self.save_button.clicked.connect(self._save_result)
         self.upload_button.clicked.connect(self._upload_manual)
         self.compare_button.clicked.connect(self._compare_result)
         self.submit_button.clicked.connect(self._submit)
-        self.skip_button.clicked.connect(self._skip_remaining)
         for button in (
             self.retry_button,
             self.save_button,
             self.upload_button,
             self.compare_button,
             self.submit_button,
-            self.skip_button,
         ):
             button.setMinimumHeight(36)
             button_row.addWidget(button)
@@ -1200,6 +1220,16 @@ class TaskCenterPage(QWidget):
             and self.local_state.model is not None
         )
         can_edit_sources = self._can_edit_local_sources()
+        current_source = self._current_source_position()
+        selected_sources = self._selected_source_positions()
+        has_references = bool(
+            self.local_state and self.local_state.references()
+        )
+        current_image = (
+            self.local_store.image_at(*current_source)
+            if self.local_store is not None and current_source is not None
+            else None
+        )
         self.generate_button.setEnabled(
             (can_claim or can_work) and local_ready
         )
@@ -1218,20 +1248,65 @@ class TaskCenterPage(QWidget):
         self.retry_button.setEnabled(can_work)
         self.save_button.setEnabled(self.gallery.current_path() is not None)
         self.compare_button.setEnabled(self.gallery.current_path() is not None)
+        group = (
+            self._groups_by_id.get(self.current_project_id)
+            if self.current_project_id is not None
+            else None
+        )
+        has_submitted = bool(
+            group
+            and any(
+                subtask.status
+                in (TASK_AWAITING_ACCEPTANCE, TASK_APPROVED)
+                for subtask in group.tasks
+            )
+        )
+        has_remaining = bool(
+            group
+            and any(
+                subtask.status
+                in (
+                    TASK_AVAILABLE,
+                    TASK_CLAIMED,
+                    TASK_WORKING,
+                    TASK_RETURNED,
+                )
+                for subtask in group.tasks
+            )
+        )
         self.skip_button.setEnabled(
-            self.current_project_id is not None
+            has_submitted
+            and has_remaining
             and self.actor.role in (ROLE_AI, ROLE_ADMIN)
         )
-        for button in (
-            self.add_source_files_button,
-            self.add_source_folder_button,
-            self.add_source_library_button,
-            self.crop_source_button,
-            self.restore_source_button,
-            self.remove_source_button,
-            self.clear_sources_button,
-        ):
-            button.setEnabled(can_edit_sources)
+        self.add_source_files_button.setEnabled(can_edit_sources)
+        self.add_source_folder_button.setEnabled(can_edit_sources)
+        self.add_source_library_button.setEnabled(
+            can_edit_sources and self.library_service is not None
+        )
+        self.crop_source_button.setEnabled(
+            can_edit_sources and current_source is not None
+        )
+        self.restore_source_button.setEnabled(
+            can_edit_sources
+            and (
+                (
+                    current_source is not None
+                    and current_image is not None
+                    and current_image.source_path is not None
+                )
+                or (
+                    current_source is None
+                    and not has_references
+                )
+            )
+        )
+        self.remove_source_button.setEnabled(
+            can_edit_sources and bool(selected_sources)
+        )
+        self.clear_sources_button.setEnabled(
+            can_edit_sources and has_references
+        )
         self.queue_hint.setText(
             f"正在执行 {len(self.active_workers)} 个，等待 {len(self.waiting_jobs)} 个"
         )
@@ -1684,7 +1759,7 @@ class TaskCenterPage(QWidget):
             return
         reason, ok = QInputDialog.getMultiLineText(
             self,
-            "剩余不制作",
+            "结束剩余子任务",
             "请填写剩余子任务不制作的原因：",
         )
         if not ok:
@@ -1694,7 +1769,7 @@ class TaskCenterPage(QWidget):
             return
         answer = QMessageBox.question(
             self,
-            "确认剩余不制作",
+            "确认结束剩余子任务",
             f"将把当前主任务中 {len(remaining)} 个未完成子任务"
             "标记为“无需制作”，是否继续？",
         )
