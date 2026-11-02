@@ -131,21 +131,83 @@ class LargeImageDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("查看大图")
         self.resize(1100, 800)
+        self._pixmap = QPixmap(str(path))
+        self._scale = 1.0
+        self._fit_pending = True
         layout = QVBoxLayout(self)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(False)
-        label = QLabel()
-        pixmap = QPixmap(str(path))
-        label.setPixmap(pixmap)
-        label.resize(pixmap.size())
-        scroll.setWidget(label)
-        layout.addWidget(scroll, 1)
+        toolbar = QHBoxLayout()
+        self.zoom_in_button = QPushButton("放大")
+        self.zoom_out_button = QPushButton("缩小")
+        self.fit_button = QPushButton("适应窗口")
+        self.actual_button = QPushButton("100%")
+        self.scale_label = QLabel("100%")
+        toolbar.addWidget(self.zoom_in_button)
+        toolbar.addWidget(self.zoom_out_button)
+        toolbar.addWidget(self.fit_button)
+        toolbar.addWidget(self.actual_button)
+        toolbar.addStretch(1)
+        toolbar.addWidget(self.scale_label)
+        layout.addLayout(toolbar)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(False)
+        self.image_label = QLabel()
+        self.scroll.setWidget(self.image_label)
+        layout.addWidget(self.scroll, 1)
         actions = QHBoxLayout()
         actions.addStretch(1)
-        close = QPushButton("关闭")
-        close.clicked.connect(self.accept)
-        actions.addWidget(close)
+        self.close_button = QPushButton("关闭")
+        self.close_button.clicked.connect(self.accept)
+        actions.addWidget(self.close_button)
         layout.addLayout(actions)
+        self.zoom_in_button.clicked.connect(lambda: self._zoom_by(1.2))
+        self.zoom_out_button.clicked.connect(lambda: self._zoom_by(1 / 1.2))
+        self.fit_button.clicked.connect(self._fit_to_window)
+        self.actual_button.clicked.connect(lambda: self._set_scale(1.0))
+        self._render()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._fit_pending:
+            self._fit_pending = False
+            self._fit_to_window()
+
+    def wheelEvent(self, event) -> None:
+        self._zoom_by(1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
+        event.accept()
+
+    def _zoom_by(self, factor: float) -> None:
+        self._set_scale(self._scale * factor)
+
+    def _set_scale(self, value: float) -> None:
+        self._scale = max(0.1, min(4.0, value))
+        self._render()
+
+    def _fit_to_window(self) -> None:
+        if self._pixmap.isNull():
+            return
+        available = self.scroll.viewport().size()
+        ratio = min(
+            available.width() / max(1, self._pixmap.width()),
+            available.height() / max(1, self._pixmap.height()),
+        )
+        self._set_scale(ratio)
+
+    def _render(self) -> None:
+        if self._pixmap.isNull():
+            self.image_label.setText("图片无法读取")
+            return
+        width = max(1, round(self._pixmap.width() * self._scale))
+        height = max(1, round(self._pixmap.height() * self._scale))
+        self.image_label.setPixmap(
+            self._pixmap.scaled(
+                width,
+                height,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        self.image_label.resize(width, height)
+        self.scale_label.setText(f"{round(self._scale * 100)}%")
 
 
 class UnifiedHistoryPage(QWidget):
@@ -273,14 +335,10 @@ class UnifiedHistoryPage(QWidget):
         right_layout.addWidget(self.detail_meta)
         right_layout.addWidget(self.prompt_view)
 
-        self.reference_title = QLabel("参考图")
-        self.result_title = QLabel("结果图")
-        self.reference_strip = self._image_strip()
-        self.result_strip = self._image_strip()
-        right_layout.addWidget(self.reference_title)
-        right_layout.addWidget(self.reference_strip)
-        right_layout.addWidget(self.result_title)
-        right_layout.addWidget(self.result_strip)
+        self.thumbnail_title = QLabel("参考图与结果图")
+        self.combined_strip = self._image_strip()
+        right_layout.addWidget(self.thumbnail_title)
+        right_layout.addWidget(self.combined_strip)
 
         self.preview = ClickableImageView()
         right_layout.addWidget(self.preview, 1)
@@ -288,6 +346,12 @@ class UnifiedHistoryPage(QWidget):
         self.cancel_button = QPushButton("取消任务")
         self.retry_button = QPushButton("重试任务")
         self.save_local_button = QPushButton("保存本地")
+        self.save_local_button.setStyleSheet(
+            "QPushButton { background:#2e64c4;color:white;"
+            "border:1px solid #2455aa;border-radius:5px;"
+            "padding:6px 12px;font-weight:600; }"
+            "QPushButton:disabled { background:#aebad0;color:#eef2f8; }"
+        )
         self.save_library_button = QPushButton("保存作品库")
         actions.addWidget(self.cancel_button)
         actions.addWidget(self.retry_button)
@@ -307,11 +371,8 @@ class UnifiedHistoryPage(QWidget):
         self.start_date.dateChanged.connect(self._apply_filters)
         self.end_date.dateChanged.connect(self._apply_filters)
         self.table.itemSelectionChanged.connect(self._selection_changed)
-        self.reference_strip.currentRowChanged.connect(
-            lambda row: self._show_asset("reference", row)
-        )
-        self.result_strip.currentRowChanged.connect(
-            lambda row: self._show_asset("result", row)
+        self.combined_strip.currentRowChanged.connect(
+            self._show_combined_asset
         )
         self.preview.clicked.connect(self._zoom_current)
         self.cancel_button.clicked.connect(self._cancel_current)
@@ -491,8 +552,7 @@ class UnifiedHistoryPage(QWidget):
             self.detail_title.setText("没有符合条件的历史记录")
             self.detail_meta.clear()
             self.prompt_view.clear()
-            self.reference_strip.clear()
-            self.result_strip.clear()
+            self.combined_strip.clear()
             self.preview.set_image(None)
             self._set_actions(False)
 
@@ -594,31 +654,40 @@ class UnifiedHistoryPage(QWidget):
         self.prompt_view.setPlainText(record.prompt)
         refs = [asset for asset in self.current_assets if asset.is_reference]
         results = [asset for asset in self.current_assets if asset.is_result]
-        self.reference_title.setText(f"参考图（{len(refs)}）")
-        self.result_title.setText(f"结果图（{len(results)}）")
-        self.reference_strip.set_images(
-            [(asset.thumbnail_path, asset.label, asset) for asset in refs]
+        self.thumbnail_title.setText(
+            f"参考图（{len(refs)}） · 结果图（{len(results)}）"
         )
-        self.result_strip.set_images(
-            [(asset.thumbnail_path, asset.label, asset) for asset in results]
+        ordered_assets = [*refs, *results]
+        self.combined_strip.set_images(
+            [
+                (asset.thumbnail_path, asset.label, asset)
+                for asset in ordered_assets
+            ]
         )
         if results:
-            self.result_strip.setCurrentRow(0)
-            self._show_asset("result", 0)
+            target_row = len(refs)
+            self.combined_strip.setCurrentRow(target_row)
+            self._show_combined_asset(target_row)
         elif refs:
-            self.reference_strip.setCurrentRow(0)
-            self._show_asset("reference", 0)
+            self.combined_strip.setCurrentRow(0)
+            self._show_combined_asset(0)
         else:
             self.current_selected_asset = None
             self.preview.set_image(None)
         self._update_actions(record)
 
-    def _show_asset(self, role: str, row: int) -> None:
-        assets = [
+    def _show_combined_asset(self, row: int) -> None:
+        refs = [
             asset
             for asset in self.current_assets
-            if asset.role == role
+            if asset.is_reference
         ]
+        results = [
+            asset
+            for asset in self.current_assets
+            if asset.is_result
+        ]
+        assets = [*refs, *results]
         if not 0 <= row < len(assets):
             return
         asset = assets[row]
@@ -825,4 +894,8 @@ class UnifiedHistoryPage(QWidget):
     def _zoom_current(self) -> None:
         if self.preview.current_path is None:
             return
-        LargeImageDialog(self.preview.current_path, self).exec()
+        self._zoom_dialog = LargeImageDialog(
+            self.preview.current_path,
+            self,
+        )
+        self._zoom_dialog.exec()

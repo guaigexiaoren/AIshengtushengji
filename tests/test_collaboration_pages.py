@@ -70,7 +70,6 @@ if HAS_PYSIDE:
     from yixin.ui.subtask_source_dialog import SubtaskSourceDialog
     from yixin.ui.project_history_page import ProjectHistoryPage
     from yixin.ui.unified_history_page import (
-        LargeImageDialog,
         UnifiedHistoryPage,
     )
     from yixin.ui.date_filter import OptionalDateEdit
@@ -540,14 +539,28 @@ class CollaborationPageTests(unittest.TestCase):
             for button in page.findChildren(QPushButton)
             if button.text() == "不做图" and button.isVisibleTo(page)
         ]
-        self.assertEqual(len(skip_buttons), 1)
+        self.assertEqual(len(skip_buttons), 2)
         button_texts = {
             button.text() for button in page.findChildren(QPushButton)
         }
         self.assertNotIn("上传PS成品", button_texts)
         self.assertNotIn("提交验收", button_texts)
         self.assertNotIn("验收通过", button_texts)
-        skip_buttons[0].click()
+        card_skip = next(
+            button
+            for button in skip_buttons
+            if button is not page.bottom_skip_button
+        )
+        card_skip.click()
+        self.assertTrue(page.pairs[0].skipped)
+        self.assertEqual(
+            page.selected_pair_key,
+            page.pairs[0].key,
+        )
+        self.assertEqual(page.bottom_skip_button.text(), "恢复制作")
+        page.bottom_skip_button.click()
+        self.assertFalse(page.pairs[0].skipped)
+        page.bottom_skip_button.click()
         self.assertTrue(page.pairs[0].skipped)
         page.deleteLater()
 
@@ -608,12 +621,8 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertIn("主任务 2/5", page.task_selector.itemText(1))
         self.assertIn("待制作", page.task_selector.itemText(1))
         page.provider_combo.setCurrentIndex(1)
-        skip_buttons = [
-            button
-            for button in page.findChildren(QPushButton)
-            if button.text() == "不做图" and button.isVisibleTo(page)
-        ]
-        skip_buttons[0].click()
+        page._select_pair(page.pairs[0])
+        page.bottom_skip_button.click()
         page._enqueue_all()
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0][0], task.id)
@@ -2912,8 +2921,15 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.assertEqual(page.table.rowCount(), 1)
         self.assertEqual(page.table.item(0, 0).text(), "项目")
-        self.assertEqual(page.reference_strip.count(), 3)
-        self.assertEqual(page.result_strip.count(), 1)
+        self.assertEqual(page.combined_strip.count(), 4)
+        self.assertEqual(
+            [
+                page.combined_strip.item(index).text()
+                for index in range(page.combined_strip.count())
+            ],
+            ["参考 1", "参考 2", "参考 3", "结果 1"],
+        )
+        self.assertEqual(page.combined_strip.currentRow(), 3)
         self.assertEqual(
             page.preview.current_path,
             result_path.resolve(),
@@ -2931,9 +2947,11 @@ class CollaborationPageTests(unittest.TestCase):
         ):
             page._save_library()
         self.assertEqual(len(database.list_works()), 1)
-        with patch.object(LargeImageDialog, "exec") as dialog_exec:
+        with patch(
+            "yixin.ui.unified_history_page.LargeImageDialog"
+        ) as dialog_cls:
             page._zoom_current()
-        dialog_exec.assert_called_once()
+        dialog_cls.return_value.exec.assert_called_once()
         page.deleteLater()
 
     def test_unified_history_cancels_only_queued_project_attempt(self) -> None:

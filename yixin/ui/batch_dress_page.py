@@ -545,6 +545,7 @@ class FreeComposeDialog(QDialog):
 class DressPairCard(QFrame):
     remove_requested = Signal(object)
     skip_requested = Signal(object)
+    selected = Signal(object)
 
     def __init__(
         self,
@@ -556,6 +557,7 @@ class DressPairCard(QFrame):
     ) -> None:
         super().__init__(parent)
         self.pair = pair
+        self._selected = False
         self.setObjectName("DressPairCard")
         self.setMinimumHeight(144)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -582,7 +584,7 @@ class DressPairCard(QFrame):
             )
             skip.setStyleSheet("padding: 3px 7px;")
             skip.clicked.connect(
-                lambda: self.skip_requested.emit(self.pair)
+            lambda: self._skip_clicked()
             )
             header.addWidget(skip)
         header.addWidget(remove)
@@ -597,10 +599,7 @@ class DressPairCard(QFrame):
         ]
         self.setToolTip("\n".join(reference_lines))
         if pair.skipped:
-            self.setStyleSheet(
-                "QFrame#DressPairCard { background:#f0f1f3;"
-                "border:1px dashed #a9b1bd;border-radius:9px; }"
-            )
+            self._apply_card_style()
         body = QHBoxLayout()
         body.setSpacing(5)
         body.addStretch(1)
@@ -627,6 +626,36 @@ class DressPairCard(QFrame):
             )
         body.addStretch(1)
         layout.addLayout(body)
+
+    def _skip_clicked(self) -> None:
+        self.selected.emit(self.pair)
+        self.skip_requested.emit(self.pair)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.selected.emit(self.pair)
+        super().mouseReleaseEvent(event)
+
+    def set_selected(self, selected: bool) -> None:
+        self._selected = selected
+        self._apply_card_style()
+
+    def _apply_card_style(self) -> None:
+        if self._selected:
+            self.setStyleSheet(
+                "QFrame#DressPairCard { background:#edf4ff;"
+                "border:2px solid #3f73cb;border-radius:9px; }"
+            )
+        elif self.pair.skipped:
+            self.setStyleSheet(
+                "QFrame#DressPairCard { background:#f0f1f3;"
+                "border:1px dashed #a9b1bd;border-radius:9px; }"
+            )
+        else:
+            self.setStyleSheet(
+                "QFrame#DressPairCard { background:#f8fafd;"
+                "border:1px solid #dce5f1;border-radius:9px; }"
+            )
 
     @staticmethod
     def _image_block(image: StoredImage, role_label: str) -> QWidget:
@@ -723,6 +752,8 @@ class BatchDressPage(QWidget):
         *,
         external_top: QWidget | None = None,
         allow_pair_skip: bool = False,
+        allow_bottom_skip: bool = False,
+        generate_button_text: str = "生成全部配对并加入队列",
     ) -> None:
         super().__init__(parent)
         self.database = database
@@ -739,6 +770,10 @@ class BatchDressPage(QWidget):
         self._pair_layout_pending = False
         self._pair_panel_height = 0
         self.allow_pair_skip = allow_pair_skip
+        self.allow_bottom_skip = allow_bottom_skip
+        self.generate_button_text = generate_button_text
+        self.selected_pair_key = None
+        self.pair_cards: list[DressPairCard] = []
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -1127,11 +1162,19 @@ class BatchDressPage(QWidget):
         )
         self.feedback_label.setWordWrap(True)
         self.feedback_label.setStyleSheet("color:#6d7a91;")
-        self.generate_button = QPushButton("生成全部配对并加入队列")
+        self.bottom_skip_button = QPushButton("不做图")
+        self.bottom_skip_button.setObjectName("DangerButton")
+        self.bottom_skip_button.clicked.connect(
+            self._toggle_selected_pair_skip
+        )
+        self.bottom_skip_button.setEnabled(self.allow_bottom_skip)
+        self.bottom_skip_button.setVisible(self.allow_bottom_skip)
+        self.generate_button = QPushButton(self.generate_button_text)
         self.generate_button.setObjectName("PrimaryButton")
         self.generate_button.setMinimumHeight(42)
         self.generate_button.clicked.connect(self._enqueue_all)
         layout.addWidget(self.feedback_label, 1)
+        layout.addWidget(self.bottom_skip_button)
         layout.addWidget(self.generate_button)
         return card
 
@@ -1633,6 +1676,7 @@ class BatchDressPage(QWidget):
         self._refresh_pairs()
 
     def _toggle_pair_skip(self, pair: DressTaskGroup) -> None:
+        self.selected_pair_key = pair.key
         self.pairs = [
             replace(item, skipped=not item.skipped)
             if item.key == pair.key
@@ -1640,6 +1684,48 @@ class BatchDressPage(QWidget):
             for item in self.pairs
         ]
         self._refresh_pairs()
+
+    def _select_pair(self, pair: DressTaskGroup) -> None:
+        if not self.allow_pair_skip:
+            return
+        self.selected_pair_key = pair.key
+        for card in self.pair_cards:
+            card.set_selected(card.pair.key == pair.key)
+        self._update_bottom_skip_button()
+
+    def _toggle_selected_pair_skip(self) -> None:
+        pair = next(
+            (
+                item
+                for item in self.pairs
+                if item.key == self.selected_pair_key
+            ),
+            None,
+        )
+        if pair is None:
+            QMessageBox.information(
+                self,
+                "未选择配对",
+                "请先选择一张配对卡。",
+            )
+            return
+        self._toggle_pair_skip(pair)
+
+    def _update_bottom_skip_button(self) -> None:
+        if not hasattr(self, "bottom_skip_button"):
+            return
+        pair = next(
+            (
+                item
+                for item in self.pairs
+                if item.key == self.selected_pair_key
+            ),
+            None,
+        )
+        self.bottom_skip_button.setEnabled(self.allow_bottom_skip)
+        self.bottom_skip_button.setText(
+            "恢复制作" if pair is not None and pair.skipped else "不做图"
+        )
 
     def _clear_pairs(self) -> None:
         if not self.pairs:
@@ -1656,11 +1742,15 @@ class BatchDressPage(QWidget):
             item = self.pair_grid.takeAt(0)
             widget = item.widget()
             if widget:
+                widget.hide()
                 widget.deleteLater()
         self.pair_count_label.setText(f"已建立 {len(self.pairs)} 个配对")
         for column in range(MAX_PAIR_COLUMNS):
             self.pair_grid.setColumnStretch(column, 0)
         if not self.pairs:
+            self.selected_pair_key = None
+            self.pair_cards.clear()
+            self._update_bottom_skip_button()
             empty = QLabel(
                 "还没有配对。选择服装后点击人物，或把左侧服装缩略图拖到右侧人物上。"
             )
@@ -1671,6 +1761,11 @@ class BatchDressPage(QWidget):
             for column in range(self.pair_columns):
                 self.pair_grid.setColumnStretch(column, 1)
             return
+        if not any(
+            pair.key == self.selected_pair_key for pair in self.pairs
+        ):
+            self.selected_pair_key = None
+        self.pair_cards.clear()
         for index, pair in enumerate(self.pairs):
             card = DressPairCard(
                 pair,
@@ -1679,6 +1774,9 @@ class BatchDressPage(QWidget):
             )
             card.remove_requested.connect(self._remove_pair)
             card.skip_requested.connect(self._toggle_pair_skip)
+            card.selected.connect(self._select_pair)
+            card.set_selected(pair.key == self.selected_pair_key)
+            self.pair_cards.append(card)
             self.pair_grid.addWidget(
                 card,
                 index // self.pair_columns,
@@ -1690,6 +1788,7 @@ class BatchDressPage(QWidget):
             0,
             lambda: scrollbar.setValue(min(scroll_value, scrollbar.maximum())),
         )
+        self._update_bottom_skip_button()
 
     def _enqueue_all(self) -> None:
         if not self.secret_store.load():

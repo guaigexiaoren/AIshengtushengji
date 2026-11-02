@@ -84,6 +84,8 @@ class AIGenerationPage(BatchDressPage):
             secret_store,
             parent,
             allow_pair_skip=True,
+            allow_bottom_skip=True,
+            generate_button_text="加入队列",
         )
         self.task_selector.currentIndexChanged.connect(
             self._task_changed
