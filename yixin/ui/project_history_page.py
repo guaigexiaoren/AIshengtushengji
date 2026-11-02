@@ -96,7 +96,7 @@ class ProjectHistoryPage(QWidget):
         outer.addLayout(filters)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.table = QTableWidget(0, 9)
+        self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels(
             [
                 "项目编码",
@@ -104,6 +104,7 @@ class ProjectHistoryPage(QWidget):
                 "货号",
                 "操作人员",
                 "模型",
+                "API 平台",
                 "状态",
                 "创建时间",
                 "结果数",
@@ -123,7 +124,7 @@ class ProjectHistoryPage(QWidget):
             QHeaderView.ResizeMode.Interactive
         )
         for column, width in enumerate(
-            (220, 240, 90, 120, 130, 90, 145, 70, 260)
+            (220, 240, 90, 120, 130, 110, 90, 145, 70, 260)
         ):
             self.table.setColumnWidth(column, width)
         self.table.itemSelectionChanged.connect(self._attempt_selected)
@@ -238,6 +239,7 @@ class ProjectHistoryPage(QWidget):
                 attempt["product_code"] or attempt["project_name"],
                 attempt["operator_name"],
                 MODEL_LABELS.get(attempt["model"], attempt["model"]),
+                attempt.get("provider_name") or "自动/历史",
                 ATTEMPT_LABELS.get(attempt["status"], attempt["status"]),
                 utc_naive_to_local(attempt["created_at"]).strftime(
                     "%Y-%m-%d %H:%M"
@@ -297,6 +299,7 @@ class ProjectHistoryPage(QWidget):
             f"{attempt['product_code'] or attempt['project_name']}\n"
             f"操作人员 {attempt['operator_name']} · 模型 "
             f"{MODEL_LABELS.get(attempt['model'], attempt['model'])} · "
+            f"API 平台 {attempt.get('provider_name') or '自动/历史'} · "
             f"状态 {ATTEMPT_LABELS.get(attempt['status'], attempt['status'])}"
         )
         self.prompt_view.setPlainText(attempt["prompt_text"])

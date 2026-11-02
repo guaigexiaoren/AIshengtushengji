@@ -14,6 +14,7 @@ from yixin.private_config import DATABASE
 
 BUSINESS_TABLES = (
     "generation_results",
+    "generation_provider_calls",
     "task_reviews",
     "workflow_events",
     "task_garments",
@@ -25,6 +26,7 @@ BUSINESS_TABLES = (
 )
 AUTO_INCREMENT_TABLES = (
     "generation_results",
+    "generation_provider_calls",
     "task_reviews",
     "workflow_events",
     "generation_attempts",

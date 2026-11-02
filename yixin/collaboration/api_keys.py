@@ -52,9 +52,17 @@ class DatabaseApiKeyStore:
         self.repository = repository
         self.actor = actor
 
-    def load(self, *, strict: bool = False) -> str | None:
+    def load(
+        self,
+        *,
+        provider_id: int | None = None,
+        strict: bool = False,
+    ) -> str | None:
         try:
-            value = self.repository.load_actor_api_key(self.actor)
+            value = self.repository.load_actor_api_key(
+                self.actor,
+                provider_id=provider_id,
+            )
         except Exception:
             if strict:
                 raise

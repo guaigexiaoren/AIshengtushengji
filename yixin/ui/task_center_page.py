@@ -460,7 +460,7 @@ class TaskCenterPage(QWidget):
 
         queue_card = QGroupBox("生成任务队列")
         queue_layout = QVBoxLayout(queue_card)
-        self.queue_table = QTableWidget(0, 8)
+        self.queue_table = QTableWidget(0, 9)
         self.queue_table.setHorizontalHeaderLabels(
             [
                 "主任务编码",
@@ -468,6 +468,7 @@ class TaskCenterPage(QWidget):
                 "子任务编码",
                 "轮次",
                 "操作人员",
+                "API 平台",
                 "状态",
                 "创建时间",
                 "结果数",
@@ -482,7 +483,7 @@ class TaskCenterPage(QWidget):
             QHeaderView.ResizeMode.Interactive
         )
         for column, width in enumerate(
-            (180, 80, 190, 60, 100, 90, 135, 65)
+            (180, 80, 190, 60, 100, 105, 90, 135, 65)
         ):
             self.queue_table.setColumnWidth(column, width)
         queue_layout.addWidget(self.queue_table)
@@ -1510,6 +1511,7 @@ class TaskCenterPage(QWidget):
                 attempt["task_code"],
                 f"第 {attempt['attempt_no']} 轮",
                 attempt["operator_name"] or str(attempt["operator_id"]),
+                attempt.get("provider_name") or "自动/历史",
                 label,
                 utc_naive_to_local(
                     attempt["created_at"]

@@ -49,6 +49,7 @@ class ReportTaskRow:
     approved_at: datetime | None
     returned_at: datetime | None
     manual_image_count: int = 0
+    provider_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -188,7 +189,14 @@ def aggregate_report(rows: list[ReportTaskRow]) -> ReportData:
         rows=tuple(rows),
         summary=summary,
         by_user=_group(rows, lambda row: row.assignee_name or "未分配"),
-        by_model=_group(rows, lambda row: row.model or "未设置"),
+        by_model=_group(
+            rows,
+            lambda row: (
+                f"{row.provider_name} / {row.model}"
+                if row.provider_name and row.model
+                else row.provider_name or row.model or "未设置"
+            ),
+        ),
         by_date=_group(
             rows,
             lambda row: utc_naive_to_local(
@@ -271,6 +279,7 @@ def export_report_excel(report: ReportData, path: Path) -> Path:
             "子任务状态",
             "运营",
             "制作人员",
+            "API 平台",
             "模型",
             "服装图",
             "模特图",
@@ -295,6 +304,7 @@ def export_report_excel(report: ReportData, path: Path) -> Path:
                 row.task_status,
                 row.owner_name,
                 row.assignee_name,
+                row.provider_name or "自动/历史",
                 row.model,
                 row.garment_name,
                 row.model_name,

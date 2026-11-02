@@ -13,7 +13,11 @@ import pymysql
 from pymysql.connections import Connection
 from pymysql.cursors import DictCursor
 
-from ..constants import BUILTIN_PROMPT_TEMPLATES, MODEL_IDS
+from ..constants import (
+    BUILTIN_PROMPT_TEMPLATES,
+    MODEL_IDS,
+    PROVIDER_PROTOCOLS,
+)
 from ..private_config import SHARED_ROOT
 from ..security import validate_api_key
 from ..time_utils import local_to_utc_naive
@@ -48,6 +52,7 @@ from .types import (
     TASK_SKIPPED,
     TASK_WORKING,
     AuthUser,
+    ApiProvider,
     GeneratedResultInput,
     GenerationAttempt,
     GenerationResult,
@@ -56,12 +61,13 @@ from .types import (
     ProjectDraft,
     ProjectRecord,
     ProjectTask,
+    ProviderModelRoute,
     PROJECT_SCOPES,
     ROLE_DEFAULT_MENUS,
     ROLE_ALLOWED_MENUS,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 LEGACY_SHARED_ROOT = (
     r"\\fe80--211-32ff-fe87-ba49.ipv6-literal.net\AI作图"
 )
@@ -174,6 +180,7 @@ class MySQLCentralRepository:
                         cursor.execute(statement)
                     self._apply_schema_v2(cursor)
                     self._apply_schema_v3(cursor)
+                    self._apply_schema_v4(cursor)
                     self._apply_shared_root_update(cursor)
                     cursor.execute(
                         "INSERT IGNORE INTO schema_migrations(version, applied_at) "
@@ -285,7 +292,7 @@ class MySQLCentralRepository:
             END
             """
         )
-        if previous_version >= SCHEMA_VERSION:
+        if previous_version >= 3:
             return
         cursor.execute("SELECT id, role FROM users")
         for user in cursor.fetchall():
@@ -297,6 +304,46 @@ class MySQLCentralRepository:
                     """,
                     (user["id"], menu_key),
                 )
+
+    @staticmethod
+    def _apply_schema_v4(cursor) -> None:
+        attempt_columns = {
+            "provider_id": "BIGINT UNSIGNED NULL",
+            "provider_code": "VARCHAR(64) NOT NULL DEFAULT ''",
+            "provider_name": "VARCHAR(100) NOT NULL DEFAULT ''",
+            "provider_model": "VARCHAR(160) NOT NULL DEFAULT ''",
+        }
+        for column, definition in attempt_columns.items():
+            _add_column_if_missing(
+                cursor,
+                "generation_attempts",
+                column,
+                definition,
+            )
+        _add_column_if_missing(
+            cursor,
+            "user_api_keys",
+            "provider_id",
+            "BIGINT UNSIGNED NOT NULL DEFAULT 1",
+        )
+        cursor.execute(
+            """
+            SELECT COLUMN_NAME
+            FROM information_schema.KEY_COLUMN_USAGE
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'user_api_keys'
+              AND CONSTRAINT_NAME = 'PRIMARY'
+            ORDER BY ORDINAL_POSITION
+            """
+        )
+        primary_columns = tuple(
+            row["COLUMN_NAME"] for row in cursor.fetchall()
+        )
+        if primary_columns and primary_columns != ("user_id", "provider_id"):
+            cursor.execute(
+                "ALTER TABLE user_api_keys DROP PRIMARY KEY, "
+                "ADD PRIMARY KEY(user_id, provider_id)"
+            )
 
     @staticmethod
     def _apply_shared_root_update(cursor) -> None:
@@ -844,11 +891,26 @@ class MySQLCentralRepository:
         actor: AuthUser,
         user_id: int,
         api_key: str,
+        *,
+        provider_id: int = 1,
     ) -> None:
         if actor.role != ROLE_ADMIN:
             raise PermissionDeniedError("只有管理员可以配置 API Key")
         with self.connection() as connection:
             with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, is_enabled
+                    FROM api_providers
+                    WHERE id = %s
+                    """,
+                    (provider_id,),
+                )
+                provider = cursor.fetchone()
+                if provider is None:
+                    raise ValueError("API 平台不存在")
+                if not bool(provider["is_enabled"]):
+                    raise ValueError("API 平台已停用")
                 cursor.execute(
                     "SELECT role, is_active FROM users WHERE id = %s",
                     (user_id,),
@@ -866,9 +928,9 @@ class MySQLCentralRepository:
                 cursor.execute(
                     """
                     INSERT INTO user_api_keys(
-                        user_id, encrypted_key, key_suffix, updated_by,
+                        user_id, provider_id, encrypted_key, key_suffix, updated_by,
                         updated_at, last_test_status, last_test_at
-                    ) VALUES (%s, %s, %s, %s, %s, 'format_ok', %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, 'format_ok', %s)
                     ON DUPLICATE KEY UPDATE
                         encrypted_key = VALUES(encrypted_key),
                         key_suffix = VALUES(key_suffix),
@@ -877,54 +939,393 @@ class MySQLCentralRepository:
                         last_test_status = VALUES(last_test_status),
                         last_test_at = VALUES(last_test_at)
                     """,
-                    (user_id, encrypted, suffix, actor.id, now, now),
+                    (
+                        user_id,
+                        provider_id,
+                        encrypted,
+                        suffix,
+                        actor.id,
+                        now,
+                        now,
+                    ),
                 )
 
-    def clear_api_key(self, actor: AuthUser, user_id: int) -> None:
+    def clear_api_key(
+        self,
+        actor: AuthUser,
+        user_id: int,
+        *,
+        provider_id: int | None = None,
+    ) -> None:
         if actor.role != ROLE_ADMIN:
             raise PermissionDeniedError("只有管理员可以清除 API Key")
         with self.connection() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    "DELETE FROM user_api_keys WHERE user_id = %s",
-                    (user_id,),
-                )
+                if provider_id is None:
+                    cursor.execute(
+                        "DELETE FROM user_api_keys WHERE user_id = %s",
+                        (user_id,),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        DELETE FROM user_api_keys
+                        WHERE user_id = %s AND provider_id = %s
+                        """,
+                        (user_id, provider_id),
+                    )
 
     def api_key_statuses(self) -> dict[int, dict[str, Any]]:
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT user_id, key_suffix, updated_at,
+                    SELECT user_id, provider_id, key_suffix, updated_at,
+                           last_test_status, last_test_at
+                    FROM user_api_keys
+                    ORDER BY updated_at, provider_id
+                    """
+                )
+                result: dict[int, dict[str, Any]] = {}
+                for row in cursor.fetchall():
+                    result[int(row["user_id"])] = dict(row)
+                return result
+
+    def api_key_statuses_by_provider(
+        self,
+    ) -> dict[tuple[int, int], dict[str, Any]]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT user_id, provider_id, key_suffix, updated_at,
                            last_test_status, last_test_at
                     FROM user_api_keys
                     """
                 )
                 return {
-                    int(row["user_id"]): dict(row)
+                    (int(row["user_id"]), int(row["provider_id"])): dict(row)
                     for row in cursor.fetchall()
                 }
 
-    def load_actor_api_key(self, actor: AuthUser) -> str:
+    def api_key_status(
+        self,
+        user_id: int,
+        provider_id: int,
+    ) -> dict[str, Any] | None:
+        return self.api_key_statuses_by_provider().get(
+            (user_id, provider_id)
+        )
+
+    def load_actor_api_key(
+        self,
+        actor: AuthUser,
+        *,
+        provider_id: int | None = None,
+    ) -> str:
         if actor.role not in (ROLE_AI, ROLE_ADMIN):
             raise ApiKeyError("当前账号不需要配置生图 API Key")
         with self.connection() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT u.is_active, k.encrypted_key
-                    FROM users u
-                    LEFT JOIN user_api_keys k ON k.user_id = u.id
-                    WHERE u.id = %s
-                    """,
-                    (actor.id,),
-                )
+                if provider_id is None:
+                    cursor.execute(
+                        """
+                        SELECT u.is_active, (
+                            SELECT k.encrypted_key
+                            FROM user_api_keys k
+                            JOIN api_providers p ON p.id = k.provider_id
+                            WHERE k.user_id = u.id
+                              AND p.is_enabled = 1
+                            ORDER BY p.priority, p.id
+                            LIMIT 1
+                        ) AS encrypted_key
+                        FROM users u
+                        WHERE u.id = %s
+                        """,
+                        (actor.id,),
+                    )
+                else:
+                    cursor.execute(
+                        """
+                        SELECT u.is_active, k.encrypted_key
+                        FROM users u
+                        LEFT JOIN user_api_keys k
+                          ON k.user_id = u.id AND k.provider_id = %s
+                        WHERE u.id = %s
+                        """,
+                        (provider_id, actor.id),
+                    )
                 row = cursor.fetchone()
         if row is None or not bool(row["is_active"]):
             raise ApiKeyError("账号已停用")
         if not row["encrypted_key"]:
             raise ApiKeyError("尚未配置 API Key，请联系管理员")
         return decrypt_api_key(row["encrypted_key"])
+
+    def list_api_providers(
+        self,
+        *,
+        include_disabled: bool = True,
+    ) -> list[ApiProvider]:
+        where = "" if include_disabled else "WHERE is_enabled = 1"
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT *
+                    FROM api_providers
+                    {where}
+                    ORDER BY priority, id
+                    """
+                )
+                return [
+                    _api_provider(row)
+                    for row in cursor.fetchall()
+                ]
+
+    def list_provider_models(
+        self,
+        provider_id: int,
+        *,
+        include_disabled: bool = True,
+    ) -> list[dict[str, Any]]:
+        condition = "" if include_disabled else "AND m.is_enabled = 1"
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT m.*
+                    FROM api_provider_models m
+                    WHERE m.provider_id = %s {condition}
+                    ORDER BY FIELD(
+                        m.logical_model,
+                        'gemini-nano-banana-2.1',
+                        'gemini-3.1-flash-image',
+                        'gemini-3-pro-image'
+                    ), m.id
+                    """,
+                    (provider_id,),
+                )
+                return [dict(row) for row in cursor.fetchall()]
+
+    def list_provider_routes(
+        self,
+        logical_model: str,
+        *,
+        provider_code: str | None = None,
+    ) -> list[ProviderModelRoute]:
+        if logical_model not in MODEL_IDS:
+            raise ValueError("不支持的模型")
+        provider_filter = ""
+        parameters: list[Any] = [logical_model]
+        if provider_code:
+            provider_filter = "AND p.provider_code = %s"
+            parameters.append(provider_code)
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT p.id AS provider_id,
+                           p.provider_code,
+                           p.display_name AS provider_name,
+                           p.base_url,
+                           p.default_protocol,
+                           m.logical_model,
+                           m.provider_model,
+                           m.protocol,
+                           m.max_reference_images,
+                           m.images_per_request,
+                           p.priority AS priority
+                    FROM api_provider_models m
+                    JOIN api_providers p ON p.id = m.provider_id
+                    WHERE m.logical_model = %s
+                      AND m.is_enabled = 1
+                      AND p.is_enabled = 1
+                      {provider_filter}
+                    ORDER BY p.priority, m.priority, p.id, m.id
+                    """,
+                    tuple(parameters),
+                )
+                return [
+                    _provider_model_route(row)
+                    for row in cursor.fetchall()
+                ]
+
+    def update_api_provider(
+        self,
+        actor: AuthUser,
+        provider_id: int,
+        *,
+        display_name: str,
+        base_url: str,
+        default_protocol: str,
+        enabled: bool,
+        priority: int,
+        models: Sequence[dict[str, Any]],
+    ) -> None:
+        if actor.role != ROLE_ADMIN:
+            raise PermissionDeniedError("只有管理员可以修改 API 平台")
+        clean_name = display_name.strip()
+        clean_url = base_url.strip().rstrip("/")
+        if not clean_name:
+            raise ValueError("平台名称不能为空")
+        if not clean_url.startswith(("https://", "http://")):
+            raise ValueError("API 地址必须以 http:// 或 https:// 开头")
+        if default_protocol not in PROVIDER_PROTOCOLS:
+            raise ValueError("不支持的 API 协议")
+        if priority < 0:
+            raise ValueError("平台优先级不能为负数")
+        now = utc_now()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT id FROM api_providers WHERE id = %s",
+                    (provider_id,),
+                )
+                if cursor.fetchone() is None:
+                    raise ValueError("API 平台不存在")
+                cursor.execute(
+                    """
+                    UPDATE api_providers
+                    SET display_name = %s, base_url = %s,
+                        default_protocol = %s, is_enabled = %s,
+                        priority = %s, updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        clean_name,
+                        clean_url,
+                        default_protocol,
+                        int(enabled),
+                        int(priority),
+                        now,
+                        provider_id,
+                    ),
+                )
+                for model in models:
+                    logical_model = str(model.get("logical_model") or "")
+                    provider_model = str(
+                        model.get("provider_model") or ""
+                    ).strip()
+                    protocol = str(model.get("protocol") or "")
+                    if logical_model not in MODEL_IDS:
+                        raise ValueError("模型映射中包含不支持的模型")
+                    if not provider_model:
+                        raise ValueError("平台模型名不能为空")
+                    if protocol not in PROVIDER_PROTOCOLS:
+                        raise ValueError("模型映射中包含不支持的协议")
+                    max_references = int(
+                        model.get("max_reference_images") or 0
+                    )
+                    images_per_request = int(
+                        model.get("images_per_request") or 0
+                    )
+                    if not 0 <= max_references <= 14:
+                        raise ValueError("最大参考图数必须在 0 到 14 之间")
+                    if not 1 <= images_per_request <= 4:
+                        raise ValueError("单次出图数必须在 1 到 4 之间")
+                    cursor.execute(
+                        """
+                        INSERT INTO api_provider_models(
+                            provider_id, logical_model, provider_model,
+                            protocol, max_reference_images,
+                            images_per_request, is_enabled, priority,
+                            created_at, updated_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                        )
+                        ON DUPLICATE KEY UPDATE
+                            provider_model = VALUES(provider_model),
+                            protocol = VALUES(protocol),
+                            max_reference_images =
+                                VALUES(max_reference_images),
+                            images_per_request =
+                                VALUES(images_per_request),
+                            is_enabled = VALUES(is_enabled),
+                            priority = VALUES(priority),
+                            updated_at = VALUES(updated_at)
+                        """,
+                        (
+                            provider_id,
+                            logical_model,
+                            provider_model,
+                            protocol,
+                            max_references,
+                            images_per_request,
+                            int(bool(model.get("enabled", True))),
+                            int(model.get("priority") or priority),
+                            now,
+                            now,
+                        ),
+                    )
+
+    def record_provider_call(
+        self,
+        attempt_id: int,
+        actor: AuthUser,
+        *,
+        provider_id: int | None,
+        provider_name: str,
+        provider_model: str,
+        status: str,
+        request_id: str = "",
+        remote_task_id: str = "",
+        status_code: int | None = None,
+        error_code: str = "",
+        error_message: str = "",
+    ) -> None:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                attempt = self._attempt_row_for_update(cursor, attempt_id)
+                if (
+                    int(attempt["operator_id"]) != actor.id
+                    and actor.role != ROLE_ADMIN
+                ):
+                    raise PermissionDeniedError("不能修改其他人的生成记录")
+                if status != "skipped":
+                    cursor.execute(
+                        """
+                        UPDATE generation_attempts
+                        SET provider_id = %s, provider_code = (
+                                SELECT provider_code FROM api_providers
+                                WHERE id = %s
+                            ),
+                            provider_name = %s, provider_model = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            provider_id,
+                            provider_id,
+                            provider_name[:100],
+                            provider_model[:160],
+                            attempt_id,
+                        ),
+                    )
+                cursor.execute(
+                    """
+                    INSERT INTO generation_provider_calls(
+                        attempt_id, provider_id, provider_name,
+                        provider_model, status, request_id,
+                        remote_task_id, status_code, error_code,
+                        error_message, created_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                    )
+                    """,
+                    (
+                        attempt_id,
+                        provider_id,
+                        provider_name[:100],
+                        provider_model[:160],
+                        status,
+                        request_id[:255],
+                        remote_task_id[:255],
+                        status_code,
+                        error_code[:100],
+                        error_message,
+                        utc_now(),
+                    ),
+                )
 
     def reset_password(self, user_id: int, temporary_password: str) -> None:
         validate_new_password(temporary_password)
@@ -2390,6 +2791,10 @@ class MySQLCentralRepository:
         output_tokens: int | None,
         results: Sequence[GeneratedResultInput],
         source_type: str = "generated",
+        provider_id: int | None = None,
+        provider_code: str = "",
+        provider_name: str = "",
+        provider_model: str = "",
     ) -> None:
         if not results:
             raise ValueError("生成结果不能为空")
@@ -2408,7 +2813,9 @@ class MySQLCentralRepository:
                     SET status = %s, generated_image_count = %s,
                         request_id = %s, remote_task_id = %s,
                         raw_response_json = %s, input_tokens = %s,
-                        output_tokens = %s, finished_at = %s
+                        output_tokens = %s, provider_id = %s,
+                        provider_code = %s, provider_name = %s,
+                        provider_model = %s, finished_at = %s
                     WHERE id = %s
                     """,
                     (
@@ -2419,6 +2826,10 @@ class MySQLCentralRepository:
                         json.dumps(raw_response, ensure_ascii=False, sort_keys=True),
                         input_tokens,
                         output_tokens,
+                        provider_id,
+                        provider_code,
+                        provider_name,
+                        provider_model,
                         now,
                         attempt_id,
                     ),
@@ -3315,6 +3726,7 @@ class MySQLCentralRepository:
                 COALESCE(reviews.rework_count, 0) AS rework_count,
                 COALESCE(attempts.generated_image_count, 0) AS generated_image_count,
                 COALESCE(attempts.manual_image_count, 0) AS manual_image_count,
+                COALESCE(attempts.provider_name, '') AS provider_name,
                 COALESCE(attempts.generation_cost, 0) AS generation_cost
             FROM project_tasks t
             JOIN projects p ON p.id = t.project_id
@@ -3336,6 +3748,7 @@ class MySQLCentralRepository:
                         CASE WHEN model = 'manual_ps'
                             THEN generated_image_count ELSE 0 END
                     ) AS manual_image_count,
+                    MAX(NULLIF(provider_name, '')) AS provider_name,
                     SUM(generated_image_count * unit_price) AS generation_cost
                 FROM generation_attempts
                 WHERE status = %s
@@ -3373,6 +3786,7 @@ class MySQLCentralRepository:
                         submitted_at=row["submitted_at"],
                         approved_at=row["approved_at"],
                         returned_at=row["returned_at"],
+                        provider_name=row["provider_name"] or "",
                     )
                     for row in cursor.fetchall()
                 ]
@@ -3987,6 +4401,44 @@ def _generation_attempt(row: dict[str, Any]) -> GenerationAttempt:
         operator_name=row.get("operator_name") or "",
         created_at=row["created_at"],
         finished_at=row["finished_at"],
+        provider_id=(
+            int(row["provider_id"])
+            if row.get("provider_id")
+            else None
+        ),
+        provider_code=row.get("provider_code") or "",
+        provider_name=row.get("provider_name") or "",
+        provider_model=row.get("provider_model") or "",
+    )
+
+
+def _api_provider(row: dict[str, Any]) -> ApiProvider:
+    return ApiProvider(
+        id=int(row["id"]),
+        provider_code=row["provider_code"],
+        display_name=row["display_name"],
+        base_url=row["base_url"],
+        default_protocol=row["default_protocol"],
+        enabled=bool(row["is_enabled"]),
+        priority=int(row["priority"]),
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+    )
+
+
+def _provider_model_route(row: dict[str, Any]) -> ProviderModelRoute:
+    return ProviderModelRoute(
+        provider_id=int(row["provider_id"]),
+        provider_code=row["provider_code"],
+        provider_name=row["provider_name"],
+        base_url=row["base_url"],
+        default_protocol=row["default_protocol"],
+        logical_model=row["logical_model"],
+        provider_model=row["provider_model"],
+        protocol=row["protocol"] or row["default_protocol"],
+        max_reference_images=int(row["max_reference_images"]),
+        images_per_request=int(row["images_per_request"]),
+        priority=int(row["priority"]),
     )
 
 

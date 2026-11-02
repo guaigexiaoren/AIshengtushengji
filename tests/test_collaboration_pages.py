@@ -35,6 +35,7 @@ if HAS_PYSIDE:
         ATTEMPT_SUCCEEDED,
         ROLE_ADMIN,
         ROLE_OPERATIONS,
+        ApiProvider,
         AuthUser,
         GenerationAttempt,
         GenerationResult,
@@ -43,7 +44,11 @@ if HAS_PYSIDE:
         ProjectRecord,
         ProjectTask,
     )
-    from yixin.constants import BUILTIN_PROMPT_TEMPLATES
+    from yixin.constants import (
+        BUILTIN_PROMPT_TEMPLATES,
+        PROTOCOL_OPENAI_CHAT_IMAGE,
+        PROTOCOL_OPENAI_IMAGES,
+    )
     from yixin.database import Database
     from yixin.library import LibraryService
     from yixin.paths import AppPaths
@@ -51,7 +56,12 @@ if HAS_PYSIDE:
     from yixin.settings import INPUT_MANUAL_UPLOAD, AppSettings
     from yixin.storage import FileStore
     from yixin.time_utils import utc_naive_to_local
-    from yixin.ui.admin_page import AddUserDialog, AdminPage, EditUserDialog
+    from yixin.ui.admin_page import (
+        AddUserDialog,
+        AdminPage,
+        ApiProviderDialog,
+        EditUserDialog,
+    )
     from yixin.ui.collaboration_login import LoginDialog
     from yixin.ui.dialogs import SettingsDialog
     from yixin.ui.main_window import MainWindow, SidebarNav
@@ -177,6 +187,18 @@ class FakeCentralRepository:
     def api_key_statuses(self):
         return {}
 
+    def api_key_statuses_by_provider(self):
+        return {}
+
+    def api_key_status(self, _user_id, _provider_id):
+        return None
+
+    def list_api_providers(self, **_kwargs):
+        return []
+
+    def list_provider_models(self, _provider_id, **_kwargs):
+        return []
+
     def list_model_prices(self):
         return {}
 
@@ -192,7 +214,7 @@ class FakeCentralRepository:
             "max_generation_concurrency": 2,
         }
 
-    def load_actor_api_key(self, _actor):
+    def load_actor_api_key(self, _actor, **_kwargs):
         return None
 
     def current_model_price(self, _model):
@@ -767,6 +789,53 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertIn("menu_permissions", update)
         self.assertIn("project_access", update)
         page.deleteLater()
+
+    def test_admin_api_platform_tab_lists_provider_routes(self) -> None:
+        provider = ApiProvider(
+            id=3,
+            provider_code="a6api",
+            display_name="A6API",
+            base_url="https://api.a6api.vip/v1",
+            default_protocol=PROTOCOL_OPENAI_IMAGES,
+            enabled=True,
+            priority=30,
+        )
+        self.repository.list_api_providers = lambda **_kwargs: [provider]
+        self.repository.list_provider_models = (
+            lambda *_args, **_kwargs: [{"logical_model": "model"}]
+        )
+        page = AdminPage(self.repository, self.actor)
+        self.assertEqual(page.provider_table.rowCount(), 1)
+        self.assertEqual(page.provider_table.item(0, 0).text(), "A6API")
+        self.assertEqual(page.provider_table.item(0, 5).text(), "1 个")
+        page.deleteLater()
+
+    def test_admin_api_provider_dialog_edits_model_mappings(self) -> None:
+        provider = ApiProvider(
+            id=2,
+            provider_code="88api",
+            display_name="88API",
+            base_url="https://api.88api.ai/v1",
+            default_protocol=PROTOCOL_OPENAI_CHAT_IMAGE,
+            enabled=True,
+            priority=20,
+        )
+        dialog = ApiProviderDialog(
+            self.repository,
+            self.actor,
+            provider,
+            [],
+        )
+        self.assertEqual(dialog.model_table.rowCount(), 3)
+        self.assertEqual(
+            dialog.model_table.cellWidget(0, 2).currentData(),
+            PROTOCOL_OPENAI_CHAT_IMAGE,
+        )
+        self.assertIn(
+            "gemini-nano-banana-2.1",
+            dialog.model_table.cellWidget(0, 1).text(),
+        )
+        dialog.deleteLater()
 
     def test_admin_exception_filter_only_returns_abnormal_tasks(self) -> None:
         page = AdminPage(self.repository, self.actor)
@@ -1558,6 +1627,7 @@ class CollaborationPageTests(unittest.TestCase):
                 "子任务编码",
                 "轮次",
                 "操作人员",
+                "API 平台",
                 "状态",
                 "创建时间",
                 "结果数",

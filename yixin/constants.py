@@ -6,6 +6,20 @@ APP_ORGANIZATION = "亦欣"
 API_BASE_URL = "https://liuguang.ai/v1"
 GENERATION_ENDPOINT = "/images/generations"
 
+PROTOCOL_LEGACY_JSON_IMAGES = "legacy_json_images"
+PROTOCOL_OPENAI_IMAGES = "openai_images"
+PROTOCOL_OPENAI_CHAT_IMAGE = "openai_chat_image"
+PROVIDER_PROTOCOLS = (
+    PROTOCOL_LEGACY_JSON_IMAGES,
+    PROTOCOL_OPENAI_IMAGES,
+    PROTOCOL_OPENAI_CHAT_IMAGE,
+)
+PROVIDER_PROTOCOL_LABELS = {
+    PROTOCOL_LEGACY_JSON_IMAGES: "流光图片协议",
+    PROTOCOL_OPENAI_IMAGES: "OpenAI 图片协议",
+    PROTOCOL_OPENAI_CHAT_IMAGE: "OpenAI 对话图片协议",
+}
+
 MODEL_OPTIONS = (
     ("Nano Banana 2.1", "gemini-nano-banana-2.1"),
     ("Nano Banana 2", "gemini-3.1-flash-image"),

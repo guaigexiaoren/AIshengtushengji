@@ -134,6 +134,7 @@ class ProjectGenerationWorker:
                 resolution=self.resolution,
                 reference_images=references,
                 mode="dress_up",
+                central_attempt_id=attempt_id,
             )
             api_result = self.client.generate(request)
             output_directory = self.resolver.output_directory(
@@ -175,6 +176,10 @@ class ProjectGenerationWorker:
                 input_tokens=api_result.usage_input_tokens,
                 output_tokens=api_result.usage_output_tokens,
                 results=generated,
+                provider_id=api_result.provider_id,
+                provider_code=api_result.provider_code,
+                provider_name=api_result.provider_name,
+                provider_model=api_result.provider_model,
             )
             self.signals.finished.emit(self.task.id, attempt_id)
         except Exception as exc:

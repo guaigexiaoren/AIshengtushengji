@@ -28,6 +28,9 @@ class CollaborationSchemaTests(unittest.TestCase):
             "user_api_keys",
             "user_menu_permissions",
             "user_project_access",
+            "api_providers",
+            "api_provider_models",
+            "generation_provider_calls",
         ):
             self.assertIn(f"CREATE TABLE IF NOT EXISTS {table}", schema)
         for column in (
@@ -36,6 +39,9 @@ class CollaborationSchemaTests(unittest.TestCase):
             "is_urgent",
             "urgent_date",
             "urgent_by",
+            "provider_id",
+            "provider_model",
+            "default_protocol",
         ):
             self.assertIn(column, schema)
         self.assertIn("utf8mb4", schema)

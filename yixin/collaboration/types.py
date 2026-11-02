@@ -271,6 +271,38 @@ class GenerationAttempt:
     operator_name: str = ""
     created_at: datetime | None = None
     finished_at: datetime | None = None
+    provider_id: int | None = None
+    provider_code: str = ""
+    provider_name: str = ""
+    provider_model: str = ""
+
+
+@dataclass(frozen=True)
+class ApiProvider:
+    id: int
+    provider_code: str
+    display_name: str
+    base_url: str
+    default_protocol: str
+    enabled: bool
+    priority: int
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ProviderModelRoute:
+    provider_id: int
+    provider_code: str
+    provider_name: str
+    base_url: str
+    default_protocol: str
+    logical_model: str
+    provider_model: str
+    protocol: str
+    max_reference_images: int
+    images_per_request: int
+    priority: int
 
 
 @dataclass(frozen=True)

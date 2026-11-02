@@ -101,6 +101,36 @@ class MySQLIntegrationTests(unittest.TestCase):
                 repository.load_actor_api_key(ai_one),
                 "sk-integration-key-123",
             )
+            provider_ids = {
+                provider.provider_code: provider.id
+                for provider in repository.list_api_providers()
+            }
+            self.assertIn("88api", provider_ids)
+            self.assertIn("a6api", provider_ids)
+            self.assertIn("amux", provider_ids)
+            repository.save_api_key(
+                admin,
+                ai_one.id,
+                "sk-integration-a6-key-123",
+                provider_id=provider_ids["a6api"],
+            )
+            self.assertEqual(
+                repository.load_actor_api_key(
+                    ai_one,
+                    provider_id=provider_ids["a6api"],
+                ),
+                "sk-integration-a6-key-123",
+            )
+            route_codes = {
+                route.provider_code
+                for route in repository.list_provider_routes(
+                    "gemini-3.1-flash-image"
+                )
+            }
+            self.assertTrue(
+                {"liuguang", "88api", "a6api", "amux"}
+                <= route_codes
+            )
             repository.set_model_price(
                 admin,
                 "gemini-3.1-flash-image",

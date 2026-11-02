@@ -27,6 +27,18 @@ class EmptyCentralRepository:
     def api_key_statuses(self):
         return {}
 
+    def api_key_statuses_by_provider(self):
+        return {}
+
+    def api_key_status(self, _user_id, _provider_id):
+        return None
+
+    def list_api_providers(self, **_kwargs):
+        return []
+
+    def list_provider_models(self, _provider_id, **_kwargs):
+        return []
+
     def list_model_prices(self):
         return {}
 
@@ -42,7 +54,7 @@ class EmptyCentralRepository:
             "max_generation_concurrency": 2,
         }
 
-    def load_actor_api_key(self, _actor):
+    def load_actor_api_key(self, _actor, **_kwargs):
         return None
 
     def report(self, _filter):

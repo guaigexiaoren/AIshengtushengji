@@ -8,7 +8,6 @@ from PySide6.QtCore import QLocale, QTimer
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from .api import NanoBananaClient
 from .collaboration.cleanup import cleanup_expired_candidates
 from .collaboration.api_keys import DatabaseApiKeyStore
 from .collaboration.repository import (
@@ -25,6 +24,7 @@ from .library import LibraryService
 from .logging_utils import register_sensitive_value, setup_logging
 from .paths import AppPaths, resource_path
 from .private_config import DATABASE, SHARED_ROOT
+from .provider_router import ProviderRouter
 from .storage import FileStore
 from .ui.main_window import MainWindow
 from .ui.collaboration_login import (
@@ -103,7 +103,7 @@ def run() -> int:
             register_sensitive_value(secret_store.load())
         except Exception:
             pass
-        client = NanoBananaClient(lambda: secret_store.load())
+        client = ProviderRouter(repository, secret_store, actor)
         worker = TaskWorker(database, client, file_store)
         library_service = LibraryService(database, file_store, paths)
         window = MainWindow(

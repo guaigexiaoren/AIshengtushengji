@@ -43,6 +43,8 @@ class ImageRequest:
     mode: str = MODE_TEXT
     auto_strategy: str | None = None
     auto_reason: str | None = None
+    provider_code: str | None = None
+    central_attempt_id: int | None = None
 
     def validate(self) -> None:
         if self.model not in MODEL_IDS:
@@ -97,6 +99,10 @@ class ImageApiResult:
     usage_output_tokens: int | None
     raw_response: Mapping[str, Any]
     status_code: int
+    provider_id: int | None = None
+    provider_code: str = ""
+    provider_name: str = ""
+    provider_model: str = ""
 
 
 class ApiError(Exception):

@@ -46,6 +46,7 @@ from ..collaboration.types import (
     ROLE_LABELS,
     ROLE_OPERATIONS,
     TASK_STATUS_LABELS,
+    ApiProvider,
     AuthUser,
     MENU_KEYS,
     PROJECT_SCOPE_LABELS,
@@ -55,7 +56,11 @@ from ..collaboration.types import (
     ProjectRecord,
     ProjectTask,
 )
-from ..constants import MODEL_OPTIONS
+from ..constants import (
+    MODEL_OPTIONS,
+    PROVIDER_PROTOCOL_LABELS,
+    PROVIDER_PROTOCOLS,
+)
 from ..security import validate_api_key
 from ..time_utils import utc_naive_to_local
 
@@ -290,6 +295,7 @@ class ApiKeyDialog(QDialog):
         repository: MySQLCentralRepository,
         actor: AuthUser,
         target: AuthUser,
+        providers: tuple[ApiProvider, ...],
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -306,9 +312,19 @@ class ApiKeyDialog(QDialog):
         tip.setWordWrap(True)
         layout.addWidget(tip)
         form = QFormLayout()
+        self.provider_combo = QComboBox()
+        for provider in providers:
+            self.provider_combo.addItem(
+                f"{provider.display_name} · {provider.base_url}",
+                provider.id,
+            )
         self.key_edit = QLineEdit()
         self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.key_edit.setPlaceholderText("粘贴新的 API Key")
+        self.status_label = QLabel()
+        self.status_label.setStyleSheet("color:#60708a;")
+        form.addRow("API 平台", self.provider_combo)
+        form.addRow("当前状态", self.status_label)
         form.addRow("API Key", self.key_edit)
         layout.addLayout(form)
         actions = QHBoxLayout()
@@ -319,11 +335,38 @@ class ApiKeyDialog(QDialog):
         cancel.clicked.connect(self.reject)
         check.clicked.connect(self._check_format)
         save.clicked.connect(self._save)
+        self.provider_combo.currentIndexChanged.connect(
+            self._refresh_status
+        )
         actions.addStretch(1)
         actions.addWidget(check)
         actions.addWidget(cancel)
         actions.addWidget(save)
         layout.addLayout(actions)
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        self.key_edit.clear()
+        provider_id = self.provider_combo.currentData()
+        if provider_id is None:
+            self.status_label.setText("没有已启用的 API 平台")
+            self.key_edit.setEnabled(False)
+            return
+        self.key_edit.setEnabled(True)
+        try:
+            status = self.repository.api_key_status(
+                self.target.id,
+                int(provider_id),
+            )
+        except Exception:
+            status = None
+        if not status:
+            self.status_label.setText("未配置")
+            return
+        self.status_label.setText(
+            f"已配置 · 尾号 {status['key_suffix']} · "
+            f"{utc_naive_to_local(status['updated_at']).strftime('%Y-%m-%d %H:%M')}"
+        )
 
     def _check_format(self) -> None:
         try:
@@ -334,11 +377,189 @@ class ApiKeyDialog(QDialog):
         QMessageBox.information(self, "格式正确", "API Key 格式检查通过。")
 
     def _save(self) -> None:
+        provider_id = self.provider_combo.currentData()
+        if provider_id is None:
+            QMessageBox.warning(
+                self,
+                "没有可用平台",
+                "请先启用至少一个 API 平台。",
+            )
+            return
         try:
             self.repository.save_api_key(
                 self.actor,
                 self.target.id,
                 self.key_edit.text(),
+                provider_id=int(provider_id),
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
+        self.accept()
+
+
+class ApiProviderDialog(QDialog):
+    def __init__(
+        self,
+        repository: MySQLCentralRepository,
+        actor: AuthUser,
+        provider: ApiProvider,
+        models: list[dict],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.repository = repository
+        self.actor = actor
+        self.provider = provider
+        self.setWindowTitle(f"编辑 API 平台 · {provider.display_name}")
+        self.resize(920, 560)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.display_name = QLineEdit(provider.display_name)
+        self.base_url = QLineEdit(provider.base_url)
+        self.default_protocol = QComboBox()
+        for protocol in PROVIDER_PROTOCOLS:
+            self.default_protocol.addItem(
+                PROVIDER_PROTOCOL_LABELS[protocol],
+                protocol,
+            )
+        self.default_protocol.setCurrentIndex(
+            self.default_protocol.findData(provider.default_protocol)
+        )
+        self.priority = QSpinBox()
+        self.priority.setRange(0, 9999)
+        self.priority.setValue(provider.priority)
+        self.enabled = QCheckBox("启用该平台")
+        self.enabled.setChecked(provider.enabled)
+        form.addRow("平台名称", self.display_name)
+        form.addRow("API 地址", self.base_url)
+        form.addRow("默认协议", self.default_protocol)
+        form.addRow("平台优先级", self.priority)
+        form.addRow("平台状态", self.enabled)
+        layout.addLayout(form)
+
+        hint = QLabel(
+            "“逻辑模型”是页面显示的模型；“平台模型名”是该平台实际"
+            "接收的模型名称。协议、参考图上限必须按平台文档填写。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#60708a;")
+        layout.addWidget(hint)
+        self.model_table = QTableWidget(0, 6)
+        self.model_table.setHorizontalHeaderLabels(
+            [
+                "逻辑模型",
+                "平台模型名",
+                "请求协议",
+                "最大参考图",
+                "单次出图",
+                "启用",
+            ]
+        )
+        self.model_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive
+        )
+        for column, width in enumerate((190, 260, 180, 100, 85, 60)):
+            self.model_table.setColumnWidth(column, width)
+        layout.addWidget(self.model_table, 1)
+
+        existing = {
+            str(model["logical_model"]): model for model in models
+        }
+        for label, logical_model in MODEL_OPTIONS:
+            model = existing.get(logical_model, {})
+            row = self.model_table.rowCount()
+            self.model_table.insertRow(row)
+            name_item = QTableWidgetItem(label)
+            name_item.setData(Qt.ItemDataRole.UserRole, logical_model)
+            name_item.setFlags(
+                name_item.flags()
+                & ~Qt.ItemFlag.ItemIsEditable
+            )
+            self.model_table.setItem(row, 0, name_item)
+            provider_model = QLineEdit(
+                str(model.get("provider_model") or logical_model)
+            )
+            self.model_table.setCellWidget(row, 1, provider_model)
+            protocol = QComboBox()
+            for value in PROVIDER_PROTOCOLS:
+                protocol.addItem(
+                    PROVIDER_PROTOCOL_LABELS[value],
+                    value,
+                )
+            protocol.setCurrentIndex(
+                max(
+                    0,
+                    protocol.findData(
+                        model.get("protocol")
+                        or provider.default_protocol
+                    ),
+                )
+            )
+            self.model_table.setCellWidget(row, 2, protocol)
+            max_references = QSpinBox()
+            max_references.setRange(0, 14)
+            max_references.setValue(
+                14
+                if model.get("max_reference_images") is None
+                else int(model["max_reference_images"])
+            )
+            self.model_table.setCellWidget(row, 3, max_references)
+            images_per_request = QSpinBox()
+            images_per_request.setRange(1, 4)
+            images_per_request.setValue(
+                1
+                if model.get("images_per_request") is None
+                else int(model["images_per_request"])
+            )
+            self.model_table.setCellWidget(row, 4, images_per_request)
+            model_enabled = QCheckBox()
+            model_enabled.setChecked(bool(model.get("is_enabled", True)))
+            self.model_table.setCellWidget(row, 5, model_enabled)
+
+        actions = QHBoxLayout()
+        cancel = QPushButton("取消")
+        save = QPushButton("保存")
+        save.setObjectName("PrimaryButton")
+        cancel.clicked.connect(self.reject)
+        save.clicked.connect(self._save)
+        actions.addStretch(1)
+        actions.addWidget(cancel)
+        actions.addWidget(save)
+        layout.addLayout(actions)
+
+    def _save(self) -> None:
+        models: list[dict] = []
+        for row in range(self.model_table.rowCount()):
+            logical_item = self.model_table.item(row, 0)
+            provider_model = self.model_table.cellWidget(row, 1)
+            protocol = self.model_table.cellWidget(row, 2)
+            max_references = self.model_table.cellWidget(row, 3)
+            images_per_request = self.model_table.cellWidget(row, 4)
+            model_enabled = self.model_table.cellWidget(row, 5)
+            models.append(
+                {
+                    "logical_model": logical_item.data(
+                        Qt.ItemDataRole.UserRole
+                    ),
+                    "provider_model": provider_model.text(),
+                    "protocol": protocol.currentData(),
+                    "max_reference_images": max_references.value(),
+                    "images_per_request": images_per_request.value(),
+                    "priority": self.priority.value(),
+                    "enabled": model_enabled.isChecked(),
+                }
+            )
+        try:
+            self.repository.update_api_provider(
+                self.actor,
+                self.provider.id,
+                display_name=self.display_name.text(),
+                base_url=self.base_url.text(),
+                default_protocol=self.default_protocol.currentData(),
+                enabled=self.enabled.isChecked(),
+                priority=self.priority.value(),
+                models=models,
             )
         except Exception as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
@@ -432,6 +653,10 @@ class AdminPage(QWidget):
         self.tasks: list[ProjectTask] = []
         self.users: list[AuthUser] = []
         self.api_key_statuses: dict[int, dict] = {}
+        self.api_key_statuses_by_provider: dict[
+            tuple[int, int], dict
+        ] = {}
+        self.api_providers: list[ApiProvider] = []
         self.report_data: ReportData | None = None
         self._build()
         if auto_load:
@@ -441,12 +666,15 @@ class AdminPage(QWidget):
         layout = QVBoxLayout(self)
         title = QLabel("管理员控制台")
         title.setStyleSheet("font-size:22px;font-weight:700;color:#1f2d43;")
-        subtitle = QLabel("账号、模型成本、共享设置、异常处理和经营报表。")
+        subtitle = QLabel(
+            "账号、API 平台、模型成本、共享设置、异常处理和经营报表。"
+        )
         subtitle.setStyleSheet("color:#6d7a91;")
         layout.addWidget(title)
         layout.addWidget(subtitle)
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_users_tab(), "用户与权限")
+        self.tabs.addTab(self._build_api_platforms_tab(), "API 平台")
         self.tabs.addTab(self._build_settings_tab(), "价格与共享设置")
         self.tabs.addTab(self._build_exceptions_tab(), "任务异常")
         self.tabs.addTab(self._build_reports_tab(), "经营报表")
@@ -454,6 +682,7 @@ class AdminPage(QWidget):
 
     def refresh_all(self) -> None:
         self._refresh_users()
+        self._refresh_api_platforms()
         self._refresh_prices()
         self._refresh_settings()
         self._refresh_templates()
@@ -518,6 +747,44 @@ class AdminPage(QWidget):
         ):
             self.user_table.setColumnWidth(column, width)
         layout.addWidget(self.user_table, 1)
+        return widget
+
+    def _build_api_platforms_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        hint = QLabel(
+            "平台优先级数字越小越先调用。生成发生网络、额度或服务端错误时，"
+            "会按顺序切换到下一个已配置 Key 的平台；请求超时不会自动切换。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#60708a;")
+        layout.addWidget(hint)
+        toolbar = QHBoxLayout()
+        edit = QPushButton("编辑所选平台")
+        refresh = QPushButton("刷新")
+        edit.clicked.connect(self._edit_api_provider)
+        refresh.clicked.connect(self._refresh_api_platforms)
+        toolbar.addWidget(edit)
+        toolbar.addStretch(1)
+        toolbar.addWidget(refresh)
+        layout.addLayout(toolbar)
+        self.provider_table = QTableWidget(0, 6)
+        self.provider_table.setHorizontalHeaderLabels(
+            ["平台", "协议", "地址", "状态", "优先级", "模型映射"]
+        )
+        self.provider_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.provider_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.provider_table.horizontalHeader().setStretchLastSection(True)
+        self.provider_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive
+        )
+        for column, width in enumerate((120, 180, 340, 80, 80, 100)):
+            self.provider_table.setColumnWidth(column, width)
+        layout.addWidget(self.provider_table, 1)
         return widget
 
     def _build_settings_tab(self) -> QWidget:
@@ -684,12 +951,13 @@ class AdminPage(QWidget):
         layout.addWidget(self.summary_label)
         self.trend_chart = AdminTrendChart()
         layout.addWidget(self.trend_chart)
-        self.report_table = QTableWidget(0, 9)
+        self.report_table = QTableWidget(0, 10)
         self.report_table.setHorizontalHeaderLabels(
             [
                 "任务编码",
                 "子任务",
                 "制作人员",
+                "API 平台",
                 "模型",
                 "服装",
                 "状态",
@@ -706,7 +974,7 @@ class AdminPage(QWidget):
             QHeaderView.ResizeMode.Interactive
         )
         for column, width in enumerate(
-            (220, 220, 120, 130, 150, 100, 80, 70, 90)
+            (220, 220, 120, 115, 130, 150, 100, 80, 70, 90)
         ):
             self.report_table.setColumnWidth(column, width)
         layout.addWidget(self.report_table, 1)
@@ -716,6 +984,9 @@ class AdminPage(QWidget):
         try:
             self.users = self.repository.list_users()
             self.api_key_statuses = self.repository.api_key_statuses()
+            self.api_key_statuses_by_provider = (
+                self.repository.api_key_statuses_by_provider()
+            )
         except Exception as exc:
             QMessageBox.warning(self, "读取账号失败", str(exc))
             return
@@ -723,6 +994,13 @@ class AdminPage(QWidget):
         for user in self.users:
             row = self.user_table.rowCount()
             self.user_table.insertRow(row)
+            key_info = self.api_key_statuses.get(user.id)
+            provider_count = sum(
+                1
+                for user_id, _provider_id
+                in self.api_key_statuses_by_provider
+                if user_id == user.id
+            )
             values = (
                 user.username,
                 user.display_name,
@@ -730,15 +1008,16 @@ class AdminPage(QWidget):
                 "启用" if user.is_active else "停用",
                 "是" if user.must_change_password else "否",
                 (
-                    f"已配置 · {key_info['key_suffix']}"
-                    if (key_info := self.api_key_statuses.get(user.id))
+                    f"已配置 {provider_count} 个平台"
+                    f" · {key_info['key_suffix']}"
+                    if key_info
                     else "未配置"
                 ),
                 (
                     utc_naive_to_local(key_info["updated_at"]).strftime(
                         "%Y-%m-%d %H:%M"
                     )
-                    if (key_info := self.api_key_statuses.get(user.id))
+                    if key_info
                     else ""
                 ),
                 str(user.urgent_quota_per_day),
@@ -750,6 +1029,75 @@ class AdminPage(QWidget):
                     item.setData(Qt.ItemDataRole.UserRole, user.id)
                 self.user_table.setItem(row, column, item)
         self._refresh_filter_users()
+
+    def _refresh_api_platforms(self) -> None:
+        try:
+            self.api_providers = self.repository.list_api_providers()
+            model_counts = {
+                provider.id: len(
+                    self.repository.list_provider_models(
+                        provider.id,
+                        include_disabled=False,
+                    )
+                )
+                for provider in self.api_providers
+            }
+        except Exception as exc:
+            QMessageBox.warning(self, "读取 API 平台失败", str(exc))
+            return
+        self.provider_table.setRowCount(0)
+        for provider in self.api_providers:
+            row = self.provider_table.rowCount()
+            self.provider_table.insertRow(row)
+            values = (
+                provider.display_name,
+                PROVIDER_PROTOCOL_LABELS.get(
+                    provider.default_protocol,
+                    provider.default_protocol,
+                ),
+                provider.base_url,
+                "启用" if provider.enabled else "停用",
+                str(provider.priority),
+                f"{model_counts.get(provider.id, 0)} 个",
+            )
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column == 0:
+                    item.setData(
+                        Qt.ItemDataRole.UserRole,
+                        provider.id,
+                    )
+                self.provider_table.setItem(row, column, item)
+
+    def _current_provider(self) -> ApiProvider | None:
+        row = self.provider_table.currentRow()
+        if not 0 <= row < len(self.api_providers):
+            return None
+        return self.api_providers[row]
+
+    def _edit_api_provider(self) -> None:
+        provider = self._current_provider()
+        if provider is None:
+            QMessageBox.information(
+                self,
+                "未选择平台",
+                "请先选择一个 API 平台。",
+            )
+            return
+        try:
+            models = self.repository.list_provider_models(provider.id)
+        except Exception as exc:
+            QMessageBox.warning(self, "读取模型映射失败", str(exc))
+            return
+        dialog = ApiProviderDialog(
+            self.repository,
+            self.actor,
+            provider,
+            models,
+            self,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._refresh_api_platforms()
 
     def _current_user(self) -> AuthUser | None:
         row = self.user_table.currentRow()
@@ -832,23 +1180,79 @@ class AdminPage(QWidget):
                 "只有 AI 制作或管理员账号需要配置 API Key。",
             )
             return
-        dialog = ApiKeyDialog(self.repository, self.actor, user, self)
+        try:
+            providers = tuple(
+                self.repository.list_api_providers(
+                    include_disabled=False
+                )
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "读取 API 平台失败", str(exc))
+            return
+        if not providers:
+            QMessageBox.warning(
+                self,
+                "没有可用平台",
+                "请先在“API 平台”中启用至少一个平台。",
+            )
+            return
+        dialog = ApiKeyDialog(
+            self.repository,
+            self.actor,
+            user,
+            providers,
+            self,
+        )
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._refresh_users()
 
     def _clear_api_key(self) -> None:
         user = self._current_user()
-        if user is None or user.id not in self.api_key_statuses:
+        if user is None:
+            QMessageBox.information(self, "未选择账号", "请先选择一个账号。")
             return
+        configured = [
+            provider
+            for provider in self.api_providers
+            if (user.id, provider.id)
+            in self.api_key_statuses_by_provider
+        ]
+        if not configured:
+            QMessageBox.information(
+                self,
+                "无需清除",
+                "当前账号尚未配置 API Key。",
+            )
+            return
+        labels = [
+            f"{provider.display_name}（尾号 "
+            f"{self.api_key_statuses_by_provider[(user.id, provider.id)]['key_suffix']}）"
+            for provider in configured
+        ]
+        selected, ok = QInputDialog.getItem(
+            self,
+            "清除 API Key",
+            "选择要清除的平台：",
+            labels,
+            0,
+            False,
+        )
+        if not ok:
+            return
+        provider = configured[labels.index(selected)]
         answer = QMessageBox.question(
             self,
             "清除 API Key",
-            f"确定清除 {user.display_name} 的 API Key 吗？",
+            f"确定清除 {user.display_name} 在 {provider.display_name} 的 API Key 吗？",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            self.repository.clear_api_key(self.actor, user.id)
+            self.repository.clear_api_key(
+                self.actor,
+                user.id,
+                provider_id=provider.id,
+            )
         except Exception as exc:
             QMessageBox.warning(self, "清除失败", str(exc))
             return
@@ -1308,6 +1712,7 @@ class AdminPage(QWidget):
                 item.project_code,
                 item.task_code,
                 item.assignee_name or "未分配",
+                item.provider_name or "自动/历史",
                 item.model,
                 item.garment_name,
                 TASK_STATUS_LABELS.get(item.task_status, item.task_status),
