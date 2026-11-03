@@ -9,6 +9,7 @@ from yixin.collaboration.repository import (
 )
 from yixin.collaboration.types import (
     ROLE_ADMIN,
+    ROLE_OPERATIONS,
     AuthUser,
     PairingInput,
     ProjectAssetInput,
@@ -47,6 +48,68 @@ class RecordingConnection:
 
 
 class RepositoryGuardTests(unittest.TestCase):
+    def test_operation_account_preview_merges_same_project_names(
+        self,
+    ) -> None:
+        class Cursor:
+            def __init__(self) -> None:
+                self.results = [
+                    [
+                        {
+                            "id": 1,
+                            "username": "YY01",
+                            "display_name": "其他项目",
+                            "role": ROLE_OPERATIONS,
+                            "is_active": 1,
+                        },
+                        {
+                            "id": 2,
+                            "username": "legacy",
+                            "display_name": "同名项目",
+                            "role": ROLE_OPERATIONS,
+                            "is_active": 1,
+                        },
+                    ],
+                    [
+                        {
+                            "display_name": "同名项目",
+                            "project_scope": "internal",
+                            "project_name": "同名项目",
+                        },
+                        {
+                            "display_name": "同名项目",
+                            "project_scope": "external",
+                            "project_name": "同名项目",
+                        },
+                    ],
+                ]
+
+            def execute(self, _sql, _params=()):
+                return self
+
+            def fetchall(self):
+                return self.results.pop(0)
+
+        candidates = MySQLCentralRepository._operation_account_candidates(
+            Cursor(),
+            {
+                "internal": ("春季项目", "同名项目"),
+                "external": ("同名项目", "外部项目"),
+            },
+        )
+        by_name = {item.display_name: item for item in candidates}
+        self.assertEqual(by_name["春季项目"].username, "YY03")
+        self.assertEqual(by_name["春季项目"].status, "create")
+        self.assertEqual(by_name["同名项目"].status, "skip")
+        self.assertEqual(
+            by_name["同名项目"].project_access,
+            (
+                ("internal", "同名项目"),
+                ("external", "同名项目"),
+            ),
+        )
+        self.assertEqual(by_name["外部项目"].username, "YY02")
+
     def test_delete_user_rejects_non_admin_and_current_admin(self) -> None:
         repository = MySQLCentralRepository(
             MySQLConfig("localhost", 3306, "test", "user", "password")

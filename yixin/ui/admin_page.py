@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
-from PySide6.QtCore import QDate, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
-    QDateEdit,
     QDialog,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QGridLayout,
     QGroupBox,
@@ -36,8 +33,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..collaboration.reports import ReportData, ReportFilter, export_report_excel
-from ..collaboration.reports import GroupMetrics
 from ..collaboration.repository import MySQLCentralRepository
 from ..collaboration.types import (
     PROJECT_STATUS_LABELS,
@@ -64,7 +59,7 @@ from ..constants import (
 from ..security import validate_api_key
 from ..time_utils import utc_naive_to_local
 from .async_queries import get_query_runner
-from .components import FilterBar, PageActionBar, PageHeader
+from .components import PageActionBar, PageHeader
 
 
 class UserPermissionOptions(QWidget):
@@ -570,76 +565,6 @@ class ApiProviderDialog(QDialog):
         self.accept()
 
 
-class AdminTrendChart(QWidget):
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.groups: tuple[GroupMetrics, ...] = ()
-        self.setMinimumHeight(180)
-
-    def set_groups(self, groups: tuple[GroupMetrics, ...]) -> None:
-        self.groups = groups
-        self.update()
-
-    def paintEvent(self, _event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#f7f9fd"))
-        available = self.rect().adjusted(48, 28, -18, -34)
-        painter.setFont(QFont(self.font().family(), 9))
-        painter.setPen(QPen(QColor("#8795aa"), 1))
-        painter.drawText(16, 20, "每日任务量趋势")
-        painter.drawLine(
-            available.left(),
-            available.bottom(),
-            available.right(),
-            available.bottom(),
-        )
-        if not self.groups:
-            painter.setPen(QColor("#7d8ba0"))
-            painter.drawText(
-                available,
-                Qt.AlignmentFlag.AlignCenter,
-                "当前筛选范围暂无数据",
-            )
-            return
-        maximum = max(group.task_count for group in self.groups) or 1
-        slot_width = available.width() / max(1, len(self.groups))
-        bar_width = max(8.0, min(48.0, slot_width * 0.55))
-        for index, group in enumerate(self.groups):
-            center = available.left() + slot_width * (index + 0.5)
-            height = available.height() * group.task_count / maximum
-            bar = (
-                center - bar_width / 2,
-                available.bottom() - height,
-                bar_width,
-                height,
-            )
-            painter.fillRect(
-                int(bar[0]),
-                int(bar[1]),
-                int(bar[2]),
-                max(1, int(bar[3])),
-                QColor("#4778cc"),
-            )
-            painter.setPen(QColor("#4f5d72"))
-            painter.drawText(
-                int(center - slot_width / 2),
-                available.bottom() + 6,
-                int(slot_width),
-                18,
-                Qt.AlignmentFlag.AlignHCenter,
-                group.label[5:] if len(group.label) >= 10 else group.label,
-            )
-            painter.drawText(
-                int(center - slot_width / 2),
-                int(bar[1] - 18),
-                int(slot_width),
-                16,
-                Qt.AlignmentFlag.AlignHCenter,
-                str(group.task_count),
-            )
-
-
 class AdminPage(QWidget):
     def __init__(
         self,
@@ -660,7 +585,6 @@ class AdminPage(QWidget):
             tuple[int, int], dict
         ] = {}
         self.api_providers: list[ApiProvider] = []
-        self.report_data: ReportData | None = None
         self.query_runner = get_query_runner()
         self._active_exception_request = -1
         self._build()
@@ -676,7 +600,7 @@ class AdminPage(QWidget):
         layout.addWidget(
             PageHeader(
                 "管理控制台",
-                "账号、API 平台、共享设置、任务异常和经营报表。",
+                "账号、API 平台、共享设置和任务异常。",
             )
         )
         self.tabs = QTabWidget()
@@ -684,7 +608,6 @@ class AdminPage(QWidget):
         self.tabs.addTab(self._build_api_platforms_tab(), "API 平台")
         self.tabs.addTab(self._build_settings_tab(), "价格与共享设置")
         self.tabs.addTab(self._build_exceptions_tab(), "任务异常")
-        self.tabs.addTab(self._build_reports_tab(), "经营报表")
         layout.addWidget(self.tabs, 1)
 
     def refresh_all(self) -> None:
@@ -694,7 +617,6 @@ class AdminPage(QWidget):
         self._refresh_settings()
         self._refresh_templates()
         self._refresh_projects()
-
     def refresh(self) -> None:
         self.refresh_all()
 
@@ -717,6 +639,12 @@ class AdminPage(QWidget):
         self.delete_user_button = QPushButton("删除账号")
         self.delete_user_button.setObjectName("DangerButton")
         self.delete_user_button.clicked.connect(self._delete_user)
+        self.sync_operations_button = QPushButton(
+            "扫描共享盘并创建运营账号"
+        )
+        self.sync_operations_button.clicked.connect(
+            self._sync_operation_accounts
+        )
         refresh_button = QPushButton("刷新")
         refresh_button.clicked.connect(self._refresh_users)
         toolbar.addStretch(1)
@@ -754,6 +682,7 @@ class AdminPage(QWidget):
         action_bar = PageActionBar()
         for button in (
             add_button,
+            self.sync_operations_button,
             edit_button,
             self.toggle_user_button,
             reset_button,
@@ -933,77 +862,6 @@ class AdminPage(QWidget):
         layout.addWidget(actions)
         return widget
 
-    def _build_reports_tab(self) -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        filter_bar = FilterBar()
-        filters = filter_bar.layout
-        self.start_date = QDateEdit(QDate.currentDate().addDays(-30))
-        self.start_date.setCalendarPopup(True)
-        self.end_date = QDateEdit(QDate.currentDate())
-        self.end_date.setCalendarPopup(True)
-        self.project_filter = QComboBox()
-        self.user_filter = QComboBox()
-        self.model_filter = QComboBox()
-        self.model_filter.addItem("全部模型", "")
-        for label, model_id in MODEL_OPTIONS:
-            self.model_filter.addItem(label, model_id)
-        search = QPushButton("生成报表")
-        search.clicked.connect(self._load_report)
-        export = QPushButton("导出 Excel")
-        export.clicked.connect(self._export_report)
-        filters.addWidget(QLabel("开始"))
-        filters.addWidget(self.start_date)
-        filters.addWidget(QLabel("结束"))
-        filters.addWidget(self.end_date)
-        filters.addWidget(self.project_filter)
-        filters.addWidget(self.user_filter)
-        filters.addWidget(self.model_filter)
-        filters.addStretch(1)
-        layout.addWidget(filter_bar)
-        self.summary_label = QLabel("尚未生成报表")
-        self.summary_label.setWordWrap(True)
-        self.summary_label.setStyleSheet(
-            "background:#eef4ff;border:1px solid #d6e2f8;"
-            "border-radius:8px;padding:12px;line-height:1.7;"
-        )
-        layout.addWidget(self.summary_label)
-        self.trend_chart = AdminTrendChart()
-        layout.addWidget(self.trend_chart)
-        self.report_table = QTableWidget(0, 10)
-        self.report_table.setHorizontalHeaderLabels(
-            [
-                "任务编码",
-                "子任务",
-                "制作人员",
-                "API 平台",
-                "模型",
-                "服装",
-                "状态",
-                "最终图片",
-                "返工",
-                "成本",
-            ]
-        )
-        self.report_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        self.report_table.horizontalHeader().setStretchLastSection(True)
-        self.report_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Interactive
-        )
-        for column, width in enumerate(
-            (220, 220, 120, 115, 130, 150, 100, 80, 70, 90)
-        ):
-            self.report_table.setColumnWidth(column, width)
-        layout.addWidget(self.report_table, 1)
-        action_bar = PageActionBar()
-        action_bar.layout.addWidget(export)
-        action_bar.layout.addStretch(1)
-        action_bar.layout.addWidget(search)
-        layout.addWidget(action_bar)
-        return widget
-
     def _refresh_users(self) -> None:
         try:
             self.users = self.repository.list_users()
@@ -1052,7 +910,6 @@ class AdminPage(QWidget):
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, user.id)
                 self.user_table.setItem(row, column, item)
-        self._refresh_filter_users()
 
     def _refresh_api_platforms(self) -> None:
         try:
@@ -1153,6 +1010,96 @@ class AdminPage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "新增失败", str(exc))
             return
+        self._refresh_users()
+
+    def _sync_operation_accounts(self) -> None:
+        try:
+            candidates = self.repository.preview_operation_accounts(
+                self.actor
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "扫描共享盘失败", str(exc))
+            return
+        if not candidates:
+            QMessageBox.information(
+                self,
+                "没有项目文件夹",
+                "共享盘中没有扫描到内部或外部项目文件夹。",
+            )
+            return
+        conflicts = [
+            item for item in candidates if item.status == "conflict"
+        ]
+        if conflicts:
+            details = "\n".join(
+                f"{item.display_name}：{item.reason}"
+                for item in conflicts
+            )
+            QMessageBox.warning(
+                self,
+                "账号冲突",
+                "存在冲突，本次不会创建任何账号：\n" + details,
+            )
+            return
+        pending = [
+            item for item in candidates if item.status == "create"
+        ]
+        skipped = [
+            item for item in candidates if item.status == "skip"
+        ]
+        if not pending:
+            QMessageBox.information(
+                self,
+                "无需创建",
+                f"扫描到 {len(candidates)} 个项目，"
+                "对应运营账号均已存在。",
+            )
+            return
+        preview = "\n".join(
+            (
+                f"{item.username}  {item.display_name}  "
+                + "、".join(
+                    f"{PROJECT_SCOPE_LABELS.get(scope, scope)}"
+                    for scope, _name in item.project_access
+                )
+            )
+            for item in pending[:20]
+        )
+        if len(pending) > 20:
+            preview += f"\n……另有 {len(pending) - 20} 个"
+        answer = QMessageBox.question(
+            self,
+            "确认创建运营账号",
+            (
+                f"扫描到 {len(candidates)} 个项目，"
+                f"将新建 {len(pending)} 个运营账号，"
+                f"跳过 {len(skipped)} 个已有账号。\n\n"
+                f"{preview}\n\n"
+                "默认密码为 123456，首次登录必须修改。"
+            ),
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            result = self.repository.sync_operation_accounts_from_shared(
+                self.actor
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "创建运营账号失败", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "创建完成",
+            (
+                f"新建 {len(result.created)} 个，"
+                f"跳过 {len(result.skipped)} 个。\n"
+                + (
+                    "新账号：" + "、".join(result.created)
+                    if result.created
+                    else ""
+                )
+            ),
+        )
         self._refresh_users()
 
     def _edit_user(self) -> None:
@@ -1558,9 +1505,6 @@ class AdminPage(QWidget):
     def _render_exception_projects(self, result) -> None:
         self.projects = list(result)
         self.project_table.setRowCount(0)
-        self.project_filter.blockSignals(True)
-        self.project_filter.clear()
-        self.project_filter.addItem("全部任务", None)
         for project in self.projects:
             row = self.project_table.rowCount()
             self.project_table.insertRow(row)
@@ -1575,11 +1519,6 @@ class AdminPage(QWidget):
             )
             for column, value in enumerate(values):
                 self.project_table.setItem(row, column, QTableWidgetItem(value))
-            self.project_filter.addItem(
-                f"{project.project_code} · {project.product_code or project.name}",
-                project.id,
-            )
-        self.project_filter.blockSignals(False)
         if self.projects:
             self.project_table.selectRow(0)
 
@@ -1726,95 +1665,3 @@ class AdminPage(QWidget):
             QMessageBox.warning(self, "重开失败", str(exc))
             return
         self._refresh_projects()
-
-    def _refresh_filter_users(self) -> None:
-        if not hasattr(self, "user_filter"):
-            return
-        current = self.user_filter.currentData()
-        self.user_filter.clear()
-        self.user_filter.addItem("全部人员", None)
-        for user in self.users:
-            self.user_filter.addItem(user.display_name, user.id)
-        if current is not None:
-            index = self.user_filter.findData(current)
-            if index >= 0:
-                self.user_filter.setCurrentIndex(index)
-
-    def _load_report(self) -> None:
-        if self.start_date.date() > self.end_date.date():
-            QMessageBox.warning(self, "日期范围错误", "开始日期不能晚于结束日期。")
-            return
-        report_filter = ReportFilter(
-            start_date=self.start_date.date().toPython(),
-            end_date=self.end_date.date().toPython(),
-            project_id=self.project_filter.currentData(),
-            assignee_id=self.user_filter.currentData(),
-            model=self.model_filter.currentData() or "",
-        )
-        self.report_data = None
-        try:
-            self.report_data = self.repository.report(report_filter)
-        except Exception as exc:
-            QMessageBox.warning(self, "报表生成失败", str(exc))
-            return
-        summary = self.report_data.summary
-        self.summary_label.setText(
-            f"总任务 {summary.project_count} 个　子任务 {summary.task_count} 个　"
-            f"已通过 {summary.approved_task_count} 个　"
-            f"总任务完成率 {summary.project_completion_rate:.1%}　"
-            f"子任务通过率 {summary.task_completion_rate:.1%}　"
-            f"最终图片 {summary.final_image_count} 张　"
-            f"返工 {summary.rework_count} 次（{summary.rework_rate:.1%}）\n"
-            f"生成图片 {summary.generated_image_count} 张　"
-            f"PS成品 {summary.manual_image_count} 张　"
-            f"成本 ¥{summary.total_cost:.2f}　"
-            f"每通过任务 ¥{summary.cost_per_approved_task:.2f}　"
-            f"每最终图 ¥{summary.cost_per_final_image:.2f}　"
-            f"平均制作 {summary.average_production_seconds / 3600:.2f} 小时　"
-            f"平均审核 {summary.average_review_seconds / 3600:.2f} 小时　"
-            f"端到端 {summary.average_end_to_end_seconds / 3600:.2f} 小时"
-        )
-        self.trend_chart.set_groups(self.report_data.by_date)
-        self.report_table.setRowCount(0)
-        for item in self.report_data.rows:
-            row = self.report_table.rowCount()
-            self.report_table.insertRow(row)
-            values = (
-                item.project_code,
-                item.task_code,
-                item.assignee_name or "未分配",
-                item.provider_name or "自动/历史",
-                item.model,
-                item.garment_name,
-                TASK_STATUS_LABELS.get(item.task_status, item.task_status),
-                str(item.final_quantity),
-                str(item.rework_count),
-                f"¥{item.generation_cost:.2f}",
-            )
-            for column, value in enumerate(values):
-                self.report_table.setItem(
-                    row,
-                    column,
-                    QTableWidgetItem(value),
-                )
-
-    def _export_report(self) -> None:
-        if self.report_data is None:
-            self._load_report()
-        if self.report_data is None:
-            return
-        default_name = f"经营报表_{date.today():%Y%m%d}.xlsx"
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "导出经营报表",
-            default_name,
-            "Excel 工作簿 (*.xlsx)",
-        )
-        if not path:
-            return
-        try:
-            export_report_excel(self.report_data, Path(path))
-        except Exception as exc:
-            QMessageBox.warning(self, "导出失败", str(exc))
-            return
-        QMessageBox.information(self, "已导出", path)

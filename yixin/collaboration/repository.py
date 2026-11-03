@@ -25,6 +25,9 @@ from ..time_utils import local_to_utc_naive
 from .api_keys import ApiKeyError, decrypt_api_key, encrypt_api_key
 from .auth import hash_password, validate_new_password, verify_password
 from .reports import (
+    REPORT_DATE_COMPLETED,
+    REPORT_DATE_CREATED,
+    GroupMetrics,
     ReportData,
     ReportFilter,
     ReportTaskRow,
@@ -59,6 +62,8 @@ from .types import (
     GenerationPairSpec,
     GenerationAttempt,
     GenerationResult,
+    OperationAccountCandidate,
+    OperationAccountSyncResult,
     PairingInput,
     ProjectAssetInput,
     ProjectDraft,
@@ -71,7 +76,7 @@ from .types import (
     ROLE_ALLOWED_MENUS,
 )
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 LEGACY_SHARED_ROOT = (
     r"\\fe80--211-32ff-fe87-ba49.ipv6-literal.net\AI作图"
 )
@@ -191,6 +196,7 @@ class MySQLCentralRepository:
                     self._apply_schema_v8(cursor)
                     self._apply_schema_v9(cursor)
                     self._apply_schema_v10(cursor)
+                    self._apply_schema_v11(cursor)
                     self._apply_shared_root_update(cursor)
                     cursor.execute(
                         "INSERT IGNORE INTO schema_migrations(version, applied_at) "
@@ -554,6 +560,25 @@ class MySQLCentralRepository:
         )
 
     @staticmethod
+    def _apply_schema_v11(cursor) -> None:
+        cursor.execute(
+            "SELECT COALESCE(MAX(version), 0) AS version "
+            "FROM schema_migrations"
+        )
+        previous_version = int(cursor.fetchone()["version"])
+        if previous_version >= 11:
+            return
+        cursor.execute(
+            """
+            INSERT IGNORE INTO user_menu_permissions(user_id, menu_key)
+            SELECT id, 'reports'
+            FROM users
+            WHERE role = %s AND deleted_at IS NULL
+            """,
+            (ROLE_ADMIN,),
+        )
+
+    @staticmethod
     def _apply_shared_root_update(cursor) -> None:
         cursor.execute(
             """
@@ -905,6 +930,178 @@ class MySQLCentralRepository:
             selected_menus,
             tuple(dict.fromkeys(project_access or ())),
         )
+
+    def preview_operation_accounts(
+        self,
+        actor: AuthUser,
+    ) -> tuple[OperationAccountCandidate, ...]:
+        if actor.role != ROLE_ADMIN:
+            raise PermissionDeniedError("只有管理员可以创建运营账号")
+        folders = self.list_shared_projects()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                return self._operation_account_candidates(
+                    cursor,
+                    folders,
+                )
+
+    def sync_operation_accounts_from_shared(
+        self,
+        actor: AuthUser,
+    ) -> OperationAccountSyncResult:
+        if actor.role != ROLE_ADMIN:
+            raise PermissionDeniedError("只有管理员可以创建运营账号")
+        folders = self.list_shared_projects()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                candidates = self._operation_account_candidates(
+                    cursor,
+                    folders,
+                )
+                conflicts = tuple(
+                    item.display_name
+                    for item in candidates
+                    if item.status == "conflict"
+                )
+                if conflicts:
+                    raise StateConflictError(
+                        "以下项目存在账号冲突，本次创建已全部取消："
+                        + "、".join(conflicts)
+                    )
+                created: list[str] = []
+                skipped = [
+                    item.display_name
+                    for item in candidates
+                    if item.status == "skip"
+                ]
+                for item in candidates:
+                    if item.status != "create":
+                        continue
+                    user_id = self._insert_user(
+                        cursor,
+                        item.username,
+                        item.display_name,
+                        ROLE_OPERATIONS,
+                        "123456",
+                        must_change_password=True,
+                    )
+                    for menu_key in ROLE_DEFAULT_MENUS[ROLE_OPERATIONS]:
+                        cursor.execute(
+                            """
+                            INSERT INTO user_menu_permissions(
+                                user_id, menu_key
+                            ) VALUES (%s, %s)
+                            """,
+                            (user_id, menu_key),
+                        )
+                    for scope, name in item.project_access:
+                        cursor.execute(
+                            """
+                            INSERT INTO user_project_access(
+                                user_id, project_scope, project_name
+                            ) VALUES (%s, %s, %s)
+                            """,
+                            (user_id, scope, name),
+                        )
+                    created.append(item.username)
+        return OperationAccountSyncResult(
+            created=tuple(created),
+            skipped=tuple(skipped),
+            conflicts=(),
+        )
+
+    @staticmethod
+    def _operation_account_candidates(
+        cursor,
+        folders: dict[str, tuple[str, ...]],
+    ) -> tuple[OperationAccountCandidate, ...]:
+        projects_by_name: dict[str, tuple[str, list[str]]] = {}
+        for scope in PROJECT_SCOPES:
+            for name in folders.get(scope, ()):
+                clean = str(name).strip()
+                if not clean:
+                    continue
+                key = clean.casefold()
+                if key not in projects_by_name:
+                    projects_by_name[key] = (clean, [])
+                projects_by_name[key][1].append(scope)
+
+        cursor.execute(
+            """
+            SELECT id, username, display_name, role, is_active
+            FROM users
+            WHERE deleted_at IS NULL
+            """
+        )
+        users = cursor.fetchall()
+        users_by_display = {
+            str(row["display_name"]).casefold(): row for row in users
+        }
+        used_usernames = {
+            str(row["username"]).casefold() for row in users
+        }
+        next_number = 1
+        for username in used_usernames:
+            match = re.fullmatch(r"yy(\d+)", username)
+            if match:
+                next_number = max(next_number, int(match.group(1)) + 1)
+
+        cursor.execute(
+            """
+            SELECT u.display_name, upa.project_scope, upa.project_name
+            FROM users u
+            JOIN user_project_access upa ON upa.user_id = u.id
+            WHERE u.role = %s AND u.is_active = 1
+              AND u.deleted_at IS NULL
+            """,
+            (ROLE_OPERATIONS,),
+        )
+        existing_access: dict[str, set[tuple[str, str]]] = {}
+        for row in cursor.fetchall():
+            existing_access.setdefault(
+                str(row["display_name"]).casefold(),
+                set(),
+            ).add(
+                (row["project_scope"], row["project_name"])
+            )
+
+        result: list[OperationAccountCandidate] = []
+        for key in sorted(projects_by_name):
+            display_name, scopes = projects_by_name[key]
+            access = tuple((scope, display_name) for scope in scopes)
+            existing_user = users_by_display.get(key)
+            if existing_user is None:
+                username = f"YY{next_number:02d}"
+                while username.casefold() in used_usernames:
+                    next_number += 1
+                    username = f"YY{next_number:02d}"
+                used_usernames.add(username.casefold())
+                next_number += 1
+                status = "create"
+                reason = ""
+            elif (
+                existing_user["role"] == ROLE_OPERATIONS
+                and bool(existing_user["is_active"])
+                and set(access)
+                <= existing_access.get(key, set())
+            ):
+                username = str(existing_user["username"])
+                status = "skip"
+                reason = "账号和项目权限已存在"
+            else:
+                username = str(existing_user["username"])
+                status = "conflict"
+                reason = "显示名称已被其他账号使用或项目权限不完整"
+            result.append(
+                OperationAccountCandidate(
+                    username=username,
+                    display_name=display_name,
+                    project_access=access,
+                    status=status,
+                    reason=reason,
+                )
+            )
+        return tuple(result)
 
     def set_user_active(
         self,
@@ -2556,14 +2753,28 @@ class MySQLCentralRepository:
         self,
         actor: AuthUser,
         *,
+        project_name: str | None = None,
         limit: int = 5000,
     ) -> list[ProjectRecord]:
         if actor.role not in (ROLE_AI, ROLE_ADMIN):
             raise PermissionDeniedError("当前角色不能查看待分配任务")
+        project_condition = ""
+        params: list[Any] = [
+            TASK_APPROVED,
+            TASK_AWAITING_ACCEPTANCE,
+            TASK_AVAILABLE,
+            PROJECT_COMPLETED,
+            PROJECT_CANCELLED,
+            TASK_EXPANDED,
+        ]
+        if project_name:
+            project_condition = " AND p.project_name = %s"
+            params.append(project_name)
+        params.append(limit)
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    """
+                    f"""
                     SELECT p.*, owner.display_name AS owner_name,
                            COUNT(t.id) AS task_count,
                            COALESCE(SUM(t.status = %s), 0)
@@ -2580,24 +2791,58 @@ class MySQLCentralRepository:
                     JOIN project_tasks t ON t.project_id = p.id
                     WHERE p.status NOT IN (%s, %s)
                       AND t.status <> %s
+                      {project_condition}
                     GROUP BY p.id, owner.display_name
                     HAVING task_count > 0
                        AND available_count = task_count
                     ORDER BY p.is_urgent DESC, p.source_date, p.id
                     LIMIT %s
                     """,
-                    (
-                        TASK_APPROVED,
-                        TASK_AWAITING_ACCEPTANCE,
-                        TASK_AVAILABLE,
-                        PROJECT_COMPLETED,
-                        PROJECT_CANCELLED,
-                        TASK_EXPANDED,
-                        limit,
-                    ),
+                    tuple(params),
                 )
                 return [
                     _project_record(row)
+                    for row in cursor.fetchall()
+                ]
+
+    def list_assignment_project_counts(
+        self,
+        actor: AuthUser,
+    ) -> list[tuple[str, int]]:
+        if actor.role not in (ROLE_AI, ROLE_ADMIN):
+            raise PermissionDeniedError("当前角色不能查看待分配任务")
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT matched.project_name,
+                           COUNT(*) AS project_count
+                    FROM (
+                        SELECT p.id, p.project_name
+                        FROM projects p
+                        JOIN project_tasks t ON t.project_id = p.id
+                        WHERE p.status NOT IN (%s, %s)
+                          AND p.project_name <> ''
+                          AND t.status <> %s
+                        GROUP BY p.id, p.project_name
+                        HAVING COUNT(*) > 0
+                           AND COUNT(*) = SUM(
+                               t.status = %s
+                               AND t.assignee_id IS NULL
+                           )
+                    ) matched
+                    GROUP BY matched.project_name
+                    ORDER BY matched.project_name
+                    """,
+                    (
+                        PROJECT_COMPLETED,
+                        PROJECT_CANCELLED,
+                        TASK_EXPANDED,
+                        TASK_AVAILABLE,
+                    ),
+                )
+                return [
+                    (str(row["project_name"]), int(row["project_count"]))
                     for row in cursor.fetchall()
                 ]
 
@@ -2632,6 +2877,9 @@ class MySQLCentralRepository:
                     datetime.combine(query.end_date, time.max)
                 )
             )
+        if query.project_name:
+            conditions.append("p.project_name = %s")
+            params.append(query.project_name)
         keyword = query.keyword.strip()
         if keyword:
             pattern = f"%{keyword}%"
@@ -5612,18 +5860,34 @@ class MySQLCentralRepository:
                     ),
                 )
 
-    def report(self, report_filter: ReportFilter) -> ReportData:
+    def report(
+        self,
+        actor: AuthUser,
+        report_filter: ReportFilter,
+    ) -> ReportData:
+        if actor.role != ROLE_ADMIN:
+            raise PermissionDeniedError("只有管理员可以查看经营报告")
+        if report_filter.date_basis not in (
+            REPORT_DATE_COMPLETED,
+            REPORT_DATE_CREATED,
+        ):
+            raise ValueError("不支持的统计口径")
         conditions = ["t.status <> %s"]
         params: list[Any] = [TASK_EXPANDED]
+        date_column = (
+            "t.approved_at"
+            if report_filter.date_basis == REPORT_DATE_COMPLETED
+            else "p.created_at"
+        )
         if report_filter.start_date:
-            conditions.append("p.created_at >= %s")
+            conditions.append(f"{date_column} >= %s")
             params.append(
                 local_to_utc_naive(
                     datetime.combine(report_filter.start_date, time.min)
                 )
             )
         if report_filter.end_date:
-            conditions.append("p.created_at < %s")
+            conditions.append(f"{date_column} < %s")
             params.append(
                 local_to_utc_naive(
                     datetime.combine(
@@ -5632,6 +5896,12 @@ class MySQLCentralRepository:
                     )
                 )
             )
+        if report_filter.project_scope:
+            conditions.append("p.project_scope = %s")
+            params.append(report_filter.project_scope)
+        if report_filter.project_name:
+            conditions.append("p.project_name = %s")
+            params.append(report_filter.project_name)
         if report_filter.project_id:
             conditions.append("p.id = %s")
             params.append(report_filter.project_id)
@@ -5641,17 +5911,36 @@ class MySQLCentralRepository:
         if report_filter.model:
             conditions.append("t.model = %s")
             params.append(report_filter.model)
+        base_where_sql = " AND ".join(conditions)
+        report_conditions = [
+            *conditions,
+            "(t.status <> %s OR COALESCE(attempts.attempt_count, 0) > 0)",
+        ]
+        where_sql = " AND ".join(report_conditions)
+        report_params = [*params, TASK_APPROVED]
+        attempt_params = (
+            ATTEMPT_SUCCEEDED,
+            ATTEMPT_FAILED,
+            ATTEMPT_SUCCEEDED,
+            ATTEMPT_SUCCEEDED,
+            ATTEMPT_SUCCEEDED,
+            ATTEMPT_SUCCEEDED,
+            ATTEMPT_FAILED,
+        )
         query = f"""
             SELECT
                 p.id AS project_id,
                 p.project_code,
-                p.product_code AS project_name,
+                p.project_scope,
+                p.project_name,
+                p.product_code,
                 p.status AS project_status,
                 p.priority,
                 p.created_at AS project_created_at,
                 t.id AS task_id,
                 t.task_code,
                 t.status AS task_status,
+                t.assignee_id,
                 owner.display_name AS owner_name,
                 COALESCE(assignee.display_name, '') AS assignee_name,
                 t.model,
@@ -5662,10 +5951,13 @@ class MySQLCentralRepository:
                 t.work_started_at,
                 t.submitted_at,
                 t.approved_at,
-                t.returned_at,
-                COALESCE(reviews.rework_count, 0) AS rework_count,
-                COALESCE(attempts.generated_image_count, 0) AS generated_image_count,
-                COALESCE(attempts.manual_image_count, 0) AS manual_image_count,
+                COALESCE(attempts.generated_image_count, 0)
+                    AS generated_image_count,
+                COALESCE(attempts.attempt_count, 0) AS attempt_count,
+                COALESCE(attempts.successful_attempt_count, 0)
+                    AS successful_attempt_count,
+                COALESCE(attempts.failed_attempt_count, 0)
+                    AS failed_attempt_count,
                 COALESCE(attempts.provider_name, '') AS provider_name,
                 COALESCE(attempts.generation_cost, 0) AS generation_cost
             FROM project_tasks t
@@ -5675,62 +5967,191 @@ class MySQLCentralRepository:
             JOIN project_assets garment ON garment.id = t.garment_asset_id
             JOIN project_assets model_asset ON model_asset.id = t.model_asset_id
             LEFT JOIN (
-                SELECT task_id, COUNT(*) AS rework_count
-                FROM task_reviews
-                WHERE decision = 'return'
-                GROUP BY task_id
-            ) reviews ON reviews.task_id = t.id
-            LEFT JOIN (
                 SELECT
                     task_id,
-                    SUM(generated_image_count) AS generated_image_count,
+                    COUNT(*) AS attempt_count,
+                    SUM(status = %s) AS successful_attempt_count,
+                    SUM(status = %s) AS failed_attempt_count,
                     SUM(
-                        CASE WHEN model = 'manual_ps'
+                        CASE WHEN status = %s
                             THEN generated_image_count ELSE 0 END
-                    ) AS manual_image_count,
-                    MAX(NULLIF(provider_name, '')) AS provider_name,
-                    SUM(generated_image_count * unit_price) AS generation_cost
+                    ) AS generated_image_count,
+                    GROUP_CONCAT(
+                        DISTINCT CASE
+                            WHEN status = %s AND provider_name <> ''
+                            THEN provider_name
+                            ELSE NULL
+                        END
+                        SEPARATOR '、'
+                    ) AS provider_name,
+                    SUM(
+                        CASE WHEN status = %s
+                            THEN generated_image_count * unit_price
+                            ELSE 0 END
+                    ) AS generation_cost
                 FROM generation_attempts
-                WHERE status = %s
+                WHERE status IN (%s, %s)
+                  AND model <> 'manual_ps'
                 GROUP BY task_id
             ) attempts ON attempts.task_id = t.id
-            WHERE {" AND ".join(conditions)}
+            WHERE {where_sql}
             ORDER BY p.created_at, p.id, t.task_no
         """
         with self.connection() as connection:
             with connection.cursor() as cursor:
-                cursor.execute(query, (ATTEMPT_SUCCEEDED, *params))
+                cursor.execute(
+                    query,
+                    (*attempt_params, *report_params),
+                )
                 rows = [
                     ReportTaskRow(
                         project_id=int(row["project_id"]),
                         project_code=row["project_code"],
+                        project_scope=row["project_scope"],
                         project_name=row["project_name"],
+                        product_code=row["product_code"],
                         project_status=row["project_status"],
                         priority=row["priority"],
                         task_id=int(row["task_id"]),
                         task_code=row["task_code"],
                         task_status=row["task_status"],
+                        assignee_id=(
+                            int(row["assignee_id"])
+                            if row["assignee_id"] is not None
+                            else None
+                        ),
                         owner_name=row["owner_name"],
                         assignee_name=row["assignee_name"],
                         model=row["model"],
                         garment_name=row["garment_name"],
                         model_name=row["model_name"],
                         final_quantity=int(row["final_quantity"] or 0),
-                        rework_count=int(row["rework_count"] or 0),
-                        generated_image_count=int(row["generated_image_count"] or 0),
-                        manual_image_count=int(row["manual_image_count"] or 0),
-                        generation_cost=Decimal(str(row["generation_cost"] or 0)),
+                        generated_image_count=int(
+                            row["generated_image_count"] or 0
+                        ),
+                        attempt_count=int(row["attempt_count"] or 0),
+                        successful_attempt_count=int(
+                            row["successful_attempt_count"] or 0
+                        ),
+                        failed_attempt_count=int(
+                            row["failed_attempt_count"] or 0
+                        ),
+                        generation_cost=Decimal(
+                            str(row["generation_cost"] or 0)
+                        ),
                         project_created_at=row["project_created_at"],
                         claimed_at=row["claimed_at"],
                         work_started_at=row["work_started_at"],
                         submitted_at=row["submitted_at"],
                         approved_at=row["approved_at"],
-                        returned_at=row["returned_at"],
                         provider_name=row["provider_name"] or "",
                     )
                     for row in cursor.fetchall()
                 ]
-        return aggregate_report(rows)
+                provider_query = f"""
+                    SELECT
+                        COALESCE(NULLIF(ga.provider_name, ''), '历史/未记录')
+                            AS provider_name,
+                        ga.model,
+                        COUNT(DISTINCT p.id) AS project_count,
+                        COUNT(DISTINCT t.id) AS task_count,
+                        SUM(ga.status = %s) AS successful_attempt_count,
+                        SUM(ga.status = %s) AS failed_attempt_count,
+                        SUM(
+                            CASE WHEN ga.status = %s
+                                THEN ga.generated_image_count ELSE 0 END
+                        ) AS generated_image_count,
+                        SUM(
+                            CASE WHEN ga.status = %s
+                                THEN ga.generated_image_count * ga.unit_price
+                                ELSE 0 END
+                        ) AS generation_cost
+                    FROM generation_attempts ga
+                    JOIN project_tasks t ON t.id = ga.task_id
+                    JOIN projects p ON p.id = t.project_id
+                    WHERE {base_where_sql}
+                      AND ga.status IN (%s, %s)
+                      AND ga.model <> 'manual_ps'
+                    GROUP BY ga.provider_name, ga.model
+                    ORDER BY generated_image_count DESC, provider_name
+                """
+                cursor.execute(
+                    provider_query,
+                    (
+                        ATTEMPT_SUCCEEDED,
+                        ATTEMPT_FAILED,
+                        ATTEMPT_SUCCEEDED,
+                        ATTEMPT_SUCCEEDED,
+                        *params,
+                        ATTEMPT_SUCCEEDED,
+                        ATTEMPT_FAILED,
+                    ),
+                )
+                provider_groups = []
+                for row in cursor.fetchall():
+                    attempts = int(row["successful_attempt_count"] or 0) + int(
+                        row["failed_attempt_count"] or 0
+                    )
+                    provider_groups.append(
+                        GroupMetrics(
+                            key=f"{row['provider_name']}:{row['model']}",
+                            label=f"{row['provider_name']} / {row['model']}",
+                            project_count=int(row["project_count"] or 0),
+                            task_count=int(row["task_count"] or 0),
+                            approved_task_count=int(row["task_count"] or 0),
+                            final_image_count=int(
+                                row["generated_image_count"] or 0
+                            ),
+                            generated_image_count=int(
+                                row["generated_image_count"] or 0
+                            ),
+                            attempt_count=attempts,
+                            failed_attempt_count=int(
+                                row["failed_attempt_count"] or 0
+                            ),
+                            generation_success_rate=(
+                                int(row["successful_attempt_count"] or 0)
+                                / attempts
+                                if attempts
+                                else 0.0
+                            ),
+                            average_generation_attempts=(
+                                attempts / int(row["task_count"])
+                                if int(row["task_count"] or 0)
+                                else 0.0
+                            ),
+                            total_cost=Decimal(
+                                str(row["generation_cost"] or 0)
+                            ),
+                            average_production_seconds=0.0,
+                        )
+                    )
+        return aggregate_report(
+            rows,
+            date_basis=report_filter.date_basis,
+            by_model=tuple(provider_groups),
+        )
+
+    def list_report_project_options(
+        self,
+        actor: AuthUser,
+    ) -> list[tuple[str, str]]:
+        if actor.role != ROLE_ADMIN:
+            raise PermissionDeniedError("只有管理员可以查看经营报告")
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT DISTINCT project_scope, project_name
+                    FROM projects
+                    WHERE project_name <> ''
+                    ORDER BY project_scope, project_name
+                    """
+                )
+                return [
+                    (row["project_scope"], row["project_name"])
+                    for row in cursor.fetchall()
+                ]
 
     @staticmethod
     def _validate_draft(draft: ProjectDraft) -> None:

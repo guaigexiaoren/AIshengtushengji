@@ -28,6 +28,7 @@ if HAS_PYSIDE:
     from yixin.api import NanoBananaClient
     from yixin.collaboration.folders import current_date_folder
     from yixin.collaboration.reports import aggregate_report
+    from yixin.collaboration.reports import ReportTaskRow
     from yixin.collaboration.shared_paths import SharedPathResolver
     from yixin.collaboration.types import (
         ATTEMPT_QUEUED,
@@ -38,6 +39,8 @@ if HAS_PYSIDE:
         AuthUser,
         GenerationAttempt,
         GenerationResult,
+        OperationAccountCandidate,
+        OperationAccountSyncResult,
         ProjectAssetInput,
         ProjectRecord,
         ProjectTask,
@@ -64,6 +67,7 @@ if HAS_PYSIDE:
     from yixin.ui.components import FilterBar
     from yixin.ui.dialogs import SettingsDialog
     from yixin.ui.main_window import MainWindow, TopNavigation
+    from yixin.ui.reports_page import ReportsPage
     from yixin.ui.submission_list_page import SubmissionListPage
     from yixin.ui.unified_history_page import (
         UnifiedHistoryPage,
@@ -101,6 +105,7 @@ class FakeCentralRepository:
         self.project_attempts = []
         self.review_requests = []
         self.submission_requests = []
+        self.report_result = None
 
     def create_project(self, _actor, draft):
         self.created_drafts.append(draft)
@@ -156,6 +161,9 @@ class FakeCentralRepository:
         return []
 
     def list_assignment_projects(self, _actor, **_kwargs):
+        return []
+
+    def list_assignment_project_counts(self, _actor):
         return []
 
     def list_ai_generation_tasks(self, _actor, **_kwargs):
@@ -221,6 +229,18 @@ class FakeCentralRepository:
             (actor, user_id, {"delete": True})
         )
 
+    def preview_operation_accounts(self, _actor):
+        return (
+            OperationAccountCandidate(
+                "YY01",
+                "春季项目",
+                (("internal", "春季项目"),),
+            ),
+        )
+
+    def sync_operation_accounts_from_shared(self, _actor):
+        return OperationAccountSyncResult(("YY01",), (), ())
+
     def skip_remaining_subtasks(self, project_id, actor, *, reason):
         self.skip_requests.append((project_id, actor, reason))
         return 3
@@ -238,6 +258,12 @@ class FakeCentralRepository:
 
     def api_key_statuses_by_provider(self):
         return {}
+
+    def list_report_project_options(self, _actor):
+        return [("internal", "春季项目")]
+
+    def report(self, _actor, _report_filter):
+        return self.report_result
 
     def api_key_status(self, _user_id, _provider_id):
         return None
@@ -277,9 +303,6 @@ class FakeCentralRepository:
 
     def current_model_price(self, _model):
         return Decimal("1.25")
-
-    def report(self, _filter):
-        return aggregate_report([])
 
     def test_connection(self):
         return {"db": "test", "version": "8.4"}
@@ -569,6 +592,9 @@ class CollaborationPageTests(unittest.TestCase):
                 page.page_size,
             )
         )
+        self.repository.list_assignment_project_counts = (
+            lambda _actor: [("春季项目", 1)]
+        )
         self.repository.list_board_tasks_for_project_page = (
             lambda project_id, _actor, _statuses, _query, page: PageResult(
                 [task],
@@ -597,7 +623,15 @@ class CollaborationPageTests(unittest.TestCase):
             QTest.qWait(10)
         self.assertTrue(loaded)
         self.assertIn("共 1 条", page.project_pagination.summary.text())
-        self.assertIn("共 1 条", page.task_pagination.summary.text())
+        self.assertEqual(
+            page.project_filter.currentText(),
+            "全部项目（1）",
+        )
+        self.assertGreaterEqual(
+            page.project_filter.findData("春季项目"),
+            0,
+        )
+        self.assertFalse(hasattr(page, "task_pagination"))
         page.deleteLater()
 
     def test_ai_generation_page_loads_subtask_and_toggles_skip(self) -> None:
@@ -988,6 +1022,7 @@ class CollaborationPageTests(unittest.TestCase):
             "批量换装",
             "历史记录",
             "作品库",
+            "经营报告",
             "管理控制台",
         ]
         nav = TopNavigation(
@@ -1296,6 +1331,87 @@ class CollaborationPageTests(unittest.TestCase):
             self.repository.user_updates[-1],
             (self.actor, 8, {"delete": True}),
         )
+        page.deleteLater()
+
+    def test_admin_can_sync_operation_accounts_from_shared(self) -> None:
+        page = AdminPage(self.repository, self.actor)
+        with (
+            patch(
+                "yixin.ui.admin_page.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch(
+                "yixin.ui.admin_page.QMessageBox.information"
+            ) as information,
+            patch.object(page, "_refresh_users"),
+        ):
+            page._sync_operation_accounts()
+        information.assert_called_once()
+        self.assertIn(
+            "新建 1 个",
+            information.call_args.args[2],
+        )
+        page.deleteLater()
+
+    def test_reports_page_uses_valid_generation_metrics(self) -> None:
+        now = datetime.now()
+        row = ReportTaskRow(
+            project_id=1,
+            project_code="P001",
+            project_scope="internal",
+            project_name="春季项目",
+            product_code="G001",
+            project_status="completed",
+            priority="normal",
+            task_id=1,
+            task_code="P001-001",
+            task_status="approved",
+            assignee_id=8,
+            owner_name="运营A",
+            assignee_name="制作A",
+            model="model-a",
+            garment_name="衣服",
+            model_name="模特",
+            final_quantity=2,
+            generated_image_count=4,
+            attempt_count=2,
+            successful_attempt_count=1,
+            failed_attempt_count=1,
+            generation_cost=Decimal("4.00"),
+            project_created_at=now - timedelta(hours=3),
+            claimed_at=now - timedelta(hours=2),
+            work_started_at=now - timedelta(hours=2),
+            submitted_at=now,
+            approved_at=now,
+            provider_name="A6API",
+        )
+        report = aggregate_report([row])
+        self.repository.report_result = report
+        page = ReportsPage(
+            self.repository,
+            self.actor,
+            auto_load=False,
+        )
+        page._render_report(report)
+        self.assertEqual(
+            page.metric_cards["final_images"].value_label.text(),
+            "2 张",
+        )
+        self.assertEqual(
+            page.metric_cards["generation_success"].value_label.text(),
+            "50.0%",
+        )
+        self.assertEqual(
+            page.metric_cards["failed_attempts"].value_label.text(),
+            "1 次",
+        )
+        all_text = " ".join(
+            label.text()
+            for label in page.findChildren(QLabel)
+            if label.text()
+        )
+        self.assertNotIn("返工", all_text)
+        self.assertNotIn("PS成品", all_text)
         page.deleteLater()
 
     def test_admin_api_platform_tab_lists_provider_routes(self) -> None:
@@ -1635,6 +1751,41 @@ class CollaborationPageTests(unittest.TestCase):
         window.close()
         window.deleteLater()
 
+    def test_admin_main_window_opens_reports_as_first_level_page(
+        self,
+    ) -> None:
+        paths = AppPaths(self.root / "reports-window-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: None)
+        window = MainWindow(
+            paths=paths,
+            database=database,
+            file_store=file_store,
+            library_service=LibraryService(database, file_store, paths),
+            secret_store=SecretStore(paths.api_key_file),
+            worker=TaskWorker(database, client, file_store),
+            client=client,
+            repository=self.repository,
+            resolver=self.resolver,
+            actor=self.actor,
+            lazy_pages=True,
+        )
+        labels = [
+            window.nav_list.item(index).text()
+            for index in range(window.nav_list.count())
+        ]
+        self.assertIn("经营报告", labels)
+        report_index = labels.index("经营报告")
+        window.nav_list.setCurrentRow(report_index)
+        self.app.processEvents()
+        self.assertTrue(hasattr(window, "reports_page"))
+        self.assertIs(window.stack.currentWidget(), window.reports_page)
+        window.close()
+        window.deleteLater()
+
     def test_submission_page_uses_async_paged_repository_queries(
         self,
     ) -> None:
@@ -1674,8 +1825,10 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(page.project_table.rowCount(), 1)
         self.assertEqual(page.task_table.rowCount(), 1)
         self.assertEqual(project_queries[0][2].page_size, 100)
+        self.assertEqual(task_queries[0][3].page, 1)
         self.assertEqual(task_queries[0][3].page_size, 100)
         self.assertIn("共 125 条", page.project_pagination.summary.text())
+        self.assertFalse(hasattr(page, "task_pagination"))
         page.project_pagination.next_button.click()
         for _ in range(100):
             self.app.processEvents()

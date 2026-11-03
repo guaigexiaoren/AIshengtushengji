@@ -46,6 +46,7 @@ class PageResult(Generic[T]):
 @dataclass(frozen=True)
 class TaskQuery:
     keyword: str = ""
+    project_name: str | None = None
     statuses: tuple[str, ...] = ()
     start_date: date | None = None
     end_date: date | None = None

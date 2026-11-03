@@ -43,6 +43,7 @@ from .create_page import CreatePage
 from .dialogs import SettingsDialog
 from .unified_history_page import UnifiedHistoryPage
 from .library_page import LibraryPage
+from .reports_page import ReportsPage
 from .submission_list_page import SubmissionListPage
 from .ai_generation_page import AIGenerationPage
 from .task_assignment_page import TaskAssignmentPage
@@ -233,6 +234,7 @@ class MainWindow(QMainWindow):
             "批量换装": "batch",
             "历史记录": "history",
             "作品库": "library",
+            "经营报告": "reports",
             "管理控制台": "admin",
         }
         role_specs = self._available_page_specs()
@@ -427,16 +429,27 @@ class MainWindow(QMainWindow):
                 ]
             )
         if self.actor.role == ROLE_ADMIN:
-            specs.append(
-                (
-                    "管理控制台",
-                    lambda: AdminPage(
-                        self.repository,
-                        self.actor,
-                        auto_load=False,
+            specs.extend(
+                [
+                    (
+                        "经营报告",
+                        lambda: ReportsPage(
+                            self.repository,
+                            self.actor,
+                            auto_load=False,
+                        ),
+                        "reports_page",
                     ),
-                    "admin_page",
-                )
+                    (
+                        "管理控制台",
+                        lambda: AdminPage(
+                            self.repository,
+                            self.actor,
+                            auto_load=False,
+                        ),
+                        "admin_page",
+                    ),
+                ]
             )
         return specs
 

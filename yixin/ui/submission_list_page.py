@@ -199,11 +199,6 @@ class SubmissionListPage(QWidget):
         self.task_table.setSortingEnabled(True)
         self.task_table.itemSelectionChanged.connect(self._task_selected)
         left_layout.addWidget(self.task_table, 1)
-        self.task_pagination = PaginationBar()
-        self.task_pagination.page_requested.connect(
-            self._task_page_requested
-        )
-        left_layout.addWidget(self.task_pagination)
         self.info_line = QLabel("选择一个子任务查看详情")
         self.info_line.setWordWrap(False)
         self.info_line.setTextInteractionFlags(
@@ -353,13 +348,12 @@ class SubmissionListPage(QWidget):
         self.task_table.blockSignals(True)
         self.task_table.setRowCount(0)
         self.task_table.blockSignals(False)
-        self.task_pagination.set_result(0, 1, 100)
         self.reference_gallery.clear()
         self.result_gallery.clear()
         self._update_actions()
         query = self._task_query()
         page = PageRequest(
-            page=self._task_page.page,
+            page=1,
             page_size=100,
             sort_field=self._task_sort_field,
             sort_direction=self._task_sort_direction,
@@ -457,7 +451,6 @@ class SubmissionListPage(QWidget):
             self.tasks = []
             self.task_table.setRowCount(0)
             self._task_total = 0
-            self.task_pagination.set_result(0, 1, 100)
             self.info_line.setText("当前状态下没有任务")
             self.reference_strip.clear()
             self.reference_preview.set_image(None)
@@ -530,11 +523,6 @@ class SubmissionListPage(QWidget):
                     item.setData(Qt.ItemDataRole.UserRole, task.id)
                 self.task_table.setItem(row, column, item)
         self.task_table.blockSignals(False)
-        self.task_pagination.set_result(
-            result.total,
-            result.page,
-            result.page_size,
-        )
         if self.tasks:
             target_row = next(
                 (
@@ -590,17 +578,6 @@ class SubmissionListPage(QWidget):
         )
         if self.async_mode:
             self._request_project_page()
-
-    def _task_page_requested(self, page: int) -> None:
-        self._task_page = PageRequest(
-            page=page,
-            page_size=100,
-            sort_field=self._task_sort_field,
-            sort_direction=self._task_sort_direction,
-        )
-        project = self._current_project()
-        if self.async_mode and project is not None:
-            self._request_task_page(project)
 
     def _project_sort_requested(self, column: int) -> None:
         fields = {

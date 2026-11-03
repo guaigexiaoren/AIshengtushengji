@@ -15,8 +15,8 @@ from yixin.collaboration.types import (
 
 
 class CollaborationSchemaTests(unittest.TestCase):
-    def test_schema_version_is_ten(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 10)
+    def test_schema_version_is_eleven(self) -> None:
+        self.assertEqual(SCHEMA_VERSION, 11)
 
     def test_schema_v10_migrates_active_identity_uniqueness(self) -> None:
         with (
@@ -47,6 +47,27 @@ class CollaborationSchemaTests(unittest.TestCase):
                 "uk_users_active_display_name",
             ],
         )
+
+    def test_schema_v11_adds_reports_for_existing_admins(self) -> None:
+        class Cursor:
+            def __init__(self) -> None:
+                self.executed = []
+                self.version = 10
+
+            def execute(self, sql, params=()):
+                self.executed.append((sql, params))
+                return self
+
+            def fetchone(self):
+                return {"version": self.version}
+
+        cursor = Cursor()
+        MySQLCentralRepository._apply_schema_v11(cursor)
+        self.assertIn(
+            "INSERT IGNORE INTO user_menu_permissions",
+            cursor.executed[-1][0],
+        )
+        self.assertEqual(cursor.executed[-1][1], ("admin",))
 
     def test_required_tables_are_declared(self) -> None:
         schema = (
@@ -113,6 +134,7 @@ class CollaborationSchemaTests(unittest.TestCase):
         self.assertEqual(MENU_KEYS["submission_history"], "提交记录")
         self.assertEqual(MENU_KEYS["assign_tasks"], "待分配")
         self.assertEqual(MENU_KEYS["ai_generate"], "AI生图")
+        self.assertEqual(MENU_KEYS["reports"], "经营报告")
         self.assertNotIn("submitted", MENU_KEYS)
         self.assertNotIn("pending", MENU_KEYS)
         self.assertNotIn("completed", MENU_KEYS)
@@ -120,6 +142,14 @@ class CollaborationSchemaTests(unittest.TestCase):
         self.assertIn(
             "submission_history",
             ROLE_DEFAULT_MENUS["operations"],
+        )
+        self.assertNotIn(
+            "reports",
+            ROLE_DEFAULT_MENUS[ROLE_AI],
+        )
+        self.assertIn(
+            "reports",
+            ROLE_DEFAULT_MENUS["admin"],
         )
         self.assertNotIn(
             "submission_history",

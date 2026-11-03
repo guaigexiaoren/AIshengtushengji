@@ -11,6 +11,7 @@ from yixin.collaboration.repository import (
     StateConflictError,
 )
 from yixin.collaboration.reports import ReportFilter
+from yixin.collaboration.reports import REPORT_DATE_CREATED
 from yixin.collaboration.types import (
     GeneratedResultInput,
     PairingInput,
@@ -252,6 +253,22 @@ class MySQLIntegrationTests(unittest.TestCase):
                 PageRequest(page=1, page_size=100),
             )
             self.assertEqual(assignment_page.total, 1)
+            self.assertEqual(
+                dict(repository.list_assignment_project_counts(ai_one)),
+                {"集成项目": 1},
+            )
+            filtered_assignment = repository.list_assignment_projects_page(
+                ai_one,
+                TaskQuery(project_name="集成项目"),
+                PageRequest(page=1, page_size=100),
+            )
+            self.assertEqual(filtered_assignment.total, 1)
+            missing_assignment = repository.list_assignment_projects_page(
+                ai_one,
+                TaskQuery(project_name="不存在项目"),
+                PageRequest(page=1, page_size=100),
+            )
+            self.assertEqual(missing_assignment.total, 0)
             self.assertRegex(
                 project.project_code,
                 r"^集成运营-集成货号-\d{3,}$",
@@ -429,9 +446,19 @@ class MySQLIntegrationTests(unittest.TestCase):
                 )
             )
             self.assertEqual(
-                repository.report(ReportFilter()).summary.total_cost,
+                repository.report(
+                    admin,
+                    ReportFilter(),
+                ).summary.total_cost,
                 Decimal("2.5000"),
             )
+            created_report = repository.report(
+                admin,
+                ReportFilter(date_basis=REPORT_DATE_CREATED),
+            )
+            self.assertEqual(created_report.summary.final_image_count, 1)
+            self.assertEqual(created_report.summary.attempt_count, 2)
+            self.assertEqual(created_report.summary.failed_attempt_count, 0)
             queue_outcomes = []
 
             def claim_and_queue(actor):

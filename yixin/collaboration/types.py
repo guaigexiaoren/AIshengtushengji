@@ -24,6 +24,7 @@ MENU_KEYS = {
     "batch": "批量换装",
     "history": "历史记录",
     "library": "作品库",
+    "reports": "经营报告",
     "admin": "管理控制台",
 }
 ROLE_DEFAULT_MENUS = {
@@ -121,6 +122,22 @@ class AuthUser:
     max_generation_concurrency: int = 2
     menu_permissions: tuple[str, ...] | None = None
     project_access: tuple[tuple[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
+class OperationAccountCandidate:
+    username: str
+    display_name: str
+    project_access: tuple[tuple[str, str], ...]
+    status: str = "create"
+    reason: str = ""
+
+
+@dataclass(frozen=True)
+class OperationAccountSyncResult:
+    created: tuple[str, ...]
+    skipped: tuple[str, ...]
+    conflicts: tuple[str, ...]
 
 
 @dataclass(frozen=True)
