@@ -56,7 +56,7 @@ def run() -> int:
     QLocale.setDefault(
         QLocale(
             QLocale.Language.Chinese,
-            QLocale.Territory.China,
+            QLocale.Country.China,
         )
     )
     app.setApplicationName(APP_NAME)
