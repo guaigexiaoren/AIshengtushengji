@@ -5,7 +5,6 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QHeaderView,
     QHBoxLayout,
-    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -21,10 +20,10 @@ from ..collaboration.repository import MySQLCentralRepository, utc_now
 from ..collaboration.shared_paths import SharedPathResolver
 from ..collaboration.types import (
     PROJECT_STATUS_LABELS,
-    ROLE_ADMIN,
     TASK_APPROVED,
     TASK_AVAILABLE,
     TASK_AWAITING_ACCEPTANCE,
+    TASK_CANCELLED,
     TASK_CLAIMED,
     TASK_EXPANDED,
     TASK_RETURNED,
@@ -38,35 +37,23 @@ from ..collaboration.types import (
 from ..time_utils import utc_naive_to_local
 from ..paging import PageRequest, PageResult, TaskQuery
 from .async_queries import get_query_runner
+from .components import FilterBar, PageHeader
 from .date_filter import OptionalDateEdit
-from .dialogs import CompareDialog
 from .image_preview import DualImagePreview
 from .pagination_bar import PaginationBar
-from .subtask_source_dialog import SubtaskSourceDialog
 
 
-VIEW_STATUSES = {
-    "submitted": (TASK_AVAILABLE, TASK_CLAIMED, TASK_WORKING, TASK_RETURNED),
-    "pending": (TASK_AWAITING_ACCEPTANCE,),
-    "completed": (TASK_APPROVED, TASK_SKIPPED),
-    "records": (
-        TASK_AVAILABLE,
-        TASK_CLAIMED,
-        TASK_WORKING,
-        TASK_AWAITING_ACCEPTANCE,
-        TASK_RETURNED,
-        TASK_APPROVED,
-        TASK_SKIPPED,
-        "cancelled",
-    ),
-}
+RECORD_STATUSES = (
+    TASK_AVAILABLE,
+    TASK_CLAIMED,
+    TASK_WORKING,
+    TASK_AWAITING_ACCEPTANCE,
+    TASK_RETURNED,
+    TASK_APPROVED,
+    TASK_SKIPPED,
+    TASK_CANCELLED,
+)
 VIEW_TITLES = {
-    "submitted": (
-        "已提交",
-        "查看可领取、制作中和已退回的子任务；双击子任务可修改素材与配对。",
-    ),
-    "pending": ("待审核", "查看参考图与成品，通过或填写修改点退回。"),
-    "completed": ("已完成", "查看已经通过验收的子任务与成品。"),
     "records": (
         "提交记录",
         "只读查看自己提交的任务、制作进度、参考图和成品。",
@@ -90,7 +77,9 @@ class SubmissionListPage(QWidget):
         self.repository = repository
         self.resolver = resolver
         self.actor = actor
-        self.view_mode = view_mode
+        if view_mode != "records":
+            raise ValueError("提交记录页面只支持只读模式")
+        self.view_mode = "records"
         self.async_mode = async_mode
         self.query_runner = (
             get_query_runner() if self.async_mode else None
@@ -124,26 +113,19 @@ class SubmissionListPage(QWidget):
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(14)
         title_text, subtitle_text = VIEW_TITLES[self.view_mode]
         header = QHBoxLayout()
-        title_box = QVBoxLayout()
-        title = QLabel(title_text)
-        title.setStyleSheet("font-size:22px;font-weight:700;color:#1f2d43;")
-        subtitle = QLabel(subtitle_text)
-        subtitle.setStyleSheet("color:#6d7a91;")
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        header.addLayout(title_box, 1)
-        self.urgent_button = QPushButton("设置加急")
-        self.urgent_button.clicked.connect(self._toggle_urgent)
-        self.urgent_button.setVisible(self.view_mode == "submitted")
+        page_header = PageHeader(title_text, subtitle_text)
         refresh = QPushButton("刷新")
         refresh.clicked.connect(self.refresh)
-        header.addWidget(self.urgent_button)
-        header.addWidget(refresh)
+        page_header.add_action(refresh)
+        header.addWidget(page_header)
         outer.addLayout(header)
 
-        filters = QHBoxLayout()
+        filter_bar = FilterBar()
+        filters = filter_bar.layout
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText(
             "搜索编码、货号、运营、制作人员或备注"
@@ -157,7 +139,7 @@ class SubmissionListPage(QWidget):
         filters.addWidget(QLabel("至"))
         filters.addWidget(self.end_date_edit)
         filters.addWidget(reset_filter)
-        outer.addLayout(filters)
+        outer.addWidget(filter_bar)
 
         self.project_table = QTableWidget(0, 7)
         self.project_table.setHorizontalHeaderLabels(
@@ -177,8 +159,7 @@ class SubmissionListPage(QWidget):
             self.project_table.setColumnWidth(column, width)
         self.project_table.setMaximumHeight(220)
         self.project_table.setSortingEnabled(True)
-        if self.view_mode == "records":
-            self.project_table.setColumnHidden(6, True)
+        self.project_table.setColumnHidden(6, True)
         self.project_table.itemSelectionChanged.connect(self._project_selected)
         outer.addWidget(self.project_table)
         self.project_pagination = PaginationBar()
@@ -191,17 +172,6 @@ class SubmissionListPage(QWidget):
         left = QWidget()
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 8, 8, 0)
-        task_header = QHBoxLayout()
-        self.selection_hint = QLabel(
-            "按住 Ctrl 多选，按住 Shift 连续选择"
-        )
-        self.selection_hint.setStyleSheet(
-            "color:#7a879c;font-size:10px;"
-        )
-        self.selection_hint.setVisible(self.view_mode == "pending")
-        task_header.addStretch(1)
-        task_header.addWidget(self.selection_hint)
-        left_layout.addLayout(task_header)
         self.task_table = QTableWidget(0, 7)
         self.task_table.setHorizontalHeaderLabels(
             [
@@ -217,10 +187,6 @@ class SubmissionListPage(QWidget):
         self.task_table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
-        if self.view_mode == "pending":
-            self.task_table.setSelectionMode(
-                QAbstractItemView.SelectionMode.ExtendedSelection
-            )
         self.task_table.setEditTriggers(
             QAbstractItemView.EditTrigger.NoEditTriggers
         )
@@ -232,10 +198,6 @@ class SubmissionListPage(QWidget):
             self.task_table.setColumnWidth(column, width)
         self.task_table.setSortingEnabled(True)
         self.task_table.itemSelectionChanged.connect(self._task_selected)
-        if self.view_mode == "submitted":
-            self.task_table.itemDoubleClicked.connect(
-                self._edit_task_from_item
-            )
         left_layout.addWidget(self.task_table, 1)
         self.task_pagination = PaginationBar()
         self.task_pagination.page_requested.connect(
@@ -251,32 +213,9 @@ class SubmissionListPage(QWidget):
         left_layout.addWidget(self.info_line)
         body.addWidget(left)
 
-        self.view_results = QPushButton("与原模特图对比")
-        self.return_button = QPushButton("退回返工")
-        self.approve_button = QPushButton("验收通过")
-        self.approve_button.setObjectName("PrimaryButton")
-        self.view_results.clicked.connect(self._compare_current_result)
-        self.return_button.clicked.connect(self._return_task)
-        self.approve_button.clicked.connect(self._approve_task)
-
         preview_panel = QWidget()
         preview_layout = QVBoxLayout(preview_panel)
         preview_layout.setContentsMargins(0, 0, 0, 0)
-
-        self.review_actions = QWidget()
-        actions = QHBoxLayout(self.review_actions)
-        actions.setContentsMargins(0, 0, 0, 0)
-        actions.setSpacing(4)
-        actions.addStretch(1)
-        for button in (
-            self.view_results,
-            self.return_button,
-            self.approve_button,
-        ):
-            button.setVisible(self.view_mode == "pending")
-            actions.addWidget(button)
-        self.review_actions.setVisible(self.view_mode == "pending")
-        preview_layout.addWidget(self.review_actions)
 
         self.dual_preview = DualImagePreview(
             self.resolver,
@@ -292,8 +231,6 @@ class SubmissionListPage(QWidget):
         self.reference_strip = self.reference_gallery.list_widget
         self.reference_preview = self.reference_gallery.preview
         preview_layout.addWidget(self.dual_preview, 1)
-        if self.view_mode == "submitted":
-            self.result_panel.hide()
         body.addWidget(preview_panel)
         body.setSizes([700, 620])
         outer.addWidget(body, 1)
@@ -345,16 +282,15 @@ class SubmissionListPage(QWidget):
                 limit=10000,
                 actor=self.actor,
             )
-            if self.view_mode == "records":
-                self._all_tasks = [
-                    task
-                    for task in self._all_tasks
-                    if task.status != TASK_EXPANDED
-                ]
+            self._all_tasks = [
+                task
+                for task in self._all_tasks
+                if task.status != TASK_EXPANDED
+            ]
         except Exception as exc:
             QMessageBox.warning(self, "读取任务失败", str(exc))
             return
-        statuses = set(VIEW_STATUSES[self.view_mode])
+        statuses = set(RECORD_STATUSES)
         visible_ids = {
             task.project_id
             for task in self._all_tasks
@@ -368,7 +304,7 @@ class SubmissionListPage(QWidget):
     def _task_query(self) -> TaskQuery:
         return TaskQuery(
             keyword=self.search_edit.text().strip(),
-            statuses=VIEW_STATUSES[self.view_mode],
+            statuses=RECORD_STATUSES,
             start_date=self.start_date_edit.python_date(),
             end_date=self.end_date_edit.python_date(),
         )
@@ -389,7 +325,6 @@ class SubmissionListPage(QWidget):
             sort_direction=self._project_sort_direction,
         )
         self.info_line.setText("正在加载任务，请稍候…")
-        self.urgent_button.setEnabled(False)
         self._pending_project_selection = selected_id
         self._active_project_request = self.query_runner.submit(
             lambda: (
@@ -761,7 +696,7 @@ class SubmissionListPage(QWidget):
         self._filter_changed()
 
     def _apply_filters(self, *_args) -> None:
-        statuses = set(VIEW_STATUSES[self.view_mode])
+        statuses = set(RECORD_STATUSES)
         keyword = self.search_edit.text().strip().casefold()
         start = self.start_date_edit.python_date()
         end = self.end_date_edit.python_date()
@@ -860,7 +795,7 @@ class SubmissionListPage(QWidget):
             )
             self._request_task_page(project)
             return
-        statuses = set(VIEW_STATUSES[self.view_mode])
+        statuses = set(RECORD_STATUSES)
         keyword = self.search_edit.text().strip().casefold()
         start = self.start_date_edit.python_date()
         end = self.end_date_edit.python_date()
@@ -944,38 +879,6 @@ class SubmissionListPage(QWidget):
             )
         return None
 
-    def _selected_tasks(self) -> list[ProjectTask]:
-        task_ids = []
-        for index in self.task_table.selectionModel().selectedRows(0):
-            item = self.task_table.item(index.row(), 0)
-            if item is not None:
-                task_ids.append(
-                    int(item.data(Qt.ItemDataRole.UserRole))
-                )
-        return [
-            task
-            for task_id in dict.fromkeys(task_ids)
-            if (task := self._tasks_by_id.get(task_id)) is not None
-        ]
-
-    def _can_manage(self, project: ProjectRecord | None) -> bool:
-        return bool(
-            project
-            and (
-                self.actor.role == ROLE_ADMIN
-                or project.owner_id == self.actor.id
-            )
-        )
-
-    def _can_edit_task(self, task: ProjectTask) -> bool:
-        if self.view_mode == "records":
-            return False
-        return self._can_manage(self._current_project()) and task.status not in (
-            TASK_AWAITING_ACCEPTANCE,
-            TASK_APPROVED,
-            "cancelled",
-        )
-
     def _task_selected(self) -> None:
         task = self._current_task()
         project = self._current_project()
@@ -983,8 +886,7 @@ class SubmissionListPage(QWidget):
             self.reference_strip.clear()
             self.reference_preview.set_image(None)
             self.reference_preview.set_placeholder("尚未选择任务")
-            if self.view_mode != "submitted":
-                self.result_gallery.clear()
+            self.result_gallery.clear()
             self._update_preview_counts()
             self._update_actions()
             return
@@ -995,13 +897,13 @@ class SubmissionListPage(QWidget):
         )
         self.info_line.setToolTip(project.project_relative_root)
         self._set_reference_preview(task)
-        if self.view_mode != "submitted" and self.async_mode:
+        if self.async_mode:
             self.result_gallery.clear()
             self._active_result_task_id = task.id
             self._active_result_request = self.query_runner.submit(
                 lambda task_id=task.id: self.repository.list_results(task_id)
             )
-        elif self.view_mode != "submitted":
+        else:
             self.result_gallery.set_task(
                 task,
                 self.repository.list_results(task.id),
@@ -1037,169 +939,7 @@ class SubmissionListPage(QWidget):
         )
 
     def _update_actions(self) -> None:
-        project = self._current_project()
-        can_manage = self._can_manage(project)
-        urgent_editable = bool(
-            project
-            and can_manage
-            and project.status not in ("completed", "cancelled")
-        )
-        self.urgent_button.setEnabled(urgent_editable)
-        self.urgent_button.setText(
-            "取消加急"
-            if project and project.is_urgent
-            else "设置加急"
-        )
-        task = self._current_task()
-        selected_count = len(self._selected_tasks())
-        reviewable = bool(
-            task
-            and can_manage
-            and task.status == TASK_AWAITING_ACCEPTANCE
-        )
-        self.view_results.setEnabled(
-            bool(task and self.result_gallery.list_widget.count())
-        )
-        self.return_button.setText(
-            f"退回返工（{selected_count}）"
-            if selected_count > 1
-            else "退回返工"
-        )
-        self.approve_button.setText(
-            f"验收通过（{selected_count}）"
-            if selected_count > 1
-            else "验收通过"
-        )
-        self.return_button.setEnabled(reviewable)
-        self.approve_button.setEnabled(reviewable)
-
-    def _edit_task(self, task: ProjectTask) -> None:
-        project = self._current_project()
-        if project is None:
-            return
-        draft = self.repository.get_project_draft(project.id)
-        if draft is None:
-            return
-        dialog = SubtaskSourceDialog(
-            self.repository,
-            self.resolver,
-            self.actor,
-            task,
-            draft.assets,
-            self,
-        )
-        if dialog.exec():
-            self.refresh()
-
-    def _edit_task_from_item(self, item: QTableWidgetItem) -> None:
-        row = item.row()
-        code_item = self.task_table.item(row, 0)
-        task = (
-            self._tasks_by_id.get(
-                int(code_item.data(Qt.ItemDataRole.UserRole))
-            )
-            if code_item is not None
-            else None
-        )
-        if task is None or not self._can_edit_task(task):
-            return
-        self._edit_task(task)
-
-    def _toggle_urgent(self) -> None:
-        project = self._current_project()
-        if project is None:
-            return
-        try:
-            self.repository.set_project_urgent(
-                project.id,
-                self.actor,
-                not project.is_urgent,
-            )
-        except Exception as exc:
-            QMessageBox.warning(self, "操作失败", str(exc))
-            return
-        self.refresh()
-
-    def _compare_current_result(self) -> None:
-        task = self._current_task()
-        result_path = self.result_gallery.current_path()
-        if task is None or result_path is None:
-            return
-        model_path = self.resolver.resolve_project_path(
-            task.project_relative_root,
-            task.model_path,
-        )
-        CompareDialog(
-            model_path,
-            result_path,
-            left_label="原模特图",
-            right_label="生成成品",
-            parent=self,
-        ).exec()
-
-    def _approve_task(self) -> None:
-        tasks = self._selected_tasks() or [self._current_task()]
-        tasks = [task for task in tasks if task is not None]
-        if not tasks:
-            return
-        answer = QMessageBox.question(
-            self,
-            "验收通过",
-            f"确认通过所选 {len(tasks)} 个子任务吗？",
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        failures = []
-        for task in tasks:
-            try:
-                self.repository.review_task(
-                    task.id,
-                    self.actor,
-                    approved=True,
-                )
-            except Exception as exc:
-                failures.append(f"{task.task_code}：{exc}")
-        if failures:
-            QMessageBox.warning(
-                self,
-                "部分验收失败",
-                "\n".join(failures[:10]),
-            )
-        self.refresh()
-
-    def _return_task(self) -> None:
-        tasks = self._selected_tasks() or [self._current_task()]
-        tasks = [task for task in tasks if task is not None]
-        if not tasks:
-            return
-        reason, ok = QInputDialog.getMultiLineText(
-            self,
-            "退回返工",
-            "请填写需要修改的具体内容：",
-        )
-        if not ok:
-            return
-        if not reason.strip():
-            QMessageBox.warning(self, "需要修改点", "退回时必须填写修改内容。")
-            return
-        failures = []
-        for task in tasks:
-            try:
-                self.repository.review_task(
-                    task.id,
-                    self.actor,
-                    approved=False,
-                    reason=reason,
-                )
-            except Exception as exc:
-                failures.append(f"{task.task_code}：{exc}")
-        if failures:
-            QMessageBox.warning(
-                self,
-                "部分退回失败",
-                "\n".join(failures[:10]),
-            )
-        self.refresh()
+        return
 
     @staticmethod
     def _empty_task() -> ProjectTask:

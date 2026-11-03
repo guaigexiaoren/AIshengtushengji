@@ -11,7 +11,6 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHeaderView,
-    QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -60,6 +59,7 @@ from ..time_utils import format_task_elapsed, utc_naive_to_local
 from ..worker import TaskWorker
 from ..paging import HistoryQuery, PageRequest, TaskQuery
 from .async_queries import get_query_runner
+from .components import FilterBar, PageActionBar, PageHeader
 from .date_filter import OptionalDateEdit
 from .image_preview import DualImagePreview
 from .pagination_bar import PaginationBar
@@ -174,13 +174,20 @@ class UnifiedHistoryPage(QWidget):
     def _build(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(14)
+        outer.addWidget(
+            PageHeader(
+                "历史记录",
+                "统一查看项目生成轮次和普通创作，并保存或重试结果。",
+            )
+        )
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        outer.addWidget(splitter, 1)
 
         left = QFrame()
         left.setObjectName("Card")
         left_layout = QVBoxLayout(left)
-        filters = QHBoxLayout()
+        filter_bar = FilterBar()
+        filters = filter_bar.layout
         self.project_filter = QComboBox()
         self.project_filter.addItem("全部项目", None)
         self.product_search = QLineEdit()
@@ -212,7 +219,7 @@ class UnifiedHistoryPage(QWidget):
         filters.addWidget(self.end_date)
         filters.addWidget(reset)
         filters.addWidget(refresh)
-        left_layout.addLayout(filters)
+        left_layout.addWidget(filter_bar)
 
         self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels(
@@ -241,7 +248,7 @@ class UnifiedHistoryPage(QWidget):
             QHeaderView.ResizeMode.Interactive
         )
         for column, width in enumerate(
-            (55, 170, 170, 100, 80, 100, 70, 120, 50)
+            (78, 160, 160, 95, 80, 95, 70, 115, 50)
         ):
             self.table.setColumnWidth(column, width)
         left_layout.addWidget(self.table, 1)
@@ -279,7 +286,6 @@ class UnifiedHistoryPage(QWidget):
         self.reference_strip = self.reference_gallery.list_widget
         self.preview = self.dual_preview.result_pane.preview
         right_layout.addWidget(self.dual_preview, 1)
-        actions = QHBoxLayout()
         self.cancel_button = QPushButton("取消任务")
         self.retry_button = QPushButton("重试任务")
         self.save_local_button = QPushButton("保存本地")
@@ -290,15 +296,17 @@ class UnifiedHistoryPage(QWidget):
             "QPushButton:disabled { background:#aebad0;color:#eef2f8; }"
         )
         self.save_library_button = QPushButton("保存作品库")
-        actions.addWidget(self.cancel_button)
-        actions.addWidget(self.retry_button)
-        actions.addStretch(1)
-        actions.addWidget(self.save_local_button)
-        actions.addWidget(self.save_library_button)
-        right_layout.addLayout(actions)
         splitter.addWidget(right)
         splitter.setSizes([900, 600])
-
+        outer.addWidget(splitter, 1)
+        action_bar = PageActionBar()
+        action_bar.layout.addWidget(self.cancel_button)
+        action_bar.layout.addWidget(self.retry_button)
+        action_bar.layout.addStretch(1)
+        action_bar.layout.addWidget(self.save_local_button)
+        action_bar.layout.addWidget(self.save_library_button)
+        self.page_action_bar = action_bar
+        outer.addWidget(action_bar)
         refresh.clicked.connect(self.refresh)
         reset.clicked.connect(self._reset_filters)
         self.project_filter.currentIndexChanged.connect(self._filter_changed)
@@ -412,7 +420,10 @@ class UnifiedHistoryPage(QWidget):
                             self.actor
                         )
                     )
-            if query.task_type != "project" and not query.project_name:
+            if (
+                query.task_type != "project"
+                and query.status != "manual_ps"
+            ):
                 ordinary_result = self.database.list_tasks_page(
                     TaskQuery(
                         keyword=query.keyword,
@@ -589,6 +600,9 @@ class UnifiedHistoryPage(QWidget):
         self.project_filter.blockSignals(False)
 
     def _filter_changed(self, *_args) -> None:
+        self.project_filter.setEnabled(
+            self.type_filter.currentData() != "ordinary"
+        )
         self._page_request = PageRequest(
             page=1,
             page_size=100,
@@ -651,12 +665,17 @@ class UnifiedHistoryPage(QWidget):
 
     def _project_record(self, row: dict) -> HistoryRecord:
         created = utc_naive_to_local(row["created_at"])
+        status = str(row["status"])
+        if status == ATTEMPT_SUCCEEDED and int(
+            row.get("manual_result_count") or 0
+        ):
+            status = "manual_ps"
         return HistoryRecord(
             kind="project",
             record_id=int(row["id"]),
             task_id=int(row["task_id"]),
             attempt_id=int(row["id"]),
-            status=str(row["status"]),
+            status=status,
             created_at=created,
             project_name=str(
                 row.get("access_project_name")
@@ -750,9 +769,10 @@ class UnifiedHistoryPage(QWidget):
         for record in self.records:
             if kind and record.kind != kind:
                 continue
-            if project_name and (
-                record.kind != "project"
-                or record.project_name != project_name
+            if (
+                project_name
+                and record.kind == "project"
+                and record.project_name != project_name
             ):
                 continue
             if product and product not in record.product_code.casefold():
@@ -1242,12 +1262,32 @@ class UnifiedHistoryPage(QWidget):
                 )
             else:
                 result = asset.payload["result"]
+                reference_snapshots = None
+                try:
+                    from ..collaboration.local_sources import (
+                        LocalTaskSourceStore,
+                    )
+
+                    task = self.repository.get_task(record.task_id)
+                    if task is not None:
+                        reference_snapshots = (
+                            LocalTaskSourceStore.read_attempt_snapshot(
+                            self.library_service.file_store.paths.root
+                            / "local_sources",
+                            self.actor.id,
+                            task,
+                            int(record.attempt_id),
+                            )
+                        )
+                except Exception:
+                    reference_snapshots = None
                 work_id = self.library_service.save_project_result(
                     repository=self.repository,
                     resolver=self.resolver,
                     task_id=record.task_id,
                     attempt_id=int(record.attempt_id),
                     result=result,
+                    reference_snapshots=reference_snapshots,
                 )
             folder = self.library_service.work_folder(work_id)
         except Exception as exc:

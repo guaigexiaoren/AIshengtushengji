@@ -57,6 +57,7 @@ from ..worker import TaskWorker
 from .crop import CropDialog
 from .dialogs import LibraryPickerDialog, TemplateManagerDialog
 from .async_thumbnails import get_thumbnail_loader
+from .components import PageActionBar, PageHeader
 from .widgets import (
     load_scaled_pixmap,
     scan_image_inputs,
@@ -890,14 +891,12 @@ class BatchDressPage(QWidget):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(2)
-        title = QLabel("批量换装")
-        title.setStyleSheet("font-size:22px;font-weight:700;color:#1f2d43;")
-        subtitle = QLabel(
-            "上传服装和人物素材，点击“服装 → 人物”或直接拖拽缩略图完成配对。"
+        layout.addWidget(
+            PageHeader(
+                "批量换装",
+                "上传服装和人物素材，完成配对后统一加入生成队列。",
+            )
         )
-        subtitle.setStyleSheet("color:#6d7a91;")
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
         return card
 
     def _build_settings(self) -> QWidget:
@@ -946,7 +945,8 @@ class BatchDressPage(QWidget):
         param_layout.addWidget(QLabel("分辨率"))
         param_layout.addWidget(self.resolution_combo)
         param_layout.addSpacing(8)
-        param_layout.addWidget(QLabel("每对数量"))
+        self.count_label = QLabel("每对数量")
+        param_layout.addWidget(self.count_label)
         param_layout.addWidget(self.count_spin)
         param_layout.addStretch(1)
         form.addRow("参数", params)
@@ -1219,9 +1219,8 @@ class BatchDressPage(QWidget):
             self._refresh_pairs()
 
     def _build_submit(self) -> QWidget:
-        card = QFrame()
-        card.setObjectName("Card")
-        layout = QHBoxLayout(card)
+        card = PageActionBar()
+        layout = card.layout
         self.feedback_label = QLabel(
             "先选择服装，再点击人物；也可把服装缩略图直接拖到人物上。"
         )

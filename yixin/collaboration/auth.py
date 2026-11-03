@@ -48,8 +48,8 @@ def verify_password(password: str, encoded: str) -> bool:
 
 
 def _validate_password(password: str) -> str:
-    if len(password) < 8:
-        raise ValueError("密码至少需要 8 个字符")
+    if len(password) < 6:
+        raise ValueError("密码至少需要 6 个字符")
     if len(password) > 128:
         raise ValueError("密码不能超过 128 个字符")
     if any(character.isspace() for character in password):

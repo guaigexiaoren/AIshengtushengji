@@ -230,6 +230,7 @@ class LibraryService:
         task_id: int,
         attempt_id: int,
         result,
+        reference_snapshots: Sequence[StoredImage] | None = None,
     ) -> int:
         task = repository.get_task(task_id)
         if task is None:
@@ -284,37 +285,54 @@ class LibraryService:
                 original_name="thumbnail.jpg",
             )
             references: list[StoredImage] = []
-            reference_assets = [
-                (
-                    resolver.resolve_project_path(
-                        task.project_relative_root,
-                        asset.relative_path,
-                    ),
-                    asset.original_name,
-                    asset.content_hash,
-                    asset.mime,
-                    asset.width,
-                    asset.height,
+            if reference_snapshots is not None:
+                reference_assets = [
+                    (
+                        Path(image.path),
+                        image.original_name,
+                        image.content_hash,
+                        image.mime,
+                        image.width,
+                        image.height,
+                    )
+                    for image in reference_snapshots
+                ]
+            else:
+                reference_assets = [
+                    (
+                        resolver.resolve_project_path(
+                            task.project_relative_root,
+                            asset.relative_path,
+                        ),
+                        asset.original_name,
+                        asset.content_hash,
+                        asset.mime,
+                        asset.width,
+                        asset.height,
+                    )
+                    for asset in task.garment_assets
+                ]
+                model_path = resolver.resolve_project_path(
+                    task.project_relative_root,
+                    task.model_path,
                 )
-                for asset in task.garment_assets
-            ]
-            model_path = resolver.resolve_project_path(
-                task.project_relative_root,
-                task.model_path,
-            )
-            model_mime, model_width, model_height = image_metadata(
-                model_path.read_bytes()
-            )
-            reference_assets.append(
-                (
-                    model_path,
-                    task.model_name,
-                    task.model_hash,
-                    model_mime,
-                    model_width,
-                    model_height,
+                if not model_path.is_file():
+                    raise ValueError(
+                        f"项目模特参考图已不存在：{model_path}"
+                    )
+                model_mime, model_width, model_height = image_metadata(
+                    model_path.read_bytes()
                 )
-            )
+                reference_assets.append(
+                    (
+                        model_path,
+                        task.model_name,
+                        task.model_hash,
+                        model_mime,
+                        model_width,
+                        model_height,
+                    )
+                )
             for position, (
                 source,
                 original_name,
@@ -326,6 +344,10 @@ class LibraryService:
                 if not source.is_file():
                     raise ValueError(
                         f"第 {position} 张项目参考图已不存在"
+                    )
+                if sha256_file(source) != content_hash:
+                    raise ValueError(
+                        f"第 {position} 张项目参考图内容已变化"
                     )
                 copied = self.file_store.copy_to_library(
                     folder,
@@ -394,6 +416,36 @@ class LibraryService:
             raise
 
     def delete_work(self, work_id: int) -> bool:
+        work = self.database.get_work(work_id)
+        if work is None:
+            return False
+        task_id = work.get("task_id")
+        result_assets = self.database.get_work_assets(
+            work_id,
+            role="result",
+        )
+        if task_id is not None and result_assets:
+            saved_path = Path(result_assets[0]["path"])
+            if saved_path.is_file():
+                data = saved_path.read_bytes()
+                stored = self.file_store.store_generated(
+                    int(task_id),
+                    data,
+                    0,
+                )
+                thumbnail = self.file_store.create_thumbnail(
+                    stored.path,
+                )
+                restored = self.database.restore_saved_task_result(
+                    int(task_id),
+                    saved_path,
+                    stored,
+                    thumbnail,
+                )
+                if not restored:
+                    raise ValueError(
+                        "历史生成结果状态异常，未删除作品"
+                    )
         deleted = self.database.delete_work(work_id)
         if deleted is None:
             return False

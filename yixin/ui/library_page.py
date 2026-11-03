@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QTextEdit,
     QVBoxLayout,
@@ -31,6 +32,7 @@ from .widgets import (
     scan_image_inputs,
 )
 from .async_thumbnails import get_thumbnail_loader
+from .components import PageActionBar, PageHeader
 
 
 def _drop_inputs(mime) -> list[Path]:
@@ -146,14 +148,21 @@ class LibraryPage(QWidget):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.addWidget(splitter)
+        root.setSpacing(14)
+        root.addWidget(
+            PageHeader(
+                "作品库",
+                "管理本机保存的生成结果、参考图和可复用素材。",
+            )
+        )
+        root.addWidget(splitter, 1)
 
         left = LibraryDropFrame()
         self.left_card = left
         left_layout = QVBoxLayout(left)
         title_row = QHBoxLayout()
-        title = QLabel("本地作品库")
-        title.setStyleSheet("font-size:21px;font-weight:700;")
+        title = QLabel("作品列表")
+        title.setObjectName("SectionTitle")
         upload_images = QPushButton("上传图片")
         upload_folder = QPushButton("上传文件夹")
         upload_images.setObjectName("PrimaryButton")
@@ -188,17 +197,25 @@ class LibraryPage(QWidget):
         right = QFrame()
         right.setObjectName("Card")
         right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        detail_scroll = QScrollArea()
+        detail_scroll.setWidgetResizable(True)
+        detail_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        detail_content = QWidget()
+        detail_content.setObjectName("CardContent")
+        detail_layout = QVBoxLayout(detail_content)
+        detail_layout.setContentsMargins(18, 16, 18, 16)
+        detail_layout.setSpacing(10)
         top = QHBoxLayout()
         self.detail_title = QLabel("选择一个作品")
-        self.detail_title.setStyleSheet("font-size:20px;font-weight:700;")
+        self.detail_title.setObjectName("SectionTitle")
         self.delete_button = QPushButton("删除作品")
         self.delete_button.setObjectName("DangerButton")
         top.addWidget(self.detail_title, 1)
-        top.addWidget(self.delete_button)
-        right_layout.addLayout(top)
+        detail_layout.addLayout(top)
         self.meta_label = QLabel("")
         self.meta_label.setStyleSheet("color:#637086;")
-        right_layout.addWidget(self.meta_label)
+        detail_layout.addWidget(self.meta_label)
         path_row = QHBoxLayout()
         self.path_edit = QLineEdit()
         self.path_edit.setReadOnly(True)
@@ -206,28 +223,43 @@ class LibraryPage(QWidget):
         self.open_folder_button = QPushButton("打开作品文件夹")
         path_row.addWidget(QLabel("保存位置"))
         path_row.addWidget(self.path_edit, 1)
-        path_row.addWidget(self.open_folder_button)
-        right_layout.addLayout(path_row)
+        detail_layout.addLayout(path_row)
+        prompt_title = QLabel("提示词")
+        prompt_title.setObjectName("FieldLabel")
+        detail_layout.addWidget(prompt_title)
         self.prompt_view = QTextEdit()
         self.prompt_view.setReadOnly(True)
         self.prompt_view.setMaximumHeight(145)
-        right_layout.addWidget(self.prompt_view)
+        detail_layout.addWidget(self.prompt_view)
         tag_row = QHBoxLayout()
         self.tags_edit = QLineEdit()
         self.tags_edit.setPlaceholderText("标签用逗号分隔，例如：人像, 春天, 商业海报")
         save_tags = QPushButton("保存标签")
         tag_row.addWidget(QLabel("标签"))
         tag_row.addWidget(self.tags_edit, 1)
-        tag_row.addWidget(save_tags)
-        right_layout.addLayout(tag_row)
+        detail_layout.addLayout(tag_row)
+        asset_title = QLabel("素材预览")
+        asset_title.setObjectName("FieldLabel")
+        detail_layout.addWidget(asset_title)
         self.asset_strip = ImageStrip(icon_size=78)
-        right_layout.addWidget(self.asset_strip)
+        self.asset_strip.setMinimumHeight(100)
+        detail_layout.addWidget(self.asset_strip)
         self.preview = ImageView()
-        right_layout.addWidget(self.preview, 1)
+        self.preview.setMinimumHeight(280)
+        detail_layout.addWidget(self.preview, 1)
+        detail_scroll.setWidget(detail_content)
+        right_layout.addWidget(detail_scroll)
 
         splitter.addWidget(left)
         splitter.addWidget(right)
         splitter.setSizes([700, 700])
+        action_bar = PageActionBar()
+        action_bar.layout.addWidget(self.open_folder_button)
+        action_bar.layout.addStretch(1)
+        action_bar.layout.addWidget(save_tags)
+        action_bar.layout.addWidget(self.delete_button)
+        self.page_action_bar = action_bar
+        root.addWidget(action_bar)
 
         apply_button.clicked.connect(self.refresh)
         self.search_edit.returnPressed.connect(self.refresh)

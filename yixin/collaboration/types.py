@@ -119,7 +119,7 @@ class AuthUser:
     is_active: bool = True
     urgent_quota_per_day: int = 3
     max_generation_concurrency: int = 2
-    menu_permissions: tuple[str, ...] = ()
+    menu_permissions: tuple[str, ...] | None = None
     project_access: tuple[tuple[str, str], ...] = ()
 
 

@@ -12,6 +12,7 @@ from PySide6.QtGui import (
     QColor,
     QFont,
     QIcon,
+    QImage,
     QImageReader,
     QPainter,
     QPen,

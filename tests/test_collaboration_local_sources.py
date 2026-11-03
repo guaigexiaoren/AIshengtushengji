@@ -21,7 +21,7 @@ from yixin.collaboration.types import (
 from yixin.collaboration.worker import ProjectGenerationWorker
 from yixin.models import ImageApiResult, ImageRequest, RemoteImage
 from yixin.paths import AppPaths
-from yixin.storage import FileStore
+from yixin.storage import FileStore, sha256_bytes
 from tests.helpers import png_bytes
 
 
@@ -35,6 +35,12 @@ def make_task(root: Path) -> ProjectTask:
     Image.new("RGB", (20, 20), "blue").save(
         project / "模特图" / "模特1.png"
     )
+    garment_hash = sha256_bytes(
+        (project / "衣服图" / "衣服1.png").read_bytes()
+    )
+    model_hash = sha256_bytes(
+        (project / "模特图" / "模特1.png").read_bytes()
+    )
     return ProjectTask(
         id=11,
         task_code="P-001",
@@ -45,11 +51,11 @@ def make_task(root: Path) -> ProjectTask:
         garment_asset_id=1,
         garment_path="衣服图/衣服1.png",
         garment_name="衣服1.png",
-        garment_hash="a" * 64,
+        garment_hash=garment_hash,
         model_asset_id=2,
         model_path="模特图/模特1.png",
         model_name="模特1.png",
-        model_hash="b" * 64,
+        model_hash=model_hash,
         status="working",
         assignee_id=7,
         assignee_name="AI甲",
@@ -67,7 +73,7 @@ def make_task(root: Path) -> ProjectTask:
                 "garment",
                 "衣服图/衣服1.png",
                 "衣服1.png",
-                "a" * 64,
+                garment_hash,
                 "image/png",
                 20,
                 20,
@@ -130,6 +136,37 @@ class LocalTaskSourceTests(unittest.TestCase):
             snapshot = reloaded.load_attempt_snapshot(22)
             self.assertIsNotNone(snapshot)
             self.assertEqual(len(snapshot), 3)
+
+    def test_restore_uses_immutable_baseline_after_shared_file_changes(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = make_task(root / "share")
+            store = LocalTaskSourceStore(
+                root / "local",
+                7,
+                task,
+                SharedPathResolver(root / "share"),
+            )
+            original_garment_hash = store.state.garments[0].content_hash
+            original_model_hash = store.state.model.content_hash
+            Image.new("RGB", (20, 20), "green").save(
+                root / "share" / "项目" / "123" / "衣服图" / "衣服1.png"
+            )
+            Image.new("RGB", (20, 20), "yellow").save(
+                root / "share" / "项目" / "123" / "模特图" / "模特1.png"
+            )
+            store.clear()
+            restored = store.restore_all()
+            self.assertEqual(
+                restored.garments[0].content_hash,
+                original_garment_hash,
+            )
+            self.assertEqual(
+                restored.model.content_hash,
+                original_model_hash,
+            )
 
     def test_crop_can_be_restored_from_original(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

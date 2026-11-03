@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
@@ -76,6 +77,7 @@ class ProjectGenerationWorker:
 
     def _run(self) -> None:
         attempt_id = 0
+        written_results: list[tuple[Path, str]] = []
         try:
             current_task = self.repository.get_task(self.task.id)
             if current_task is None:
@@ -169,13 +171,15 @@ class ProjectGenerationWorker:
                     f"{index + 1:02d}_{content_hash[:12]}{suffix}"
                 )
                 atomic_write_bytes(image_path, data)
+                relative_path = self.resolver.relative_to_project(
+                    project_root,
+                    image_path,
+                )
+                written_results.append((image_path, relative_path))
                 generated.append(
                     GeneratedResultInput(
                         result_index=index,
-                        relative_path=self.resolver.relative_to_project(
-                            project_root,
-                            image_path,
-                        ),
+                        relative_path=relative_path,
                         thumbnail_relative_path="",
                         content_hash=content_hash,
                         mime=mime,
@@ -200,7 +204,33 @@ class ProjectGenerationWorker:
             self.signals.finished.emit(self.task.id, attempt_id)
         except Exception as exc:
             message = sanitize_text(str(exc))
+            for image_path, relative_path in written_results:
+                try:
+                    if (
+                        self.repository.result_path_reference_count(
+                            relative_path,
+                            -1,
+                        )
+                        == 0
+                    ):
+                        image_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
             if attempt_id:
+                try:
+                    if (
+                        self.repository.generation_attempt_status(
+                            attempt_id
+                        )
+                        == ATTEMPT_CANCELLED
+                    ):
+                        self.signals.finished.emit(
+                            self.task.id,
+                            attempt_id,
+                        )
+                        return
+                except Exception:
+                    pass
                 try:
                     self.repository.fail_generation_attempt(
                         attempt_id,

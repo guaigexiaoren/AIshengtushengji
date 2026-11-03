@@ -58,6 +58,7 @@ class CollaborationSchemaTests(unittest.TestCase):
         self.assertIn("utf8mb4", schema)
         self.assertIn("FOREIGN KEY", schema)
         for index in (
+            "uk_users_display_name",
             "idx_projects_scope_name_date",
             "idx_project_tasks_project_status_created",
             "idx_project_tasks_assignee_status_created",

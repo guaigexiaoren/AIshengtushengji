@@ -36,6 +36,7 @@ from ..collaboration.types import (
 from ..time_utils import utc_naive_to_local
 from ..paging import PageRequest, PageResult, TaskQuery
 from .async_queries import get_query_runner
+from .components import FilterBar, PageActionBar, PageHeader
 from .date_filter import OptionalDateEdit
 from .pagination_bar import PaginationBar
 from .widgets import ImageStrip
@@ -87,28 +88,25 @@ class TaskAssignmentPage(QWidget):
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(14)
         header = QHBoxLayout()
-        title_box = QVBoxLayout()
-        title = QLabel("待分配")
-        title.setStyleSheet("font-size:22px;font-weight:700;color:#1f2d43;")
-        subtitle = QLabel(
+        page_header = PageHeader(
+            "待分配",
             "选择完整未分配的主任务并整组领取；任一子任务已被领取时整批取消。"
         )
-        subtitle.setStyleSheet("color:#6d7a91;")
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        header.addLayout(title_box, 1)
         self.claim_button = QPushButton("领取所选")
         self.claim_button.setObjectName("PrimaryButton")
         self.claim_button.setEnabled(False)
         self.claim_button.clicked.connect(self._claim_selected)
         refresh = QPushButton("刷新")
         refresh.clicked.connect(self.refresh)
-        header.addWidget(self.claim_button)
-        header.addWidget(refresh)
+        page_header.add_action(refresh)
+        header.addWidget(page_header)
         outer.addLayout(header)
 
-        filters = QHBoxLayout()
+        filter_bar = FilterBar()
+        filters = filter_bar.layout
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("搜索任务编码、货号、项目或备注")
         self.start_date_edit = OptionalDateEdit("开始日期")
@@ -120,7 +118,7 @@ class TaskAssignmentPage(QWidget):
         filters.addWidget(QLabel("至"))
         filters.addWidget(self.end_date_edit)
         filters.addWidget(reset_filter)
-        outer.addLayout(filters)
+        outer.addWidget(filter_bar)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         left = QWidget()
@@ -230,6 +228,10 @@ class TaskAssignmentPage(QWidget):
         splitter.addWidget(right)
         splitter.setSizes([540, 660])
         outer.addWidget(splitter, 1)
+        action_bar = PageActionBar()
+        action_bar.layout.addStretch(1)
+        action_bar.layout.addWidget(self.claim_button)
+        outer.addWidget(action_bar)
         self.search_edit.textChanged.connect(self._filter_changed)
         self.start_date_edit.dateChanged.connect(self._filter_changed)
         self.end_date_edit.dateChanged.connect(self._filter_changed)

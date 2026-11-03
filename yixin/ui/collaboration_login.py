@@ -3,6 +3,7 @@ from __future__ import annotations
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
+    QFrame,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -130,18 +131,27 @@ class LoginDialog(QDialog):
         self.repository = repository
         self.user: AuthUser | None = None
         self.setWindowTitle("登录亦欣 AI 生图工作台")
-        self.resize(440, 300)
-        layout = QVBoxLayout(self)
+        self.resize(460, 360)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(20, 20, 20, 20)
+        card = QFrame()
+        card.setObjectName("Card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(16)
         brand = QLabel("亦欣 AI 生图工作台")
-        brand.setStyleSheet("font-size:24px;font-weight:700;color:#1f2d43;")
+        brand.setObjectName("PageTitle")
         subtitle = QLabel("运营 · AI 制作 · 管理员")
-        subtitle.setStyleSheet("color:#6d7a91;")
+        subtitle.setObjectName("PageSubtitle")
         layout.addWidget(brand)
         layout.addWidget(subtitle)
         form = QFormLayout()
+        form.setVerticalSpacing(12)
         self.username = QLineEdit()
+        self.username.setPlaceholderText("请输入登录账号")
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.password.setPlaceholderText("请输入登录密码")
         form.addRow("账号", self.username)
         form.addRow("密码", self.password)
         layout.addLayout(form)
@@ -158,6 +168,7 @@ class LoginDialog(QDialog):
         actions.addWidget(self.cancel_button)
         actions.addWidget(self.login_button)
         layout.addLayout(actions)
+        outer.addWidget(card)
 
     def _login(self) -> None:
         username = self.username.text().strip()

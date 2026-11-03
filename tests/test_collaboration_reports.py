@@ -15,6 +15,39 @@ from yixin.collaboration.types import TASK_APPROVED, TASK_AWAITING_ACCEPTANCE
 
 
 class CollaborationReportTests(unittest.TestCase):
+    def test_production_time_falls_back_to_approval_time(self) -> None:
+        start = datetime(2026, 1, 1, 9, 0, 0)
+        row = ReportTaskRow(
+            project_id=1,
+            project_code="P001",
+            project_name="春季",
+            project_status="completed",
+            priority="normal",
+            task_id=1,
+            task_code="P001-0001",
+            task_status=TASK_APPROVED,
+            owner_name="运营A",
+            assignee_name="制作A",
+            model="model-a",
+            garment_name="G001",
+            model_name="M001",
+            final_quantity=1,
+            rework_count=0,
+            generated_image_count=1,
+            generation_cost=Decimal("1.00"),
+            project_created_at=start,
+            claimed_at=start + timedelta(hours=1),
+            work_started_at=start + timedelta(hours=1),
+            submitted_at=None,
+            approved_at=start + timedelta(hours=3),
+            returned_at=None,
+        )
+        report = aggregate_report([row])
+        self.assertEqual(
+            report.summary.average_production_seconds,
+            2 * 60 * 60,
+        )
+
     def test_summary_and_excel_export(self) -> None:
         start = datetime(2026, 1, 1, 9, 0, 0)
         rows = [

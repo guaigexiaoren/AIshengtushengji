@@ -8,12 +8,10 @@ from PySide6.QtGui import (
     QFont,
     QImageReader,
     QPainter,
-    QPen,
     QPixmap,
     QTransform,
 )
 from PySide6.QtWidgets import (
-    QGraphicsLineItem,
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
@@ -32,6 +30,7 @@ from .widgets import ImageStrip
 
 class ZoomableImageView(QGraphicsView):
     scale_changed = Signal(float)
+    interacted = Signal()
 
     MIN_SCALE = 0.1
     MAX_SCALE = 4.0
@@ -119,6 +118,7 @@ class ZoomableImageView(QGraphicsView):
         if not self._has_content:
             super().wheelEvent(event)
             return
+        self.interacted.emit()
         factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
         self.set_scale(
             self._scale * factor,
@@ -131,6 +131,7 @@ class ZoomableImageView(QGraphicsView):
             event.button() == Qt.MouseButton.LeftButton
             and self._has_content
         ):
+            self.interacted.emit()
             self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
         super().mousePressEvent(event)
 
@@ -140,14 +141,13 @@ class ZoomableImageView(QGraphicsView):
             self.viewport().setCursor(Qt.CursorShape.OpenHandCursor)
 
 
-class ImageCompareView(QWidget):
-    images_swapped = Signal()
-    comparison_exited = Signal()
+class ImageZoomView(QWidget):
+    activated = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.images: list[tuple[Path, str]] = []
         self._current_path: Path | None = None
+        self._current_label = ""
         self._placeholder = "选择图片查看大图"
         self._scale = 1.0
         self._updating_scene = False
@@ -156,71 +156,33 @@ class ImageCompareView(QWidget):
         self._fit_timer.timeout.connect(self.fit_to_window)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(4)
-        self.zoom_in_button = QPushButton("放大")
-        self.zoom_out_button = QPushButton("缩小")
-        self.fit_button = QPushButton("适应窗口")
-        self.actual_button = QPushButton("100%")
-        self.swap_button = QPushButton("交换左右")
-        self.exit_compare_button = QPushButton("退出对比")
-        self.scale_label = QLabel("100%")
-        for button in (
-            self.zoom_in_button,
-            self.zoom_out_button,
-            self.fit_button,
-            self.actual_button,
-        ):
-            toolbar.addWidget(button)
-        toolbar.addStretch(1)
-        toolbar.addWidget(self.swap_button)
-        toolbar.addWidget(self.exit_compare_button)
-        toolbar.addWidget(self.scale_label)
-        layout.addLayout(toolbar)
         self.scene = QGraphicsScene(self)
         self.view = ZoomableImageView(self.scene)
         self.view.scale_changed.connect(self._scale_changed)
+        self.view.interacted.connect(self.activated)
         layout.addWidget(self.view, 1)
-        self.zoom_in_button.clicked.connect(lambda: self.view.zoom_by(1.2))
-        self.zoom_out_button.clicked.connect(
-            lambda: self.view.zoom_by(1 / 1.2)
-        )
-        self.fit_button.clicked.connect(self.fit_to_window)
-        self.actual_button.clicked.connect(lambda: self.set_zoom(1.0))
-        self.swap_button.clicked.connect(self.swap_images)
-        self.exit_compare_button.clicked.connect(self.exit_comparison)
         self._render()
 
     @property
     def current_path(self) -> Path | None:
         return self._current_path
 
-    def set_images(
-        self,
-        images: list[tuple[str | Path, str]],
-    ) -> None:
-        self.images = [
-            (Path(path), str(label))
-            for path, label in images[:2]
-        ]
-        self._current_path = (
-            self.images[-1][0] if self.images else None
-        )
-        self._render()
+    @property
+    def scale(self) -> float:
+        return self._scale
 
     def set_image(
         self,
         path: str | Path | None,
         label: str = "",
     ) -> None:
-        self.set_images(
-            [(path, label)] if path is not None else []
-        )
+        self._current_path = Path(path) if path is not None else None
+        self._current_label = str(label)
+        self._render()
 
     def set_placeholder(self, text: str) -> None:
         self._placeholder = text
-        if not self.images:
+        if self._current_path is None:
             self._render()
 
     def set_current_path(self, path: str | Path | None) -> None:
@@ -232,25 +194,8 @@ class ImageCompareView(QWidget):
     def set_zoom(self, value: float) -> None:
         self.view.set_scale(value)
 
-    def swap_images(self) -> None:
-        if len(self.images) != 2:
-            return
-        self.images.reverse()
-        self._current_path = self.images[-1][0]
-        self._render()
-        self.images_swapped.emit()
-
-    def exit_comparison(self) -> None:
-        if len(self.images) <= 1:
-            return
-        self.images = self.images[:1]
-        self._current_path = self.images[0][0]
-        self._render()
-        self.comparison_exited.emit()
-
     def _scale_changed(self, value: float) -> None:
         self._scale = value
-        self.scale_label.setText(f"{round(value * 100)}%")
 
     def _render(self) -> None:
         if self._updating_scene:
@@ -258,11 +203,7 @@ class ImageCompareView(QWidget):
         self._updating_scene = True
         try:
             self.scene.clear()
-            pixmaps = [
-                QPixmap(str(path))
-                for path, _label in self.images
-            ]
-            if not self.images:
+            if self._current_path is None:
                 text = self.scene.addSimpleText(self._placeholder)
                 text.setBrush(QColor("#60708a"))
                 text.setFont(QFont(self.font().family(), 12))
@@ -272,76 +213,48 @@ class ImageCompareView(QWidget):
                 self.view.set_has_content(False)
                 self.view.setSceneRect(rect.adjusted(-30, -30, 30, 30))
             else:
-                self._render_images(pixmaps)
+                self._render_image()
                 self.view.set_has_content(True)
-            self.swap_button.setEnabled(len(self.images) == 2)
-            self.exit_compare_button.setEnabled(len(self.images) == 2)
-            if self.images:
+            if self._current_path is not None:
                 self._fit_timer.start(0)
         finally:
             self._updating_scene = False
 
-    def _render_images(self, pixmaps: list[QPixmap]) -> None:
+    def _render_image(self) -> None:
+        assert self._current_path is not None
+        pixmap = QPixmap(str(self._current_path))
         label_height = 28
-        gap = 36
-        widths = [max(1, pixmap.width()) for pixmap in pixmaps]
-        heights = [max(1, pixmap.height()) for pixmap in pixmaps]
-        cell_width = max(widths)
-        cell_height = max(heights)
-        total_width = (
-            cell_width
-            if len(pixmaps) == 1
-            else cell_width * 2 + gap
-        )
-        for index, (pixmap, (path, label)) in enumerate(
-            zip(pixmaps, self.images)
-        ):
-            cell_left = index * (cell_width + gap)
-            slot_name = (
-                ""
-                if len(pixmaps) == 1
-                else ("左图" if index == 0 else "右图")
+        if self._current_label:
+            text = QGraphicsSimpleTextItem(self._current_label)
+            text.setBrush(QColor("#d8e2f0"))
+            text.setFont(QFont(self.font().family(), 10))
+            text.setPos(8, 0)
+            self.scene.addItem(text)
+        if pixmap.isNull():
+            text = QGraphicsSimpleTextItem(
+                f"图片无法读取\n{self._current_path.name}"
             )
-            display_label = (
-                f"{slot_name} · {label}" if slot_name else label
-            )
-            if display_label:
-                text = QGraphicsSimpleTextItem(display_label)
-                text.setBrush(QColor("#d8e2f0"))
-                text.setFont(QFont(self.font().family(), 10))
-                text.setPos(cell_left + 8, 0)
-                self.scene.addItem(text)
-            if pixmap.isNull():
-                text = QGraphicsSimpleTextItem(
-                    f"图片无法读取\n{path.name}"
-                )
-                text.setBrush(QColor("#d8e2f0"))
-                text.setPos(cell_left + 20, label_height + 20)
-                self.scene.addItem(text)
-                continue
-            item = QGraphicsPixmapItem(pixmap)
-            x = cell_left + (cell_width - pixmap.width()) / 2
-            y = label_height + (cell_height - pixmap.height()) / 2
-            item.setPos(x, y)
-            self.scene.addItem(item)
-        if len(pixmaps) == 2:
-            separator = QGraphicsLineItem(
-                cell_width + gap / 2,
-                label_height,
-                cell_width + gap / 2,
-                label_height + cell_height,
-            )
-            separator.setPen(QPen(QColor("#64748b")))
-            self.scene.addItem(separator)
-        scene_width = total_width
-        scene_height = label_height + cell_height
+            text.setBrush(QColor("#d8e2f0"))
+            text.setPos(20, label_height + 20)
+            self.scene.addItem(text)
+            self.scene.setSceneRect(QRectF(0, 0, 420, 220))
+            return
+        item = QGraphicsPixmapItem(pixmap)
+        item.setPos(0, label_height)
+        self.scene.addItem(item)
         self.scene.setSceneRect(
-            QRectF(0, 0, scene_width, scene_height)
+            QRectF(
+                0,
+                0,
+                max(1, pixmap.width()),
+                label_height + max(1, pixmap.height()),
+            )
         )
 
 
 class ImagePreviewPane(QWidget):
     selection_changed = Signal(str, object, object)
+    activated = Signal(str)
 
     def __init__(
         self,
@@ -359,39 +272,66 @@ class ImagePreviewPane(QWidget):
         self.resolver = resolver
         self.async_thumbnails = async_thumbnails
         self.items: list[tuple[Path, Path, str, object]] = []
-        self._left_index: int | None = None
-        self._right_index: int | None = None
         self._current_index: int | None = None
         self._updating_images = False
+        self.setObjectName("ImagePreviewPane")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self._apply_active_style(False)
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setContentsMargins(6, 5, 6, 5)
+        header = QHBoxLayout()
+        header.setSpacing(8)
         self.title_label = QLabel(f"{title}（0）")
         self.title_label.setStyleSheet(
             "font-weight:700;color:#1f2d43;"
         )
-        self.list_widget = ImageStrip(icon_size=icon_size)
-        self.compare_view = ImageCompareView()
-        self.preview = self.compare_view
-        self.preview.set_placeholder(f"选择{title}查看大图")
         self.meta_label = QLabel("")
+        self.meta_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight
+            | Qt.AlignmentFlag.AlignVCenter
+        )
         self.meta_label.setStyleSheet("color:#60708a;font-size:11px;")
-        layout.addWidget(self.title_label)
+        header.addWidget(self.title_label)
+        header.addStretch(1)
+        header.addWidget(self.meta_label)
+        self.list_widget = ImageStrip(icon_size=icon_size)
+        self.zoom_view = ImageZoomView()
+        self.preview = self.zoom_view
+        self.preview.set_placeholder(f"选择{title}查看大图")
+        layout.addLayout(header)
         layout.addWidget(self.list_widget)
         layout.addWidget(self.preview, 1)
-        layout.addWidget(self.meta_label)
         self.list_widget.currentRowChanged.connect(self._row_changed)
         self.list_widget.itemClicked.connect(
             lambda item: self._row_changed(self.list_widget.row(item))
         )
-        self.compare_view.images_swapped.connect(
-            self._comparison_swapped
-        )
-        self.compare_view.comparison_exited.connect(
-            self._comparison_exited
-        )
+        self.zoom_view.activated.connect(self._activated)
 
     def set_resolver(self, resolver: SharedPathResolver | None) -> None:
         self.resolver = resolver
+
+    def has_image(self) -> bool:
+        return bool(
+            self._current_index is not None
+            and 0 <= self._current_index < len(self.items)
+        )
+
+    def set_active(self, active: bool) -> None:
+        self._apply_active_style(active)
+
+    def _apply_active_style(self, active: bool) -> None:
+        border = "#3f73cb" if active else "#dce5f2"
+        self.setStyleSheet(
+            "QWidget#ImagePreviewPane {"
+            f"background:#ffffff;border:1px solid {border};"
+            "border-radius:10px;"
+            "}"
+        )
+        if hasattr(self, "title_label"):
+            color = "#245ab8" if active else "#1f2d43"
+            self.title_label.setStyleSheet(
+                f"font-weight:700;color:{color};"
+            )
 
     def set_images(
         self,
@@ -428,19 +368,17 @@ class ImagePreviewPane(QWidget):
         else:
             self.list_widget.set_images(thumbnail_items)
         if not self.items:
-            self._left_index = None
-            self._right_index = None
             self._current_index = None
             self.preview.set_placeholder(f"暂无{self.title}")
-            self.preview.set_images([])
-            self.meta_label.clear()
+            self.preview.set_image(None)
+            self.meta_label.setText("暂无图片")
             self._updating_images = False
             return
         row = 0 if default_row is None else default_row
         row = max(0, min(row, len(self.items) - 1))
         self.list_widget.setCurrentRow(row)
         self._updating_images = False
-        self._select_row(row, initial=True)
+        self._select_row(row)
 
     def set_task(self, task, results) -> None:
         if self.resolver is None:
@@ -483,13 +421,11 @@ class ImagePreviewPane(QWidget):
     def clear(self) -> None:
         self._updating_images = True
         self.items = []
-        self._left_index = None
-        self._right_index = None
         self._current_index = None
         self.list_widget.clear()
         self.preview.set_placeholder(f"暂无{self.title}")
-        self.preview.set_images([])
-        self.meta_label.clear()
+        self.preview.set_image(None)
+        self.meta_label.setText("暂无图片")
         self.title_label.setText(f"{self.title}（0）")
         self._updating_images = False
 
@@ -498,36 +434,12 @@ class ImagePreviewPane(QWidget):
             return
         self._select_row(row)
 
-    def _select_row(self, row: int, *, initial: bool = False) -> None:
+    def _select_row(self, row: int) -> None:
         if not 0 <= row < len(self.items):
             return
-        if initial or self._left_index is None:
-            self._left_index = row
-            self._right_index = None
-        elif row == self._left_index:
-            pass
-        else:
-            self._right_index = row
         self._current_index = row
         _thumbnail_path, image_path, label, payload = self.items[row]
-        compare_images = [
-            (
-                self.items[self._left_index][1],
-                self.items[self._left_index][2],
-            )
-        ]
-        if (
-            self._right_index is not None
-            and self._right_index != self._left_index
-        ):
-            compare_images.append(
-                (
-                    self.items[self._right_index][1],
-                    self.items[self._right_index][2],
-                )
-            )
-        self.preview.set_images(compare_images)
-        self.preview.set_current_path(image_path)
+        self.preview.set_image(image_path, label)
         reader = QImageReader(str(image_path))
         size = reader.size()
         dimensions = (
@@ -537,36 +449,16 @@ class ImagePreviewPane(QWidget):
         )
         self.meta_label.setText(f"{label} · {dimensions}")
         self.selection_changed.emit(self.role, payload, image_path)
+        self.activated.emit(self.role)
 
-    def _comparison_swapped(self) -> None:
-        if self._left_index is None or self._right_index is None:
-            return
-        self._left_index, self._right_index = (
-            self._right_index,
-            self._left_index,
-        )
-        self._current_index = self._right_index
-        self._emit_current()
-
-    def _comparison_exited(self) -> None:
-        if self._left_index is None:
-            return
-        self._right_index = None
-        self._current_index = self._left_index
-        self._emit_current()
-
-    def _emit_current(self) -> None:
-        row = self._current_index
-        if row is None or not 0 <= row < len(self.items):
-            return
-        image_path = self.items[row][1]
-        payload = self.items[row][3]
-        self.preview.set_current_path(image_path)
-        self.selection_changed.emit(self.role, payload, image_path)
+    def _activated(self) -> None:
+        if self.has_image():
+            self.activated.emit(self.role)
 
 
 class DualImagePreview(QWidget):
     selection_changed = Signal(str, object, object)
+    active_role_changed = Signal(str)
 
     def __init__(
         self,
@@ -575,9 +467,52 @@ class DualImagePreview(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        layout = QHBoxLayout(self)
+        self.active_role = "result"
+        self._updating_images = False
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        toolbar_host = QWidget()
+        toolbar_host.setFixedHeight(36)
+        toolbar = QHBoxLayout(toolbar_host)
+        toolbar.setContentsMargins(0, 0, 0, 0)
+        toolbar.setSpacing(4)
+        self.active_label = QLabel("当前：结果图")
+        self.active_label.setStyleSheet(
+            "color:#315272;font-weight:600;"
+        )
+        self.zoom_in_button = QPushButton("放大")
+        self.zoom_out_button = QPushButton("缩小")
+        self.fit_button = QPushButton("适应窗口")
+        self.actual_button = QPushButton("100%")
+        self.scale_label = QLabel("100%")
+        self.scale_label.setStyleSheet("color:#60708a;")
+        toolbar.addWidget(self.active_label)
+        toolbar.addStretch(1)
+        for button in (
+            self.zoom_in_button,
+            self.zoom_out_button,
+            self.fit_button,
+            self.actual_button,
+        ):
+            toolbar.addWidget(button)
+        toolbar.addWidget(self.scale_label)
+        layout.addWidget(toolbar_host)
+        self.zoom_in_button.clicked.connect(
+            lambda: self._active_view().view.zoom_by(1.2)
+        )
+        self.zoom_out_button.clicked.connect(
+            lambda: self._active_view().view.zoom_by(1 / 1.2)
+        )
+        self.fit_button.clicked.connect(
+            lambda: self._active_view().fit_to_window()
+        )
+        self.actual_button.clicked.connect(
+            lambda: self._active_view().set_zoom(1.0)
+        )
         self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.splitter.setChildrenCollapsible(False)
+        self.splitter.setHandleWidth(6)
         self.result_pane = ImagePreviewPane(
             "result",
             "结果图",
@@ -602,6 +537,15 @@ class DualImagePreview(QWidget):
         self.reference_pane.selection_changed.connect(
             self.selection_changed.emit
         )
+        self.result_pane.activated.connect(self.set_active_role)
+        self.reference_pane.activated.connect(self.set_active_role)
+        self.result_pane.preview.view.scale_changed.connect(
+            lambda value: self._pane_scale_changed("result", value)
+        )
+        self.reference_pane.preview.view.scale_changed.connect(
+            lambda value: self._pane_scale_changed("reference", value)
+        )
+        self.set_active_role("result")
 
     def set_assets(
         self,
@@ -616,11 +560,19 @@ class DualImagePreview(QWidget):
         *,
         default_reference_row: int = 0,
     ) -> None:
+        self._updating_images = True
         self.result_pane.set_images(results)
         self.reference_pane.set_images(
             references,
             default_row=default_reference_row,
         )
+        self._updating_images = False
+        preferred = (
+            "result"
+            if self.result_pane.has_image()
+            else "reference"
+        )
+        self.set_active_role(preferred)
 
     def set_resolver(self, resolver: SharedPathResolver | None) -> None:
         self.result_pane.set_resolver(resolver)
@@ -629,3 +581,58 @@ class DualImagePreview(QWidget):
     def clear(self) -> None:
         self.result_pane.clear()
         self.reference_pane.clear()
+        self.active_role = "result"
+        self.result_pane.set_active(False)
+        self.reference_pane.set_active(False)
+        self.active_label.setText("当前：结果图")
+        self.scale_label.setText("100%")
+        self._update_toolbar_state()
+
+    def set_active_role(self, role: str) -> None:
+        if self._updating_images:
+            return
+        pane = self._pane_for_role(role)
+        if pane is None or not pane.has_image():
+            return
+        self.active_role = role
+        self.result_pane.set_active(role == "result")
+        self.reference_pane.set_active(role == "reference")
+        self.active_label.setText(
+            f"当前：{'结果图' if role == 'result' else '参考图'}"
+        )
+        self.scale_label.setText(
+            f"{round(pane.preview.scale * 100)}%"
+        )
+        self._update_toolbar_state()
+        self.active_role_changed.emit(role)
+
+    def _pane_for_role(
+        self,
+        role: str,
+    ) -> ImagePreviewPane | None:
+        if role == "result":
+            return self.result_pane
+        if role == "reference":
+            return self.reference_pane
+        return None
+
+    def _active_view(self) -> ImageZoomView:
+        pane = self._pane_for_role(self.active_role)
+        if pane is None:
+            return self.result_pane.preview
+        return pane.preview
+
+    def _pane_scale_changed(self, role: str, value: float) -> None:
+        if role == self.active_role:
+            self.scale_label.setText(f"{round(value * 100)}%")
+
+    def _update_toolbar_state(self) -> None:
+        pane = self._pane_for_role(self.active_role)
+        enabled = bool(pane and pane.has_image())
+        for button in (
+            self.zoom_in_button,
+            self.zoom_out_button,
+            self.fit_button,
+            self.actual_button,
+        ):
+            button.setEnabled(enabled)

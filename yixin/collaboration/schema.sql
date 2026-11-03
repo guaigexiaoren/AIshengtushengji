@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS users (
     last_login_at DATETIME(6) NULL,
     created_at DATETIME(6) NOT NULL,
     updated_at DATETIME(6) NOT NULL,
+    UNIQUE KEY uk_users_display_name (display_name),
     INDEX idx_users_role_active (role, is_active)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 

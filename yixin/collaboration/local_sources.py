@@ -42,7 +42,24 @@ class LocalTaskSourceStore:
         self.resolver = resolver
         self.task_root = self.root / str(actor_id) / str(task.id)
         self.manifest_path = self.task_root / "sources.json"
+        self.baseline_root = self.task_root / "baseline"
+        self.baseline_manifest_path = self.task_root / "baseline.json"
         self.state = self._load()
+
+    @classmethod
+    def read_attempt_snapshot(
+        cls,
+        root: Path,
+        actor_id: int,
+        task: ProjectTask,
+        attempt_id: int,
+    ) -> tuple[StoredImage, ...] | None:
+        store = cls.__new__(cls)
+        store.root = Path(root).expanduser().resolve()
+        store.actor_id = int(actor_id)
+        store.task = task
+        store.task_root = store.root / str(actor_id) / str(task.id)
+        return store.load_attempt_snapshot(attempt_id)
 
     def reload(self) -> LocalSourceState:
         self.state = self._load()
@@ -76,7 +93,7 @@ class LocalTaskSourceStore:
                 source,
                 role,
                 original_name=source.name,
-                source_path=source,
+                source_path=None,
                 content_hash=content_hash,
                 mime=mime,
                 width=width,
@@ -107,7 +124,7 @@ class LocalTaskSourceStore:
             image.path,
             role,
             original_name=image.original_name,
-            source_path=image.source_path,
+            source_path=image.source_path or image.path,
             content_hash=image.content_hash,
             mime=image.mime,
             width=image.width,
@@ -181,12 +198,12 @@ class LocalTaskSourceStore:
         restored = self._copy_image(
             current.source_path,
             role,
-            original_name=current.source_path.name,
+            original_name=current.original_name,
             source_path=current.source_path,
-            content_hash=current.content_hash,
-            mime=current.mime,
-            width=current.width,
-            height=current.height,
+            content_hash="",
+            mime="",
+            width=0,
+            height=0,
         )
         if role == "garment":
             garments = list(self.state.garments)
@@ -244,6 +261,7 @@ class LocalTaskSourceStore:
 
     def restore_all(self) -> LocalSourceState:
         self.state = self._seed_from_task()
+        self._save()
         return self.state
 
     def save_attempt_snapshot(
@@ -328,24 +346,27 @@ class LocalTaskSourceStore:
                         if model_data
                         else None
                     )
-                    if all(image.path.is_file() for image in garments):
-                        if model is None or model.path.is_file():
-                            return LocalSourceState(
-                                self.task.source_revision,
+                    if self._images_valid(garments):
+                        if model is None or self._images_valid((model,)):
+                            state = self._ensure_baseline_from_state(
                                 garments,
                                 model,
                             )
+                            self.state = state
+                            self._save()
+                            return state
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
                 pass
         return self._seed_from_task()
 
     def _seed_from_task(self) -> LocalSourceState:
         self.task_root.mkdir(parents=True, exist_ok=True)
-        for folder_name in ("garments", "model"):
-            folder = self.task_root / folder_name
-            if folder.exists():
-                shutil.rmtree(folder)
-        self.manifest_path.unlink(missing_ok=True)
+        baseline = self._load_baseline()
+        if baseline is not None:
+            return baseline
+        if self.baseline_root.exists():
+            shutil.rmtree(self.baseline_root)
+        self.baseline_manifest_path.unlink(missing_ok=True)
         garments = []
         for asset in self.task.garment_assets:
             source = self.resolver.resolve_project_path(
@@ -357,11 +378,12 @@ class LocalTaskSourceStore:
                     source,
                     "garment",
                     original_name=asset.original_name,
-                    source_path=source,
+                    source_path=None,
                     content_hash=asset.content_hash,
                     mime=asset.mime,
                     width=asset.width,
                     height=asset.height,
+                    destination_folder=self.baseline_root / "garments",
                 )
             )
         model_path = self.resolver.resolve_project_path(
@@ -372,11 +394,12 @@ class LocalTaskSourceStore:
             model_path,
             "model",
             original_name=self.task.model_name,
-            source_path=model_path,
+            source_path=None,
             content_hash=self.task.model_hash,
-            mime="image/png",
+            mime="",
             width=0,
             height=0,
+            destination_folder=self.baseline_root / "model",
         )
         state = LocalSourceState(
             self.task.source_revision,
@@ -384,8 +407,100 @@ class LocalTaskSourceStore:
             model,
         )
         self.state = state
+        self._save_baseline(state)
         self._save()
         return state
+
+    def _ensure_baseline_from_state(
+        self,
+        garments: tuple[StoredImage, ...],
+        model: StoredImage | None,
+    ) -> LocalSourceState:
+        baseline = self._load_baseline()
+        if baseline is None:
+            available = {
+                image.content_hash: image.path
+                for image in (*garments, *((model,) if model else ()))
+            }
+            try:
+                if self.baseline_root.exists():
+                    shutil.rmtree(self.baseline_root)
+                baseline_garments = []
+                for asset in self.task.garment_assets:
+                    source = available.get(asset.content_hash)
+                    if source is None:
+                        source = self.resolver.resolve_project_path(
+                            self.task.project_relative_root,
+                            asset.relative_path,
+                        )
+                    baseline_garments.append(
+                        self._copy_image(
+                            source,
+                            "garment",
+                            original_name=asset.original_name,
+                            source_path=None,
+                            content_hash=asset.content_hash,
+                            mime=asset.mime,
+                            width=asset.width,
+                            height=asset.height,
+                            destination_folder=(
+                                self.baseline_root / "garments"
+                            ),
+                        )
+                    )
+                source = available.get(self.task.model_hash)
+                if source is None:
+                    source = self.resolver.resolve_project_path(
+                        self.task.project_relative_root,
+                        self.task.model_path,
+                    )
+                baseline_model = self._copy_image(
+                    source,
+                    "model",
+                    original_name=self.task.model_name,
+                    source_path=None,
+                    content_hash=self.task.model_hash,
+                    mime="",
+                    width=0,
+                    height=0,
+                    destination_folder=self.baseline_root / "model",
+                )
+            except Exception:
+                return LocalSourceState(
+                    self.task.source_revision,
+                    garments,
+                    model,
+                )
+            baseline = LocalSourceState(
+                self.task.source_revision,
+                tuple(baseline_garments),
+                baseline_model,
+            )
+            self._save_baseline(baseline)
+        baseline_paths = {
+            image.content_hash: image.path
+            for image in baseline.references()
+        }
+
+        def normalized(image: StoredImage) -> StoredImage:
+            return StoredImage(
+                path=image.path,
+                content_hash=image.content_hash,
+                mime=image.mime,
+                width=image.width,
+                height=image.height,
+                original_name=image.original_name,
+                source_path=baseline_paths.get(
+                    image.content_hash,
+                    image.path,
+                ),
+            )
+
+        return LocalSourceState(
+            self.task.source_revision,
+            tuple(normalized(image) for image in garments),
+            normalized(model) if model is not None else None,
+        )
 
     def _copy_image(
         self,
@@ -398,14 +513,21 @@ class LocalTaskSourceStore:
         mime: str,
         width: int,
         height: int,
+        destination_folder: Path | None = None,
     ) -> StoredImage:
         source = Path(source).resolve()
         if not source.is_file():
             raise FileNotFoundError(f"参考图不存在：{source}")
         data = source.read_bytes()
         actual_hash = sha256_bytes(data)
+        if content_hash and actual_hash != content_hash:
+            raise ValueError(
+                f"参考图“{original_name}”内容已变化，请重新提交项目"
+            )
         actual_mime, actual_width, actual_height = image_metadata(data)
-        folder = self.task_root / ("garments" if role == "garment" else "model")
+        folder = destination_folder or (
+            self.task_root / ("garments" if role == "garment" else "model")
+        )
         folder.mkdir(parents=True, exist_ok=True)
         suffix = source.suffix.lower() or ".png"
         destination = folder / f"{actual_hash[:20]}{suffix}"
@@ -418,7 +540,11 @@ class LocalTaskSourceStore:
             width=actual_width or width,
             height=actual_height or height,
             original_name=original_name,
-            source_path=Path(source_path).resolve() if source_path else source,
+            source_path=(
+                Path(source_path).resolve()
+                if source_path
+                else destination.resolve()
+            ),
         )
 
     def _save(self) -> None:
@@ -445,6 +571,68 @@ class LocalTaskSourceStore:
                 indent=2,
             ).encode("utf-8"),
         )
+
+    def _load_baseline(self) -> LocalSourceState | None:
+        if not self.baseline_manifest_path.is_file():
+            return None
+        try:
+            data = json.loads(
+                self.baseline_manifest_path.read_text("utf-8")
+            )
+            if int(data.get("source_revision", 0)) != int(
+                self.task.source_revision
+            ):
+                return None
+            garments = tuple(
+                self._deserialize_image(item)
+                for item in data.get("garments", [])
+            )
+            model_data = data.get("model")
+            model = (
+                self._deserialize_image(model_data)
+                if model_data
+                else None
+            )
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return None
+        if not self._images_valid(garments):
+            return None
+        if model is not None and not self._images_valid((model,)):
+            return None
+        return LocalSourceState(
+            self.task.source_revision,
+            garments,
+            model,
+        )
+
+    def _save_baseline(self, state: LocalSourceState) -> None:
+        self.task_root.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "task_id": self.task.id,
+            "source_revision": state.source_revision,
+            "garments": [
+                self._serialize_image(image)
+                for image in state.garments
+            ],
+            "model": (
+                self._serialize_image(state.model)
+                if state.model is not None
+                else None
+            ),
+        }
+        atomic_write_bytes(
+            self.baseline_manifest_path,
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+            ).encode("utf-8"),
+        )
+
+    @staticmethod
+    def _images_valid(images: Iterable[StoredImage]) -> bool:
+        return all(image.path.is_file() for image in images)
 
     def _attempt_snapshot_path(self, attempt_id: int) -> Path:
         folder = self.task_root / "attempt_sources"

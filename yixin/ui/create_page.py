@@ -64,6 +64,7 @@ from ..time_utils import format_task_elapsed
 from ..worker import TaskWorker
 from .dialogs import CompareDialog, LibraryPickerDialog, TemplateManagerDialog
 from .crop import CropDialog
+from .components import PageActionBar, PageHeader
 from .save_helpers import LocalSaveController, show_saved_path, show_saved_toast
 from .widgets import (
     CompareWidget,
@@ -118,9 +119,10 @@ class CreatePage(QWidget):
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setChildrenCollapsible(False)
-        outer = QHBoxLayout(self)
+        outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(splitter)
+        outer.setSpacing(14)
+        outer.addWidget(splitter, 1)
 
         left_host = QWidget()
         left_layout = QVBoxLayout(left_host)
@@ -136,6 +138,11 @@ class CreatePage(QWidget):
         splitter.addWidget(left_host)
         splitter.addWidget(right_host)
         splitter.setSizes([580, 700])
+        action_bar = PageActionBar()
+        action_bar.layout.addStretch(1)
+        action_bar.layout.addWidget(self.generate_button)
+        self.page_action_bar = action_bar
+        outer.addWidget(action_bar)
 
         self.worker.signals.task_changed.connect(self._on_task_changed)
         self.mode_combo.currentIndexChanged.connect(self._update_reference_visibility)
@@ -164,12 +171,12 @@ class CreatePage(QWidget):
         header = QFrame()
         header.setObjectName("Card")
         header_layout = QVBoxLayout(header)
-        title = QLabel("开始创作")
-        title.setStyleSheet("font-size:22px;font-weight:700;color:#1f2d43;")
-        subtitle = QLabel("选择 Nano Banana 型号，输入提示词后加入串行任务队列。")
-        subtitle.setStyleSheet("color:#6d7a91;")
-        header_layout.addWidget(title)
-        header_layout.addWidget(subtitle)
+        header_layout.addWidget(
+            PageHeader(
+                "普通创作",
+                "选择模型和提示词，生成结果会自动加入串行队列。",
+            )
+        )
         layout.addWidget(header)
 
         settings_card = QGroupBox("生成设置")
@@ -290,7 +297,6 @@ class CreatePage(QWidget):
         self.generate_button = QPushButton("生成并加入队列")
         self.generate_button.setObjectName("PrimaryButton")
         self.generate_button.setMinimumHeight(42)
-        form.addRow(self.generate_button)
         layout.addWidget(settings_card)
         self.queue_group = self._build_queue()
         layout.addWidget(self.queue_group)

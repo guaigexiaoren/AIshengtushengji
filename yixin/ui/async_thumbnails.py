@@ -30,14 +30,15 @@ class ThumbnailRequest:
 
 
 class _ThumbnailTaskSignals(QObject):
-    loaded = Signal(str, object)
-    failed = Signal(str, str)
+    loaded = Signal(object, object)
+    failed = Signal(object, str)
 
 
 class _ThumbnailTask(QRunnable):
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, cache_key: tuple[str, int, int]) -> None:
         super().__init__()
         self.path = path
+        self.cache_key = cache_key
         self.signals = _ThumbnailTaskSignals()
 
     def run(self) -> None:
@@ -55,11 +56,11 @@ class _ThumbnailTask(QRunnable):
         image = reader.read()
         if image.isNull():
             self.signals.failed.emit(
-                str(self.path),
+                self.cache_key,
                 reader.errorString() or "无法读取图片",
             )
             return
-        self.signals.loaded.emit(str(self.path), image)
+        self.signals.loaded.emit(self.cache_key, image)
 
 
 class ThumbnailLoader(QObject):
@@ -70,9 +71,9 @@ class ThumbnailLoader(QObject):
         super().__init__(parent)
         self._pool = QThreadPool(self)
         self._pool.setMaxThreadCount(THUMBNAIL_THREAD_COUNT)
-        self._cache: OrderedDict[str, QImage] = OrderedDict()
+        self._cache: OrderedDict[tuple[str, int, int], QImage] = OrderedDict()
         self._requests: dict[int, QSize] = {}
-        self._inflight: dict[str, list[int]] = {}
+        self._inflight: dict[tuple[str, int, int], list[int]] = {}
         self._next_request_id = 1
 
     def request_thumbnail(
@@ -81,7 +82,13 @@ class ThumbnailLoader(QObject):
         target_size: QSize,
     ) -> ThumbnailRequest:
         source = Path(path)
-        key = str(source)
+        try:
+            stat = source.stat()
+            source_key = str(source.resolve())
+            key = (source_key, stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            source_key = str(source)
+            key = (source_key, -1, -1)
         request_id = self._next_request_id
         self._next_request_id += 1
         target = QSize(
@@ -104,14 +111,17 @@ class ThumbnailLoader(QObject):
             return ThumbnailRequest(request_id, source, target)
 
         self._inflight[key] = [request_id]
-        task = _ThumbnailTask(source)
+        task = _ThumbnailTask(source, key)
         task.signals.loaded.connect(self._loaded)
         task.signals.failed.connect(self._failed)
         self._pool.start(task)
         return ThumbnailRequest(request_id, source, target)
 
     def invalidate(self, path: str | Path) -> None:
-        self._cache.pop(str(path), None)
+        source = str(Path(path).resolve())
+        for key in tuple(self._cache):
+            if key[0] == source:
+                self._cache.pop(key, None)
 
     def clear_cache(self) -> None:
         self._cache.clear()
@@ -119,7 +129,11 @@ class ThumbnailLoader(QObject):
     def cache_size(self) -> int:
         return len(self._cache)
 
-    def _loaded(self, key: str, image: QImage) -> None:
+    def _loaded(
+        self,
+        key: tuple[str, int, int],
+        image: QImage,
+    ) -> None:
         self._cache[key] = image
         self._cache.move_to_end(key)
         while len(self._cache) > THUMBNAIL_CACHE_LIMIT:
@@ -127,21 +141,25 @@ class ThumbnailLoader(QObject):
         for request_id in self._inflight.pop(key, []):
             self._emit_ready(request_id, key, image)
 
-    def _failed(self, key: str, message: str) -> None:
+    def _failed(
+        self,
+        key: tuple[str, int, int],
+        message: str,
+    ) -> None:
         for request_id in self._inflight.pop(key, []):
             if self._requests.pop(request_id, None) is None:
                 continue
-            self.thumbnail_failed.emit(request_id, key, message)
+            self.thumbnail_failed.emit(request_id, key[0], message)
 
     def _emit_ready(
         self,
         request_id: int,
-        key: str,
+        key: tuple[str, int, int],
         image: QImage,
     ) -> None:
         if self._requests.pop(request_id, None) is None:
             return
-        self.thumbnail_ready.emit(request_id, key, image)
+        self.thumbnail_ready.emit(request_id, key[0], image)
 
 
 _thumbnail_loader: ThumbnailLoader | None = None

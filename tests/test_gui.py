@@ -394,12 +394,12 @@ class GuiFlowTests(unittest.TestCase):
         page = self.window.create_page
         self.assertIs(page.queue_group.parent(), page.form_content)
         self.app.processEvents()
-        generate_bottom = page.generate_button.mapTo(
-            page.form_content, QPoint(0, page.generate_button.height())
-        ).y()
-        queue_top = page.queue_group.mapTo(page.form_content, QPoint(0, 0)).y()
-        self.assertGreater(queue_top, generate_bottom)
-        self.assertLess(queue_top - generate_bottom, 180)
+        self.assertIs(
+            page.generate_button.parentWidget(),
+            page.page_action_bar,
+        )
+        self.assertIs(page.page_action_bar.parentWidget(), page)
+        self.assertIs(page.queue_group.parent(), page.form_content)
 
     def test_mixed_reference_and_result_preview_in_create_and_history(self) -> None:
         page = self.window.create_page

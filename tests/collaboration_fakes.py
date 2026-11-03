@@ -9,6 +9,12 @@ class EmptyCentralRepository:
     def list_projects(self, **_kwargs):
         return []
 
+    def list_exception_projects(self, _cutoff, **_kwargs):
+        return []
+
+    def list_exception_tasks(self, _project_id, _cutoff):
+        return []
+
     def list_project_tasks(self, _project_id):
         return []
 

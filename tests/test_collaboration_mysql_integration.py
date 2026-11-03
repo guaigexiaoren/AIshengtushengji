@@ -60,6 +60,7 @@ class MySQLIntegrationTests(unittest.TestCase):
             )
             users.append(admin.id)
             operator = repository.create_user(
+                admin,
                 "_integration_ops",
                 "集成运营",
                 "operations",
@@ -68,12 +69,14 @@ class MySQLIntegrationTests(unittest.TestCase):
                 project_access=(("internal", "集成项目"),),
             )
             ai_one = repository.create_user(
+                admin,
                 "_integration_ai1",
                 "集成制作1",
                 "ai",
                 "TempAi1123",
             )
             ai_two = repository.create_user(
+                admin,
                 "_integration_ai2",
                 "集成制作2",
                 "ai",
@@ -338,6 +341,56 @@ class MySQLIntegrationTests(unittest.TestCase):
                     for result in repository.list_results(task.id)
                 )
             )
+            reopened = repository.queue_generation_attempt(
+                task.id,
+                admin,
+                prompt="管理员直接重试",
+                model="gemini-3.1-flash-image",
+                aspect_ratio="3:4",
+                resolution="2K",
+                n=1,
+                unit_price=Decimal("1.25"),
+                allow_reopen=True,
+            )
+            self.assertEqual(reopened.operator_id, admin.id)
+            started = repository.start_queued_generation_attempt(
+                reopened.id,
+                admin,
+            )
+            self.assertEqual(started.status, "running")
+            repository.complete_generation_attempt(
+                reopened.id,
+                admin,
+                request_id="integration-retry",
+                remote_task_id="integration-retry",
+                raw_response={"ok": True},
+                input_tokens=1,
+                output_tokens=2,
+                results=(
+                    GeneratedResultInput(
+                        0,
+                        "AI成品/integration/result-retry.png",
+                        "",
+                        "d" * 64,
+                        "image/png",
+                        10,
+                        10,
+                    ),
+                ),
+            )
+            retried_results = repository.list_results(task.id)
+            self.assertEqual(
+                sum(result.is_final for result in retried_results),
+                1,
+            )
+            self.assertEqual(
+                next(
+                    result.relative_path
+                    for result in retried_results
+                    if result.is_final
+                ),
+                "AI成品/integration/result-retry.png",
+            )
             history = repository.list_project_attempt_history(admin)
             history_row = next(
                 row for row in history if int(row["id"]) == attempt.id
@@ -367,7 +420,7 @@ class MySQLIntegrationTests(unittest.TestCase):
             )
             self.assertEqual(
                 repository.report(ReportFilter()).summary.total_cost,
-                Decimal("1.2500"),
+                Decimal("2.5000"),
             )
             queue_outcomes = []
 

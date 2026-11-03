@@ -461,13 +461,14 @@ class Database:
     def request_cancel(self, task_id: int) -> str:
         now = utc_now_iso()
         with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT status FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
             if row is None:
                 raise ValueError("任务不存在")
             if row["status"] == TASK_QUEUED:
-                connection.execute(
+                updated = connection.execute(
                     """
                     UPDATE tasks
                     SET status = ?, cancel_requested = 1, updated_at = ?, finished_at = ?
@@ -475,9 +476,10 @@ class Database:
                     """,
                     (TASK_CANCELLED, now, now, task_id, TASK_QUEUED),
                 )
-                return TASK_CANCELLED
+                if updated.rowcount == 1:
+                    return TASK_CANCELLED
             if row["status"] == TASK_RUNNING:
-                connection.execute(
+                updated = connection.execute(
                     """
                     UPDATE tasks
                     SET cancel_requested = 1, updated_at = ?
@@ -485,8 +487,13 @@ class Database:
                     """,
                     (now, task_id, TASK_RUNNING),
                 )
-                return TASK_RUNNING
-            return row["status"]
+                if updated.rowcount == 1:
+                    return TASK_RUNNING
+            current = connection.execute(
+                "SELECT status FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            return str(current["status"]) if current else TASK_CANCELLED
 
     def is_cancel_requested(self, task_id: int) -> bool:
         with self.connection() as connection:
@@ -716,7 +723,7 @@ class Database:
                 UPDATE task_results
                 SET saved = 1, path = ?, thumbnail_path = ?,
                     mime = ?, width = ?, height = ?
-                WHERE id = ? AND task_id = ?
+                WHERE id = ? AND task_id = ? AND saved = 0
                 """,
                 (
                     str(saved_path),
@@ -729,8 +736,37 @@ class Database:
                 ),
             )
             if updated.rowcount != 1:
-                raise ValueError("生成结果不存在，作品保存已回滚")
+                raise ValueError(
+                    "生成结果不存在或已经保存，作品保存已回滚"
+                )
             return work_id
+
+    def restore_saved_task_result(
+        self,
+        task_id: int,
+        saved_path: Path,
+        image: StoredImage,
+        thumbnail_path: Path,
+    ) -> bool:
+        with self.connection() as connection:
+            updated = connection.execute(
+                """
+                UPDATE task_results
+                SET saved = 0, path = ?, thumbnail_path = ?,
+                    mime = ?, width = ?, height = ?
+                WHERE task_id = ? AND path = ? AND saved = 1
+                """,
+                (
+                    str(image.path),
+                    str(thumbnail_path),
+                    image.mime,
+                    image.width,
+                    image.height,
+                    task_id,
+                    str(saved_path),
+                ),
+            )
+            return updated.rowcount == 1
 
     def create_manual_work_with_assets(
         self,

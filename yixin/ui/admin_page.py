@@ -63,6 +63,8 @@ from ..constants import (
 )
 from ..security import validate_api_key
 from ..time_utils import utc_naive_to_local
+from .async_queries import get_query_runner
+from .components import FilterBar, PageActionBar, PageHeader
 
 
 class UserPermissionOptions(QWidget):
@@ -191,7 +193,7 @@ class AddUserDialog(QDialog):
             self.role.addItem(ROLE_LABELS[role], role)
         self.password = QLineEdit()
         self.password.setEchoMode(QLineEdit.EchoMode.Password)
-        self.password.setPlaceholderText("至少 8 个字符，首次登录后强制修改")
+        self.password.setPlaceholderText("至少 6 个字符，首次登录后强制修改")
         self.urgent_quota = QSpinBox()
         self.urgent_quota.setRange(0, 99)
         self.urgent_quota.setValue(3)
@@ -215,16 +217,16 @@ class AddUserDialog(QDialog):
             shared_projects or {},
         )
         layout.addWidget(self.permissions, 1)
-        actions = QHBoxLayout()
+        actions = PageActionBar()
         cancel = QPushButton("取消")
         save = QPushButton("保存")
         save.setObjectName("PrimaryButton")
         cancel.clicked.connect(self.reject)
         save.clicked.connect(self.accept)
-        actions.addStretch(1)
-        actions.addWidget(cancel)
-        actions.addWidget(save)
-        layout.addLayout(actions)
+        actions.layout.addStretch(1)
+        actions.layout.addWidget(cancel)
+        actions.layout.addWidget(save)
+        layout.addWidget(actions)
 
 
 class EditUserDialog(QDialog):
@@ -272,16 +274,17 @@ class EditUserDialog(QDialog):
         )
         layout.addWidget(self.permissions, 1)
 
-        actions = QHBoxLayout()
+        actions = PageActionBar()
         cancel = QPushButton("取消")
         save = QPushButton("保存")
         save.setObjectName("PrimaryButton")
         cancel.clicked.connect(self.reject)
         save.clicked.connect(self.accept)
-        actions.addStretch(1)
-        actions.addWidget(cancel)
-        actions.addWidget(save)
-        layout.addLayout(actions)
+        actions.layout.addStretch(1)
+        actions.layout.addWidget(cancel)
+        actions.layout.addWidget(save)
+        layout.addWidget(actions)
+
     def selected_menu_permissions(self) -> tuple[str, ...]:
         return self.permissions.selected_menu_permissions()
 
@@ -327,7 +330,7 @@ class ApiKeyDialog(QDialog):
         form.addRow("当前状态", self.status_label)
         form.addRow("API Key", self.key_edit)
         layout.addLayout(form)
-        actions = QHBoxLayout()
+        actions = PageActionBar()
         check = QPushButton("检查格式")
         cancel = QPushButton("取消")
         save = QPushButton("保存")
@@ -338,11 +341,11 @@ class ApiKeyDialog(QDialog):
         self.provider_combo.currentIndexChanged.connect(
             self._refresh_status
         )
-        actions.addStretch(1)
-        actions.addWidget(check)
-        actions.addWidget(cancel)
-        actions.addWidget(save)
-        layout.addLayout(actions)
+        actions.layout.addStretch(1)
+        actions.layout.addWidget(check)
+        actions.layout.addWidget(cancel)
+        actions.layout.addWidget(save)
+        layout.addWidget(actions)
         self._refresh_status()
 
     def _refresh_status(self) -> None:
@@ -658,20 +661,24 @@ class AdminPage(QWidget):
         ] = {}
         self.api_providers: list[ApiProvider] = []
         self.report_data: ReportData | None = None
+        self.query_runner = get_query_runner()
+        self._active_exception_request = -1
         self._build()
+        self.query_runner.succeeded.connect(self._query_succeeded)
+        self.query_runner.failed.connect(self._query_failed)
         if auto_load:
             self.refresh_all()
 
     def _build(self) -> None:
         layout = QVBoxLayout(self)
-        title = QLabel("管理员控制台")
-        title.setStyleSheet("font-size:22px;font-weight:700;color:#1f2d43;")
-        subtitle = QLabel(
-            "账号、API 平台、模型成本、共享设置、异常处理和经营报表。"
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(14)
+        layout.addWidget(
+            PageHeader(
+                "管理控制台",
+                "账号、API 平台、共享设置、任务异常和经营报表。",
+            )
         )
-        subtitle.setStyleSheet("color:#6d7a91;")
-        layout.addWidget(title)
-        layout.addWidget(subtitle)
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_users_tab(), "用户与权限")
         self.tabs.addTab(self._build_api_platforms_tab(), "API 平台")
@@ -709,12 +716,6 @@ class AdminPage(QWidget):
         self.clear_api_key_button.clicked.connect(self._clear_api_key)
         refresh_button = QPushButton("刷新")
         refresh_button.clicked.connect(self._refresh_users)
-        toolbar.addWidget(add_button)
-        toolbar.addWidget(edit_button)
-        toolbar.addWidget(self.toggle_user_button)
-        toolbar.addWidget(reset_button)
-        toolbar.addWidget(self.api_key_button)
-        toolbar.addWidget(self.clear_api_key_button)
         toolbar.addStretch(1)
         toolbar.addWidget(refresh_button)
         layout.addLayout(toolbar)
@@ -747,6 +748,18 @@ class AdminPage(QWidget):
         ):
             self.user_table.setColumnWidth(column, width)
         layout.addWidget(self.user_table, 1)
+        action_bar = PageActionBar()
+        for button in (
+            add_button,
+            edit_button,
+            self.toggle_user_button,
+            reset_button,
+            self.api_key_button,
+            self.clear_api_key_button,
+        ):
+            action_bar.layout.addWidget(button)
+        action_bar.layout.addStretch(1)
+        layout.addWidget(action_bar)
         return widget
 
     def _build_api_platforms_tab(self) -> QWidget:
@@ -764,7 +777,6 @@ class AdminPage(QWidget):
         refresh = QPushButton("刷新")
         edit.clicked.connect(self._edit_api_provider)
         refresh.clicked.connect(self._refresh_api_platforms)
-        toolbar.addWidget(edit)
         toolbar.addStretch(1)
         toolbar.addWidget(refresh)
         layout.addLayout(toolbar)
@@ -785,6 +797,10 @@ class AdminPage(QWidget):
         for column, width in enumerate((120, 180, 340, 80, 80, 100)):
             self.provider_table.setColumnWidth(column, width)
         layout.addWidget(self.provider_table, 1)
+        action_bar = PageActionBar()
+        action_bar.layout.addWidget(edit)
+        action_bar.layout.addStretch(1)
+        layout.addWidget(action_bar)
         return widget
 
     def _build_settings_tab(self) -> QWidget:
@@ -896,7 +912,7 @@ class AdminPage(QWidget):
             self.admin_task_table.setColumnWidth(column, width)
         splitter.addWidget(self.admin_task_table)
         layout.addWidget(splitter, 1)
-        actions = QHBoxLayout()
+        actions = PageActionBar()
         reassign = QPushButton("改派所选任务")
         cancel = QPushButton("取消所选任务")
         reopen = QPushButton("重开所选任务")
@@ -905,18 +921,19 @@ class AdminPage(QWidget):
         cancel.clicked.connect(self._admin_cancel_project)
         reopen.clicked.connect(self._reopen_project)
         refresh.clicked.connect(self._refresh_projects)
-        actions.addWidget(reassign)
-        actions.addStretch(1)
-        actions.addWidget(cancel)
-        actions.addWidget(reopen)
-        actions.addWidget(refresh)
-        layout.addLayout(actions)
+        actions.layout.addWidget(reassign)
+        actions.layout.addStretch(1)
+        actions.layout.addWidget(refresh)
+        actions.layout.addWidget(cancel)
+        actions.layout.addWidget(reopen)
+        layout.addWidget(actions)
         return widget
 
     def _build_reports_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
-        filters = QHBoxLayout()
+        filter_bar = FilterBar()
+        filters = filter_bar.layout
         self.start_date = QDateEdit(QDate.currentDate().addDays(-30))
         self.start_date.setCalendarPopup(True)
         self.end_date = QDateEdit(QDate.currentDate())
@@ -939,9 +956,7 @@ class AdminPage(QWidget):
         filters.addWidget(self.user_filter)
         filters.addWidget(self.model_filter)
         filters.addStretch(1)
-        filters.addWidget(search)
-        filters.addWidget(export)
-        layout.addLayout(filters)
+        layout.addWidget(filter_bar)
         self.summary_label = QLabel("尚未生成报表")
         self.summary_label.setWordWrap(True)
         self.summary_label.setStyleSheet(
@@ -978,6 +993,11 @@ class AdminPage(QWidget):
         ):
             self.report_table.setColumnWidth(column, width)
         layout.addWidget(self.report_table, 1)
+        action_bar = PageActionBar()
+        action_bar.layout.addWidget(export)
+        action_bar.layout.addStretch(1)
+        action_bar.layout.addWidget(search)
+        layout.addWidget(action_bar)
         return widget
 
     def _refresh_users(self) -> None:
@@ -1116,6 +1136,7 @@ class AdminPage(QWidget):
             return
         try:
             self.repository.create_user(
+                self.actor,
                 dialog.username.text(),
                 dialog.display_name.text(),
                 dialog.role.currentData(),
@@ -1266,7 +1287,11 @@ class AdminPage(QWidget):
             QMessageBox.warning(self, "不能停用", "不能停用当前登录账号。")
             return
         try:
-            self.repository.set_user_active(user.id, not user.is_active)
+            self.repository.set_user_active(
+                self.actor,
+                user.id,
+                not user.is_active,
+            )
         except Exception as exc:
             QMessageBox.warning(self, "操作失败", str(exc))
             return
@@ -1285,7 +1310,7 @@ class AdminPage(QWidget):
         if not ok:
             return
         try:
-            self.repository.reset_password(user.id, password)
+            self.repository.reset_password(self.actor, user.id, password)
         except Exception as exc:
             QMessageBox.warning(self, "重置失败", str(exc))
             return
@@ -1473,25 +1498,29 @@ class AdminPage(QWidget):
         self._refresh_templates()
 
     def _refresh_projects(self) -> None:
-        try:
-            all_projects = self.repository.list_projects()
-        except Exception as exc:
-            QMessageBox.warning(self, "读取任务失败", str(exc))
-            return
-        self.projects = []
         cutoff = datetime.utcnow() - timedelta(hours=24)
-        for project in all_projects:
+        self._exception_cutoff = cutoff
+        if not self.isVisible():
             try:
-                tasks = self.repository.list_project_tasks(project.id)
-            except Exception:
-                tasks = []
-            exceptional = [
-                task
-                for task in tasks
-                if self._task_needs_admin_attention(task, cutoff)
-            ]
-            if project.status == "cancelled" or exceptional:
-                self.projects.append(project)
+                projects = self.repository.list_exception_projects(
+                    cutoff
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "读取任务失败", str(exc))
+                return
+            self._render_exception_projects(projects)
+            return
+        self._active_exception_request = self.query_runner.submit(
+            lambda: self.repository.list_exception_projects(cutoff)
+        )
+
+    def _query_succeeded(self, request_id: int, result) -> None:
+        if request_id != self._active_exception_request:
+            return
+        self._render_exception_projects(result)
+
+    def _render_exception_projects(self, result) -> None:
+        self.projects = list(result)
         self.project_table.setRowCount(0)
         self.project_filter.blockSignals(True)
         self.project_filter.clear()
@@ -1518,6 +1547,11 @@ class AdminPage(QWidget):
         if self.projects:
             self.project_table.selectRow(0)
 
+    def _query_failed(self, request_id: int, message: str) -> None:
+        if request_id != self._active_exception_request:
+            return
+        QMessageBox.warning(self, "读取任务失败", message)
+
     def _current_admin_project(self) -> ProjectRecord | None:
         row = self.project_table.currentRow()
         if not 0 <= row < len(self.projects):
@@ -1528,18 +1562,19 @@ class AdminPage(QWidget):
         project = self._current_admin_project()
         if project is None:
             return
+        cutoff = datetime.utcnow() - timedelta(hours=24)
         try:
-            self.tasks = self.repository.list_project_tasks(project.id)
+            self.tasks = (
+                self.repository.list_project_tasks(project.id)
+                if project.status == "cancelled"
+                else self.repository.list_exception_tasks(
+                    project.id,
+                    cutoff,
+                )
+            )
         except Exception as exc:
             QMessageBox.warning(self, "读取任务失败", str(exc))
             return
-        if project.status != "cancelled":
-            cutoff = datetime.utcnow() - timedelta(hours=24)
-            self.tasks = [
-                task
-                for task in self.tasks
-                if self._task_needs_admin_attention(task, cutoff)
-            ]
         self.admin_task_table.setRowCount(0)
         for task in self.tasks:
             row = self.admin_task_table.rowCount()

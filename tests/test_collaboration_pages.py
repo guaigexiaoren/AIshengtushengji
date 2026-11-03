@@ -13,18 +13,15 @@ HAS_PYSIDE = importlib.util.find_spec("PySide6") is not None
 
 if HAS_PYSIDE:
     from PIL import Image
-    from PySide6.QtCore import QDate, QItemSelectionModel, QPoint, Qt
+    from PySide6.QtCore import QPoint, Qt
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import (
-        QAbstractItemView,
         QApplication,
         QDialog,
         QGraphicsView,
-        QHeaderView,
         QLabel,
         QMessageBox,
         QPushButton,
-        QTableWidget,
     )
 
     from yixin.api import NanoBananaClient
@@ -45,7 +42,6 @@ if HAS_PYSIDE:
         ProjectTask,
     )
     from yixin.constants import (
-        BUILTIN_PROMPT_TEMPLATES,
         PROTOCOL_OPENAI_CHAT_IMAGE,
         PROTOCOL_OPENAI_IMAGES,
         TASK_SUCCESS,
@@ -53,12 +49,10 @@ if HAS_PYSIDE:
     from yixin.database import Database
     from yixin.library import LibraryService
     from yixin.models import ImageRequest
-    from yixin.paging import PageRequest, PageResult, TaskQuery
+    from yixin.paging import PageResult
     from yixin.paths import AppPaths
     from yixin.security import SecretStore
-    from yixin.settings import INPUT_MANUAL_UPLOAD, AppSettings
     from yixin.storage import FileStore
-    from yixin.time_utils import utc_naive_to_local
     from yixin.ui.admin_page import (
         AddUserDialog,
         AdminPage,
@@ -66,20 +60,18 @@ if HAS_PYSIDE:
         EditUserDialog,
     )
     from yixin.ui.collaboration_login import LoginDialog
+    from yixin.ui.components import FilterBar
     from yixin.ui.dialogs import SettingsDialog
-    from yixin.ui.main_window import MainWindow, SidebarNav
+    from yixin.ui.main_window import MainWindow, SidebarNav, TopNavigation
     from yixin.ui.submission_list_page import SubmissionListPage
-    from yixin.ui.subtask_source_dialog import SubtaskSourceDialog
-    from yixin.ui.project_history_page import ProjectHistoryPage
     from yixin.ui.unified_history_page import (
         UnifiedHistoryPage,
     )
     from yixin.ui.image_preview import (
-        ImageCompareView,
+        DualImagePreview,
+        ImageZoomView,
         ImagePreviewPane,
     )
-    from yixin.ui.date_filter import OptionalDateEdit
-    from yixin.ui.task_center_page import TaskCenterPage
     from yixin.ui.task_assignment_page import TaskAssignmentPage
     from yixin.ui.ai_generation_page import AIGenerationPage
     from yixin.ui.task_create_page import (
@@ -88,6 +80,9 @@ if HAS_PYSIDE:
     )
     from yixin.ui.theme import APP_STYLESHEET
     from yixin.worker import TaskWorker
+    from tests.helpers import png_bytes
+
+
 
 
 class FakeCentralRepository:
@@ -121,6 +116,12 @@ class FakeCentralRepository:
 
     def list_projects(self, **_kwargs):
         return []
+
+    def list_exception_projects(self, _cutoff, **_kwargs):
+        return self.list_projects()
+
+    def list_exception_tasks(self, project_id, _cutoff):
+        return self.list_project_tasks(project_id)
 
     def list_accessible_projects(self, _actor):
         return (("internal", "春季项目"),)
@@ -194,6 +195,25 @@ class FakeCentralRepository:
 
     def update_user(self, actor, user_id, **kwargs):
         self.user_updates.append((actor, user_id, kwargs))
+
+    def create_user(self, actor, *args, **kwargs):
+        self.user_updates.append((actor, None, {"create": args, **kwargs}))
+        return AuthUser(
+            999,
+            args[0],
+            args[1],
+            args[2],
+        )
+
+    def set_user_active(self, actor, user_id, active):
+        self.user_updates.append(
+            (actor, user_id, {"active": active})
+        )
+
+    def reset_password(self, actor, user_id, password):
+        self.user_updates.append(
+            (actor, user_id, {"password": password})
+        )
 
     def skip_remaining_subtasks(self, project_id, actor, *, reason):
         self.skip_requests.append((project_id, actor, reason))
@@ -328,12 +348,21 @@ def make_project(
 
 def make_task(status: str) -> ProjectTask:
     now = datetime.now()
+    first_garment_hash = hashlib.sha256(
+        png_bytes((255, 0, 0), (20, 20))
+    ).hexdigest()
+    second_garment_hash = hashlib.sha256(
+        png_bytes((0, 128, 0), (20, 20))
+    ).hexdigest()
+    model_hash = hashlib.sha256(
+        png_bytes((0, 0, 255), (20, 20))
+    ).hexdigest()
     garments = (
         ProjectAssetInput(
             "garment",
             "衣服图/衣服1.png",
             "衣服1.png",
-            "a" * 64,
+            first_garment_hash,
             "image/png",
             20,
             20,
@@ -342,7 +371,7 @@ def make_task(status: str) -> ProjectTask:
             "garment",
             "衣服图/衣服2.png",
             "衣服2.png",
-            "b" * 64,
+            second_garment_hash,
             "image/png",
             20,
             20,
@@ -358,11 +387,11 @@ def make_task(status: str) -> ProjectTask:
         garment_asset_id=2,
         garment_path=garments[0].relative_path,
         garment_name=garments[0].original_name,
-        garment_hash=garments[0].content_hash,
+        garment_hash=first_garment_hash,
         model_asset_id=1,
         model_path="模特图/模特1.png",
         model_name="模特1.png",
-        model_hash="c" * 64,
+        model_hash=model_hash,
         status=status,
         assignee_id=4,
         assignee_name="AI制作Amy",
@@ -415,41 +444,17 @@ class CollaborationPageTests(unittest.TestCase):
             self.resolver,
             self.actor,
         )
-        submitted = SubmissionListPage(
+        records = SubmissionListPage(
             self.repository,
             self.resolver,
             self.actor,
-            "submitted",
-        )
-        pending = SubmissionListPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            "pending",
-        )
-        completed = SubmissionListPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            "completed",
-        )
-        center = TaskCenterPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            NanoBananaClient(lambda: None),
-            SecretStore(self.root / "unused.bin"),
-            FileStore(AppPaths(self.root / "data")),
-            AppSettings(Database(self.root / "preview.db")),
+            "records",
         )
         admin = AdminPage(self.repository, self.actor)
         self.assertEqual(create.product_table.rowCount(), 0)
-        self.assertEqual(submitted.project_table.rowCount(), 0)
-        self.assertEqual(pending.project_table.rowCount(), 0)
-        self.assertEqual(completed.project_table.rowCount(), 0)
-        self.assertEqual(center.task_table.rowCount(), 0)
+        self.assertEqual(records.project_table.rowCount(), 0)
         self.assertEqual(admin.user_table.rowCount(), 0)
-        for page in (create, submitted, pending, completed, center, admin):
+        for page in (create, records, admin):
             page.deleteLater()
 
     def test_ai_submit_removes_pair_controls_and_enlarges_assets(self) -> None:
@@ -493,8 +498,6 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(page.project_table.rowCount(), 1)
         self.assertTrue(page.project_table.isColumnHidden(6))
         self.assertEqual(page.task_table.rowCount(), 2)
-        self.assertFalse(page.urgent_button.isVisible())
-        self.assertFalse(page.review_actions.isVisible())
         self.assertFalse(page.result_panel.isHidden())
         self.assertIs(
             page.result_panel,
@@ -504,7 +507,8 @@ class CollaborationPageTests(unittest.TestCase):
             page.reference_panel,
             page.dual_preview.reference_pane,
         )
-        self.assertFalse(page._can_edit_task(available))
+        self.assertFalse(hasattr(page, "urgent_button"))
+        self.assertFalse(hasattr(page, "review_actions"))
         page.deleteLater()
 
     def test_assignment_page_multi_select_and_claim(self) -> None:
@@ -620,6 +624,24 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(len(page.garment_assets), 2)
         self.assertEqual(len(page.person_assets), 1)
         self.assertEqual(len(page.pairs), 1)
+        self.assertTrue(page.count_spin.isHidden())
+        original_hashes = tuple(
+            image.content_hash for image in page.garment_assets
+        )
+        with patch.object(
+            QMessageBox,
+            "question",
+            return_value=QMessageBox.StandardButton.Yes,
+        ):
+            page._clear_role("garment")
+        self.assertEqual(page.garment_assets, [])
+        self.assertTrue(page.restore_all_button.isEnabled())
+        page.restore_all_button.click()
+        self.assertEqual(len(page.garment_assets), 2)
+        self.assertEqual(
+            tuple(image.content_hash for image in page.garment_assets),
+            original_hashes,
+        )
         self.assertIsNotNone(page.provider_combo)
         self.assertNotEqual(
             page.template_combo.parentWidget(),
@@ -895,7 +917,8 @@ class CollaborationPageTests(unittest.TestCase):
             "历史重试提示词",
         )
         self.assertEqual(page.provider_combo.currentData(), "a6api")
-        self.assertEqual(page.count_spin.value(), 2)
+        self.assertEqual(page.count_spin.value(), 1)
+        self.assertTrue(page.count_spin.isHidden())
         page._enqueue_all()
         self.assertEqual(len(self.repository.generation_requests), 1)
         _task_id, _actor, kwargs = self.repository.generation_requests[0]
@@ -991,6 +1014,83 @@ class CollaborationPageTests(unittest.TestCase):
         )
         nav.close()
         nav.deleteLater()
+
+    def test_top_navigation_groups_categories_and_hides_single_rows(
+        self,
+    ) -> None:
+        labels = [
+            "AI提交",
+            "提交记录",
+            "待分配",
+            "AI生图",
+            "普通创作",
+            "批量换装",
+            "历史记录",
+            "作品库",
+            "管理控制台",
+        ]
+        nav = TopNavigation(
+            labels,
+            group_before={
+                0: "AI图提交",
+                2: "任务中心",
+                4: "创造中心",
+            },
+            submenu_indices={0, 1, 2, 3, 4, 5},
+            display_name="管理员",
+            role_label="管理员",
+            settings_visible=True,
+        )
+        nav.resize(1180, 92)
+        nav.show()
+        self.app.processEvents()
+        self.assertEqual(
+            list(nav._category_buttons),
+            [
+                "AI图提交",
+                "任务中心",
+                "创造中心",
+                "历史记录",
+                "作品库",
+                "管理控制台",
+            ],
+        )
+        nav.setCurrentRow(0)
+        self.assertTrue(nav.secondary_nav.isVisible())
+        self.assertEqual(
+            [button.text() for button in nav._buttons if button.isVisible()],
+            ["AI提交", "提交记录"],
+        )
+        nav.setCurrentRow(6)
+        self.assertFalse(nav.secondary_nav.isVisible())
+        nav.close()
+        nav.deleteLater()
+
+    def test_filter_bar_wraps_without_squeezing_controls(self) -> None:
+        filter_bar = FilterBar()
+        buttons = [QPushButton(f"筛选 {index}") for index in range(8)]
+        for button in buttons:
+            button.setFixedSize(100, 32)
+            filter_bar.layout.addWidget(button)
+        filter_bar.resize(380, 120)
+        filter_bar.show()
+        self.app.processEvents()
+        self.assertGreater(
+            len({button.geometry().y() for button in buttons}),
+            1,
+        )
+        self.assertTrue(
+            all(button.width() >= button.minimumSizeHint().width()
+                for button in buttons)
+        )
+        filter_bar.resize(1200, 80)
+        self.app.processEvents()
+        self.assertEqual(
+            len({button.geometry().y() for button in buttons}),
+            1,
+        )
+        filter_bar.close()
+        filter_bar.deleteLater()
 
     def test_new_task_default_directory_and_custom_date_detection(self) -> None:
         page = TaskCreatePage(
@@ -1381,65 +1481,6 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(len(draft.pairs), 6)
         page.deleteLater()
 
-    def test_subtask_source_dialog_adds_files_for_both_roles(self) -> None:
-        write_task_images(self.root)
-        task = make_task("claimed")
-        product_root = self.root / task.project_relative_root
-        assets = (
-            ProjectAssetInput(
-                "garment",
-                "衣服图/衣服1.png",
-                "衣服1.png",
-                "a" * 64,
-                "image/png",
-                20,
-                20,
-            ),
-            ProjectAssetInput(
-                "model",
-                "模特图/模特1.png",
-                "模特1.png",
-                "c" * 64,
-                "image/png",
-                20,
-                20,
-            ),
-        )
-        external = self.root / "外部素材"
-        external.mkdir()
-        new_garment = external / "新增衣服.png"
-        new_model = external / "新增模特.png"
-        Image.new("RGB", (30, 40), "yellow").save(new_garment)
-        Image.new("RGB", (30, 40), "cyan").save(new_model)
-        dialog = SubtaskSourceDialog(
-            self.repository,
-            self.resolver,
-            self.actor,
-            task,
-            assets,
-        )
-        dialog._stage_sources("garment", [new_garment])
-        dialog._stage_sources("model", [new_model])
-        dialog.garment_list.clearSelection()
-        dialog.model_list.clearSelection()
-        dialog.garment_list.item(dialog.garment_list.count() - 1).setSelected(
-            True
-        )
-        dialog.model_list.item(dialog.model_list.count() - 1).setSelected(
-            True
-        )
-        dialog._save()
-        self.assertEqual(len(self.repository.source_updates), 1)
-        update = self.repository.source_updates[0][2]
-        roles = {asset.role for asset in update["new_assets"]}
-        self.assertEqual(roles, {"garment", "model"})
-        self.assertTrue(
-            (product_root / "衣服图" / "新增衣服.png").is_file()
-        )
-        self.assertTrue(
-            (product_root / "模特图" / "新增模特.png").is_file()
-        )
-        dialog.deleteLater()
 
     def test_operations_main_window_has_new_task_navigation(self) -> None:
         paths = AppPaths(self.root / "data")
@@ -1482,6 +1523,56 @@ class CollaborationPageTests(unittest.TestCase):
             refresh.assert_called_once_with()
         window.close()
         window.deleteLater()
+
+    def test_empty_menu_permissions_stay_empty(self) -> None:
+        paths = AppPaths(self.root / "empty-menu-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: None)
+        actor = AuthUser(
+            3,
+            "operator",
+            "运营小林",
+            ROLE_OPERATIONS,
+            menu_permissions=(),
+        )
+        window = MainWindow(
+            paths=paths,
+            database=database,
+            file_store=file_store,
+            library_service=LibraryService(database, file_store, paths),
+            secret_store=SecretStore(paths.api_key_file),
+            worker=TaskWorker(database, client, file_store),
+            client=client,
+            repository=self.repository,
+            resolver=self.resolver,
+            actor=actor,
+            lazy_pages=True,
+        )
+        labels = [
+            window.nav_list.item(index).text()
+            for index in range(window.nav_list.count())
+        ]
+        self.assertEqual(labels, ["无可用菜单"])
+        window.close()
+        window.deleteLater()
+
+    def test_ai_user_can_submit_tasks(self) -> None:
+        page = TaskCreatePage(
+            self.repository,
+            self.resolver,
+            AuthUser(
+                4,
+                "ai_amy",
+                "AI制作Amy",
+                "ai",
+            ),
+            auto_load=False,
+        )
+        self.assertTrue(page.create_button.isEnabled())
+        page.deleteLater()
 
     def test_main_window_creates_pages_only_when_first_visited(self) -> None:
         paths = AppPaths(self.root / "lazy-window-data")
@@ -1786,1413 +1877,19 @@ class CollaborationPageTests(unittest.TestCase):
         window.close()
         window.deleteLater()
 
-    def test_submission_pages_have_requested_columns_and_actions(self) -> None:
-        picker = OptionalDateEdit("开始日期")
-        self.assertEqual(picker.text(), "开始日期")
-        self.assertIsNone(picker.python_date())
-        picker.setDate(QDate.currentDate())
-        self.assertEqual(picker.python_date(), date.today())
-        picker.clear()
-        write_task_images(self.root)
-        project = make_project()
-        submitted_task = make_task("claimed")
-        pending_task = make_task("awaiting_acceptance")
-        completed_task = make_task("approved")
-        product_root = self.root / pending_task.project_relative_root
-        result_path = (
-            product_root
-            / "AI成品"
-            / pending_task.project_code
-            / pending_task.task_code
-            / "attempt_001"
-            / "result_01.png"
-        )
-        result_path.parent.mkdir(parents=True)
-        Image.new("RGB", (40, 50), "purple").save(result_path)
-        result = GenerationResult(
-            id=19,
-            attempt_id=2,
-            result_index=0,
-            relative_path=result_path.relative_to(product_root).as_posix(),
-            thumbnail_relative_path=result_path.relative_to(
-                product_root
-            ).as_posix(),
-            content_hash="f" * 64,
-            mime="image/png",
-            width=40,
-            height=50,
-            is_final=True,
-        )
-        self.repository.list_projects = lambda **_: [project]
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            submitted_task
-        ]
-        self.repository.list_results = lambda _task_id: [result]
-        submitted = SubmissionListPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            "submitted",
-        )
-        submitted.show()
-        self.app.processEvents()
-        self.assertNotIn(
-            "模特图",
-            [
-                submitted.task_table.horizontalHeaderItem(index).text()
-                for index in range(submitted.task_table.columnCount())
-            ],
-        )
-        self.assertTrue(submitted.project_table.isSortingEnabled())
-        self.assertTrue(submitted.task_table.isSortingEnabled())
-        self.assertEqual(
-            submitted.project_table.horizontalHeader().sectionResizeMode(0),
-            QHeaderView.ResizeMode.Interactive,
-        )
-        self.assertEqual(
-            submitted.task_table.horizontalHeader().sectionResizeMode(0),
-            QHeaderView.ResizeMode.Interactive,
-        )
-        self.assertIsNone(submitted.start_date_edit.python_date())
-        self.assertEqual(submitted.start_date_edit.text(), "开始日期")
-        self.assertEqual(
-            submitted.task_table.horizontalHeaderItem(5).text(),
-            "创建时间",
-        )
-        self.assertEqual(
-            submitted.task_table.columnCount(),
-            7,
-        )
-        self.assertIsNone(submitted.task_table.cellWidget(0, 6))
-        with patch.object(submitted, "_edit_task") as edit_task:
-            submitted._edit_task_from_item(submitted.task_table.item(0, 0))
-        edit_task.assert_called_once_with(submitted_task)
-        with patch.object(submitted, "refresh"):
-            submitted._toggle_urgent()
-        self.assertEqual(
-            self.repository.project_urgent_updates[-1][0],
-            project.id,
-        )
-        self.assertTrue(self.repository.project_urgent_updates[-1][2])
-        self.assertTrue(submitted.urgent_button.isVisible())
-        self.assertTrue(submitted.result_panel.isHidden())
-        self.assertFalse(submitted.reference_panel.isHidden())
-        self.assertFalse(submitted.review_actions.isVisible())
-        self.assertEqual(
-            submitted.reference_header.text(),
-            "参考图（3）",
-        )
-        self.assertEqual(submitted.reference_strip.count(), 3)
-        self.assertEqual(submitted.reference_strip.currentRow(), 2)
-        self.assertEqual(submitted.reference_strip.item(2).text(), "模特")
-        self.assertTrue(
-            all(
-                not submitted.reference_strip.item(index).icon().isNull()
-                for index in range(submitted.reference_strip.count())
-            )
-        )
-        self.assertEqual(
-            submitted.reference_preview.current_path,
-            (product_root / "模特图" / "模特1.png").resolve(),
-        )
-        submitted.reference_strip.setCurrentRow(0)
-        self.app.processEvents()
-        self.assertEqual(
-            submitted.reference_preview.current_path,
-            (product_root / "衣服图" / "衣服1.png").resolve(),
-        )
-        self.assertEqual(
-            submitted.info_line.text(),
-            "123 · 2026-01-02 · 运营小林 · 重点检查领口",
-        )
-        submitted.search_edit.setText("不存在的货号")
-        self.app.processEvents()
-        self.assertEqual(submitted.project_table.rowCount(), 0)
-        submitted.search_edit.clear()
-        self.app.processEvents()
-        self.assertEqual(submitted.project_table.rowCount(), 1)
-        task_date = utc_naive_to_local(submitted_task.created_at).date()
-        task_qdate = QDate(
-            task_date.year,
-            task_date.month,
-            task_date.day,
-        )
-        submitted.start_date_edit.setDate(task_qdate)
-        submitted.end_date_edit.setDate(task_qdate)
-        self.app.processEvents()
-        self.assertEqual(submitted.project_table.rowCount(), 1)
-        submitted._reset_filters()
-        submitted.close()
-        submitted.deleteLater()
 
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            pending_task
-        ]
-        pending = SubmissionListPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            "pending",
-        )
-        pending.show()
-        self.app.processEvents()
-        self.assertFalse(pending.urgent_button.isVisible())
-        self.assertTrue(pending.view_results.isVisible())
-        self.assertTrue(pending.return_button.isVisible())
-        self.assertTrue(pending.approve_button.isVisible())
-        self.assertTrue(pending.view_results.isEnabled())
-        self.assertTrue(pending.review_actions.isVisible())
-        self.assertFalse(pending.result_panel.isHidden())
-        self.assertFalse(pending.reference_panel.isHidden())
-        self.assertEqual(
-            [
-                pending.view_results.text(),
-                pending.return_button.text(),
-                pending.approve_button.text(),
-            ],
-            ["与原模特图对比", "退回返工", "验收通过"],
-        )
-        self.assertEqual(pending.task_table.columnCount(), 7)
-        self.assertEqual(
-            pending.result_header.text(),
-            "结果图（1）",
-        )
-        self.assertEqual(
-            pending.reference_header.text(),
-            "参考图（3）",
-        )
-        self.assertEqual(pending.result_gallery.list_widget.count(), 1)
-        self.assertEqual(
-            pending.result_gallery.preview.current_path,
-            result_path.resolve(),
-        )
-        with patch(
-            "yixin.ui.submission_list_page.CompareDialog"
-        ) as compare_dialog:
-            pending.view_results.click()
-        compare_dialog.assert_called_once()
-        compare_dialog.return_value.exec.assert_called_once_with()
-        pending.close()
-        pending.deleteLater()
 
-        self.repository.list_results = lambda _task_id: []
-        pending_empty = SubmissionListPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            "pending",
-        )
-        pending_empty.show()
-        self.app.processEvents()
-        self.assertFalse(pending_empty.view_results.isEnabled())
-        self.assertTrue(pending_empty.return_button.isEnabled())
-        self.assertTrue(pending_empty.approve_button.isEnabled())
-        self.assertEqual(
-            pending_empty.result_header.text(),
-            "结果图（0）",
-        )
-        pending_empty.close()
-        pending_empty.deleteLater()
-        self.repository.list_results = lambda _task_id: [result]
 
-        completed_project = make_project("in_progress")
-        self.repository.list_projects = lambda **_: [completed_project]
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            completed_task,
-            pending_task,
-        ]
-        completed = SubmissionListPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            "completed",
-        )
-        completed.show()
-        self.app.processEvents()
-        self.assertFalse(completed.urgent_button.isVisible())
-        self.assertFalse(completed.view_results.isVisible())
-        self.assertFalse(completed.return_button.isVisible())
-        self.assertFalse(completed.approve_button.isVisible())
-        self.assertFalse(completed.review_actions.isVisible())
-        self.assertFalse(completed.result_panel.isHidden())
-        self.assertFalse(completed.reference_panel.isHidden())
-        self.assertEqual(completed.project_table.rowCount(), 1)
-        self.assertEqual(completed.task_table.rowCount(), 1)
-        self.assertEqual(
-            completed.task_table.item(0, 3).text(),
-            "已完成",
-        )
-        completed.close()
-        completed.deleteLater()
 
-    def test_task_center_layout_retry_and_atomic_queue_action(self) -> None:
-        write_task_images(self.root)
 
-        class KeyStore:
-            @staticmethod
-            def load():
-                return "test-key"
 
-        settings_database = Database(self.root / "preview.db")
-        settings_database.initialize()
-        center = TaskCenterPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            NanoBananaClient(lambda: "test-key"),
-            KeyStore(),
-            FileStore(AppPaths(self.root / "data")),
-            AppSettings(settings_database),
-        )
-        self.assertFalse(hasattr(center, "claim_button"))
-        self.assertEqual(
-            [
-                center.retry_button.text(),
-                center.save_button.text(),
-                center.upload_button.text(),
-                center.compare_button.text(),
-                center.submit_button.text(),
-            ],
-            [
-                "载入参数",
-                "保存当前成品",
-                "上传PS成品",
-                "与原模特图对比",
-                "提交验收",
-            ],
-        )
-        task = make_task("available")
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [task]
-        center.refresh()
-        self.assertEqual(center.current_task.id, task.id)
-        self.assertTrue(center.upload_button.isEnabled())
-        self.assertTrue(center._can_upload_manual(task))
-        self.assertEqual(
-            center.project_table.horizontalHeader().sectionResizeMode(0),
-            QHeaderView.ResizeMode.Interactive,
-        )
-        ps_image = self.root / "修后图.png"
-        Image.new("RGB", (20, 20), "white").save(ps_image)
-        with (
-            patch(
-                "yixin.ui.task_center_page.QFileDialog.getOpenFileNames",
-                return_value=([str(ps_image)], ""),
-            ) as first_open_files,
-            patch(
-                "yixin.ui.task_center_page.upload_manual_candidates",
-                return_value=1,
-            ),
-            patch(
-                "yixin.ui.task_center_page.QMessageBox.information"
-            ),
-            patch.object(center, "refresh"),
-        ):
-            center._upload_manual()
-        self.assertEqual(
-            first_open_files.call_args.args[2],
-            str(Path.home()),
-        )
-        upload_history = self.root / "上次修后图目录"
-        upload_history.mkdir()
-        center.app_settings.set_input_folder(
-            INPUT_MANUAL_UPLOAD,
-            upload_history,
-        )
-        with (
-            patch(
-                "yixin.ui.task_center_page.QFileDialog.getOpenFileNames",
-                return_value=([str(ps_image)], ""),
-            ) as open_files,
-            patch(
-                "yixin.ui.task_center_page.upload_manual_candidates",
-                return_value=1,
-            ) as upload_manual,
-            patch(
-                "yixin.ui.task_center_page.QMessageBox.information"
-            ),
-            patch.object(center, "refresh"),
-        ):
-            center._upload_manual()
-        upload_manual.assert_called_once()
-        self.assertEqual(upload_manual.call_args.args[2].id, task.id)
-        self.assertEqual(
-            open_files.call_args.args[2],
-            str(upload_history.resolve()),
-        )
-        self.assertNotIn("options", open_files.call_args.kwargs)
-        self.assertEqual(
-            center.app_settings.input_folder(INPUT_MANUAL_UPLOAD),
-            ps_image.parent.resolve(),
-        )
-        center.prompt_edit.setPlainText("临时修改")
-        with patch.object(center.prompt_edit, "setFocus") as set_focus:
-            center._retry_task()
-        self.assertEqual(center.prompt_edit.toPlainText(), task.prompt_text)
-        set_focus.assert_called_once_with()
-        center.prompt_edit.setPlainText("新的提示词")
-        center.refresh = lambda: None
-        center._enqueue_generation()
-        self.assertEqual(len(self.repository.generation_requests), 1)
-        self.assertEqual(
-            self.repository.generation_requests[0][0],
-            task.id,
-        )
-        snapshot = center.local_store.load_attempt_snapshot(7)
-        self.assertIsNotNone(snapshot)
-        self.assertEqual(len(snapshot), 3)
-        center.deleteLater()
 
-    def test_pending_review_supports_multi_select_batch_actions(self) -> None:
-        write_task_images(self.root)
-        first = make_task("awaiting_acceptance")
-        second = replace(
-            first,
-            id=12,
-            task_code="春季项目-123-001-002",
-        )
-        self.repository.list_projects = lambda **_: [
-            make_project("in_progress")
-        ]
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            first,
-            second,
-        ]
-        page = SubmissionListPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            "pending",
-        )
-        page.show()
-        self.app.processEvents()
-        self.assertEqual(
-            page.task_table.selectionMode(),
-            QAbstractItemView.SelectionMode.ExtendedSelection,
-        )
-        self.assertTrue(page.selection_hint.isVisible())
-        page.task_table.selectRow(0)
-        page.task_table.setCurrentCell(
-            1,
-            0,
-            QItemSelectionModel.SelectionFlag.Select
-            | QItemSelectionModel.SelectionFlag.Rows,
-        )
-        self.app.processEvents()
-        self.assertEqual(len(page._selected_tasks()), 2)
-        self.assertEqual(page.approve_button.text(), "验收通过（2）")
-        self.assertEqual(page.return_button.text(), "退回返工（2）")
-        with (
-            patch(
-                "yixin.ui.submission_list_page.QMessageBox.question",
-                return_value=QMessageBox.StandardButton.Yes,
-            ),
-            patch.object(page, "refresh"),
-        ):
-            page._approve_task()
-        self.assertEqual(
-            {request[0] for request in self.repository.review_requests},
-            {11, 12},
-        )
-        self.assertTrue(
-            all(request[2] for request in self.repository.review_requests)
-        )
-        self.repository.review_requests.clear()
-        with (
-            patch(
-                "yixin.ui.submission_list_page.QInputDialog.getMultiLineText",
-                return_value=("请统一调整领口", True),
-            ),
-            patch.object(page, "refresh"),
-        ):
-            page._return_task()
-        self.assertEqual(
-            {
-                (request[0], request[2], request[3])
-                for request in self.repository.review_requests
-            },
-            {
-                (11, False, "请统一调整领口"),
-                (12, False, "请统一调整领口"),
-            },
-        )
-        page.deleteLater()
 
-    def test_task_center_uses_source_strip_and_current_results(self) -> None:
-        write_task_images(self.root)
-        task = make_task("working")
-        product_root = self.root / task.project_relative_root
-        garment_assets = tuple(
-            replace(
-                asset,
-                content_hash=hashlib.sha256(
-                    (
-                        product_root / asset.relative_path
-                    ).read_bytes()
-                ).hexdigest(),
-            )
-            for asset in task.garment_assets
-        )
-        model_hash = hashlib.sha256(
-            (product_root / task.model_path).read_bytes()
-        ).hexdigest()
-        task = replace(
-            task,
-            garment_assets=garment_assets,
-            garment_hash=garment_assets[0].content_hash,
-            model_hash=model_hash,
-        )
-        result_path = (
-            product_root
-            / "AI成品"
-            / task.project_code
-            / task.task_code
-            / "attempt_001"
-            / "result_01.png"
-        )
-        result_path.parent.mkdir(parents=True)
-        Image.new("RGB", (50, 70), "orange").save(result_path)
-        result = GenerationResult(
-            id=21,
-            attempt_id=4,
-            result_index=0,
-            relative_path=result_path.relative_to(product_root).as_posix(),
-            thumbnail_relative_path=result_path.relative_to(
-                product_root
-            ).as_posix(),
-            content_hash="a" * 64,
-            mime="image/png",
-            width=50,
-            height=70,
-            is_final=False,
-        )
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            task
-        ]
-        self.repository.list_results = lambda _task_id: [result]
-        self.repository.list_templates = lambda _actor: [
-            {
-                "scope": "shared",
-                "name": "内置·基础服装替换",
-                "prompt": "内置基础提示词",
-            }
-        ]
-        center = TaskCenterPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            NanoBananaClient(lambda: "test-key"),
-            type(
-                "KeyStore",
-                (),
-                {"load": staticmethod(lambda: "test-key")},
-            )(),
-            FileStore(AppPaths(self.root / "task-center-data")),
-            AppSettings(Database(self.root / "task-center.db")),
-        )
-        center.resize(1480, 900)
-        center.show()
-        self.app.processEvents()
-        center._sync_task_splitter_to_generation()
-        self.app.processEvents()
-        self.assertFalse(hasattr(center, "task_detail"))
-        self.assertEqual(center.source_title.text(), "子任务参考图")
-        self.assertEqual(
-            center.task_table.selectionMode(),
-            QAbstractItemView.SelectionMode.ExtendedSelection,
-        )
-        self.assertEqual(
-            center.subtask_hint.text(),
-            "按住 Ctrl 多选，按住 Shift 连续选择",
-        )
-        self.assertTrue(center.local_source_hint.isHidden())
-        center._sync_task_splitter_to_generation()
-        self.assertEqual(
-            center.generation_splitter.sizes(),
-            center.task_splitter.sizes(),
-        )
-        self.assertLessEqual(
-            abs(
-                center.source_strip.mapTo(center, QPoint(0, 0)).y()
-                - center.gallery.list_widget.mapTo(
-                    center, QPoint(0, 0)
-                ).y()
-            ),
-            8,
-        )
-        self.assertLessEqual(
-            abs(
-                center.task_table.mapTo(center, QPoint(0, 0)).y()
-                - center.queue_table.mapTo(center, QPoint(0, 0)).y()
-            ),
-            12,
-        )
-        self.assertEqual(center.source_strip.count(), 3)
-        self.assertEqual(center.source_strip.currentRow(), 2)
-        self.assertEqual(center.source_strip.item(0).text(), "衣服 1")
-        self.assertEqual(center.source_strip.item(2).text(), "模特")
-        self.assertTrue(
-            all(
-                not center.source_strip.item(index).icon().isNull()
-                for index in range(center.source_strip.count())
-            )
-        )
-        center.source_strip.setCurrentRow(0)
-        self.assertEqual(center.project_table.rowCount(), 1)
-        self.assertEqual(center.task_table.rowCount(), 1)
-        self.assertEqual(
-            [
-                center.project_table.horizontalHeaderItem(i).text()
-                for i in range(center.project_table.columnCount())
-            ],
-            ["任务编码", "货号", "子任务进度", "状态", "创建时间"],
-        )
-        self.assertEqual(center.project_table.item(0, 2).text(), "0/1")
-        self.assertTrue(center.project_table.isSortingEnabled())
-        self.assertTrue(center.task_table.isSortingEnabled())
-        self.assertEqual(
-            [
-                center.queue_table.horizontalHeaderItem(index).text()
-                for index in range(center.queue_table.columnCount())
-            ],
-            [
-                "主任务编码",
-                "货号",
-                "子任务编码",
-                "轮次",
-                "操作人员",
-                "API 平台",
-                "状态",
-                "创建时间",
-                "结果数",
-            ],
-        )
-        self.assertEqual(center.queue_refresh_button.text(), "立即刷新")
-        self.assertIs(
-            center.generation_splitter.widget(1).findChild(QTableWidget),
-            center.queue_table,
-        )
-        self.assertEqual(center.project_filter_combo.count(), 2)
-        self.assertEqual(
-            center.project_filter_combo.itemText(1),
-            "春季项目",
-        )
-        center.product_search.setText("不存在")
-        self.app.processEvents()
-        self.assertEqual(center.project_table.rowCount(), 0)
-        center.product_search.clear()
-        self.app.processEvents()
-        self.assertEqual(center.project_table.rowCount(), 1)
-        self.assertFalse(hasattr(center, "source_role_combo"))
-        self.assertFalse(hasattr(center, "source_preview"))
-        self.assertEqual(center.result_title.text(), "当前任务生成结果")
-        self.assertEqual(
-            [
-                center.add_source_files_button.text(),
-                center.add_source_folder_button.text(),
-                center.add_source_library_button.text(),
-                center.crop_source_button.text(),
-                center.restore_source_button.text(),
-                center.remove_source_button.text(),
-                center.clear_sources_button.text(),
-            ],
-            [
-                "添加图片",
-                "添加文件夹",
-                "从作品库添加",
-                "裁剪当前图",
-                "恢复原图",
-                "移除所选",
-                "清空素材",
-            ],
-        )
-        self.assertFalse(center.skip_button.isEnabled())
-        self.assertFalse(center.add_source_library_button.isEnabled())
-        self.assertTrue(center.crop_source_button.isEnabled())
-        self.assertTrue(center.restore_source_button.isEnabled())
-        self.assertTrue(center.remove_source_button.isEnabled())
-        self.assertTrue(center.clear_sources_button.isEnabled())
-        center.source_strip.clearSelection()
-        center.source_strip.setCurrentRow(-1)
-        center._update_controls()
-        self.assertFalse(center.crop_source_button.isEnabled())
-        self.assertFalse(center.restore_source_button.isEnabled())
-        self.assertFalse(center.remove_source_button.isEnabled())
-        self.assertTrue(center.clear_sources_button.isEnabled())
-        center.source_strip.setCurrentRow(0)
-        center._update_controls()
-        self.assertIsNone(center.template_combo.currentData())
-        self.assertEqual(
-            center.prompt_edit.toPlainText(),
-            task.prompt_text,
-        )
-        center.template_combo.setCurrentIndex(1)
-        self.assertEqual(
-            center.prompt_edit.toPlainText(),
-            "内置基础提示词",
-        )
-        self.assertEqual(center.gallery.list_widget.count(), 1)
-        self.assertEqual(center.gallery.selected_result_ids(), [21])
-        self.assertEqual(
-            center.gallery.preview.current_path,
-            result_path.resolve(),
-        )
-        extra_garment = self.root / "额外衣服.png"
-        Image.new("RGB", (30, 40), "yellow").save(extra_garment)
-        center.source_strip.setCurrentRow(0)
-        with patch(
-            "yixin.ui.task_center_page.QFileDialog.getOpenFileNames",
-            return_value=([str(extra_garment)], ""),
-        ):
-            center._add_source_files()
-        self.assertEqual(len(center.local_state.garments), 3)
-        self.assertEqual(center.source_strip.count(), 4)
-        self.assertFalse(center.local_source_hint.isHidden())
-        extra_model = self.root / "额外模特.png"
-        Image.new("RGB", (30, 40), "cyan").save(extra_model)
-        center.source_strip.setCurrentRow(
-            center.source_strip.count() - 1
-        )
-        with patch(
-            "yixin.ui.task_center_page.QFileDialog.getOpenFileNames",
-            return_value=([str(extra_model)], ""),
-        ):
-            center._add_source_files()
-        self.assertEqual(
-            center.local_state.model.path.read_bytes(),
-            extra_model.read_bytes(),
-        )
-        dropped_folder = self.root / "拖入任务素材"
-        dropped_folder.mkdir()
-        Image.new("RGB", (30, 40), "black").save(
-            dropped_folder / "拖入衣服.png"
-        )
-        center.source_strip.setCurrentRow(0)
-        center._handle_source_drop([dropped_folder])
-        self.assertEqual(len(center.local_state.garments), 4)
-        restored = TaskCenterPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            NanoBananaClient(lambda: "test-key"),
-            type(
-                "KeyStore",
-                (),
-                {"load": staticmethod(lambda: "test-key")},
-            )(),
-            FileStore(AppPaths(self.root / "task-center-data")),
-            AppSettings(Database(self.root / "task-center.db")),
-        )
-        self.assertIsNotNone(restored.local_state)
-        self.assertEqual(len(restored.local_state.garments), 4)
-        with patch(
-            "yixin.ui.task_center_page.QMessageBox.question",
-            return_value=QMessageBox.StandardButton.Yes,
-        ):
-            center._clear_sources()
-        self.assertEqual(center.local_state.garments, ())
-        self.assertIsNone(center.local_state.model)
-        self.assertFalse(center.generate_button.isEnabled())
-        self.assertTrue(center.restore_source_button.isEnabled())
-        self.assertFalse(center.clear_sources_button.isEnabled())
-        center._restore_source()
-        self.assertEqual(len(center.local_state.garments), 2)
-        self.assertIsNotNone(center.local_state.model)
-        restored.deleteLater()
-        center.deleteLater()
 
-    def test_task_center_saves_only_current_original_result(self) -> None:
-        write_task_images(self.root)
-        task = make_task("working")
-        source = (
-            self.root
-            / task.project_relative_root
-            / "AI成品"
-            / "春季项目-123-001"
-            / task.task_code
-            / "attempt_001"
-            / "result_01.png"
-        )
-        source.parent.mkdir(parents=True)
-        Image.new("RGB", (64, 80), "purple").save(source)
-        result = GenerationResult(
-            id=9,
-            attempt_id=3,
-            result_index=1,
-            relative_path=source.relative_to(
-                self.root / task.project_relative_root
-            ).as_posix(),
-            thumbnail_relative_path=source.relative_to(
-                self.root / task.project_relative_root
-            ).as_posix(),
-            content_hash="d" * 64,
-            mime="image/png",
-            width=64,
-            height=80,
-            is_final=True,
-        )
-        database = Database(self.root / "save-settings.db")
-        database.initialize()
-        settings = AppSettings(database)
-        output = self.root / "本地保存"
-        output.mkdir()
-        settings.set_local_save_mode("fixed")
-        settings.set_fixed_folder(output)
-        center = TaskCenterPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            NanoBananaClient(lambda: "test-key"),
-            type(
-                "KeyStore",
-                (),
-                {"load": staticmethod(lambda: "test-key")},
-            )(),
-            FileStore(AppPaths(self.root / "save-data")),
-            settings,
-        )
-        center.current_task = task
-        center.gallery.set_task(task, [result])
-        with patch(
-            "yixin.ui.task_center_page.show_saved_toast"
-        ) as toast:
-            center._save_result()
-        saved = list(output.glob("*.png"))
-        self.assertEqual(len(saved), 1)
-        self.assertEqual(saved[0].read_bytes(), source.read_bytes())
-        toast.assert_called_once()
-        center.deleteLater()
 
-    def test_task_center_local_source_permissions(self) -> None:
-        write_task_images(self.root)
-        ai_actor = AuthUser(4, "ai", "AI制作Amy", "ai")
-        task = make_task("working")
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            task
-        ]
-        center = TaskCenterPage(
-            self.repository,
-            self.resolver,
-            ai_actor,
-            NanoBananaClient(lambda: "test-key"),
-            type(
-                "KeyStore",
-                (),
-                {"load": staticmethod(lambda: "test-key")},
-            )(),
-            FileStore(AppPaths(self.root / "permission-data")),
-            AppSettings(Database(self.root / "permission.db")),
-        )
-        self.assertTrue(center.add_source_files_button.isEnabled())
-        center.deleteLater()
 
-        task = make_task("awaiting_acceptance")
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            task
-        ]
-        pending = TaskCenterPage(
-            self.repository,
-            self.resolver,
-            ai_actor,
-            NanoBananaClient(lambda: "test-key"),
-            type(
-                "KeyStore",
-                (),
-                {"load": staticmethod(lambda: "test-key")},
-            )(),
-            FileStore(AppPaths(self.root / "permission-pending")),
-            AppSettings(Database(self.root / "permission-pending.db")),
-        )
-        self.assertFalse(pending.add_source_files_button.isEnabled())
-        pending.deleteLater()
 
-    def test_task_center_crop_updates_unstarted_queue_snapshot(self) -> None:
-        write_task_images(self.root)
-        task = make_task("working")
-        queued = GenerationAttempt(
-            id=77,
-            task_id=task.id,
-            attempt_no=1,
-            operator_id=self.actor.id,
-            model="gemini-3.1-flash-image",
-            prompt_text="等待执行",
-            aspect_ratio="3:4",
-            resolution="2K",
-            n=1,
-            status=ATTEMPT_QUEUED,
-            source_revision=task.source_revision,
-            unit_price=Decimal("0"),
-            generated_image_count=0,
-            created_at=datetime.now(),
-        )
-        self.repository.queued_attempts = [queued]
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            task
-        ]
-        center = TaskCenterPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            NanoBananaClient(lambda: "test-key"),
-            type(
-                "KeyStore",
-                (),
-                {"load": staticmethod(lambda: "test-key")},
-            )(),
-            FileStore(AppPaths(self.root / "crop-queue-data")),
-            AppSettings(Database(self.root / "crop-queue.db")),
-        )
-        original_hash = center.local_state.garments[0].content_hash
-        center.source_strip.setCurrentRow(0)
-        dialog = type(
-            "CropDialogStub",
-            (),
-            {
-                "DialogCode": QDialog.DialogCode,
-                "exec": lambda _self: QDialog.DialogCode.Accepted,
-                "crop_box": lambda _self: (0, 0, 10, 10),
-            },
-        )()
-        with patch(
-            "yixin.ui.task_center_page.CropDialog",
-            return_value=dialog,
-        ):
-            center._crop_source()
-        snapshot = center.local_store.load_attempt_snapshot(77)
-        self.assertIsNotNone(snapshot)
-        self.assertNotEqual(snapshot[0].content_hash, original_hash)
-        center.deleteLater()
 
-    def test_task_center_batch_submits_selected_subtasks(self) -> None:
-        write_task_images(self.root)
-        first = replace(
-            make_task("working"),
-            assignee_id=self.actor.id,
-            assignee_name=self.actor.display_name,
-        )
-        second = replace(
-            first,
-            id=12,
-            task_code="春季项目-123-001-002",
-        )
-        product_root = self.root / first.project_relative_root
-        results_by_task = {}
-        for task, result_id, color in (
-            (first, 101, "orange"),
-            (second, 102, "purple"),
-        ):
-            result_path = product_root / "AI成品" / f"{result_id}.png"
-            result_path.parent.mkdir(parents=True, exist_ok=True)
-            Image.new("RGB", (40, 50), color).save(result_path)
-            results_by_task[task.id] = [
-                GenerationResult(
-                    id=result_id,
-                    attempt_id=result_id,
-                    result_index=0,
-                    relative_path=result_path.relative_to(
-                        product_root
-                    ).as_posix(),
-                    thumbnail_relative_path=result_path.relative_to(
-                        product_root
-                    ).as_posix(),
-                    content_hash=f"{result_id:064d}",
-                    mime="image/png",
-                    width=40,
-                    height=50,
-                    is_final=False,
-                )
-            ]
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            first,
-            second,
-        ]
-        self.repository.list_results = lambda task_id: list(
-            results_by_task[task_id]
-        )
-        center = TaskCenterPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            NanoBananaClient(lambda: "test-key"),
-            type(
-                "KeyStore",
-                (),
-                {"load": staticmethod(lambda: "test-key")},
-            )(),
-            FileStore(AppPaths(self.root / "batch-submit-data")),
-            AppSettings(Database(self.root / "batch-submit.db")),
-        )
-        first_task_id = center.current_task.id
-        first_result_id = results_by_task[first_task_id][0].id
-        center.gallery.set_selected_result_ids((first_result_id,))
-        center._selection_changed()
-        other_row = next(
-            row
-            for row in range(center.task_table.rowCount())
-            if int(
-                center.task_table.item(row, 0).data(
-                    Qt.ItemDataRole.UserRole
-                )
-            )
-            != first_task_id
-        )
-        center.task_table.setCurrentCell(
-            other_row,
-            0,
-            QItemSelectionModel.SelectionFlag.Select
-            | QItemSelectionModel.SelectionFlag.Rows,
-        )
-        center._task_selected()
-        second_task_id = center.current_task.id
-        second_result_id = results_by_task[second_task_id][0].id
-        center.gallery.set_selected_result_ids((second_result_id,))
-        center._selection_changed()
-        self.assertCountEqual(center._selected_task_ids(), [11, 12])
-        with (
-            patch(
-                "yixin.ui.task_center_page.QMessageBox.question",
-                return_value=QMessageBox.StandardButton.Yes,
-            ),
-            patch.object(center, "refresh"),
-        ):
-            center._submit()
-        submitted = {
-            request[0]: request[2]["final_result_ids"]
-            for request in self.repository.submission_requests
-        }
-        self.assertEqual(
-            submitted,
-            {
-                first_task_id: (first_result_id,),
-                second_task_id: (second_result_id,),
-            },
-        )
-        center.deleteLater()
-
-    def test_task_center_default_prompt_and_two_column_parameters(self) -> None:
-        write_task_images(self.root)
-        task = replace(make_task("working"), prompt_text="")
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            task
-        ]
-        self.repository.list_templates = lambda _actor: [
-            {
-                "scope": "shared",
-                "name": "内置·基础服装替换",
-                "prompt": BUILTIN_PROMPT_TEMPLATES[0][1],
-            }
-        ]
-        center = TaskCenterPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            NanoBananaClient(lambda: "test-key"),
-            type(
-                "KeyStore",
-                (),
-                {"load": staticmethod(lambda: "test-key")},
-            )(),
-            FileStore(AppPaths(self.root / "default-prompt-data")),
-            AppSettings(Database(self.root / "default-prompt.db")),
-        )
-        self.assertEqual(
-            center.prompt_edit.toPlainText(),
-            BUILTIN_PROMPT_TEMPLATES[0][1],
-        )
-        self.assertEqual(
-            center.template_combo.currentText(),
-            "选择提示词模板",
-        )
-        self.assertEqual(center.parameters_grid.count(), 4)
-        self.assertEqual(
-            center.parameters_grid.getItemPosition(3)[:2],
-            (0, 3),
-        )
-        center.deleteLater()
-
-    def test_task_center_groups_progress_and_filters(self) -> None:
-        write_task_images(self.root)
-        working = make_task("awaiting_acceptance")
-        approved = replace(
-            working,
-            id=12,
-            task_code="春季项目-123-001-002",
-            status="approved",
-        )
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            working,
-            approved,
-        ]
-        center = TaskCenterPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            NanoBananaClient(lambda: "test-key"),
-            type(
-                "KeyStore",
-                (),
-                {"load": staticmethod(lambda: "test-key")},
-            )(),
-            FileStore(AppPaths(self.root / "group-data")),
-            AppSettings(Database(self.root / "group.db")),
-        )
-        self.assertEqual(center.project_table.rowCount(), 1)
-        self.assertEqual(center.project_table.item(0, 2).text(), "1/2")
-        self.assertEqual(center.task_table.rowCount(), 1)
-        center.include_finished.setChecked(True)
-        self.app.processEvents()
-        self.assertEqual(center.task_table.rowCount(), 2)
-        center.product_search.setText("不存在")
-        self.assertEqual(center.project_table.rowCount(), 0)
-        center.product_search.clear()
-        working_date = utc_naive_to_local(working.created_at).date()
-        working_qdate = QDate(
-            working_date.year,
-            working_date.month,
-            working_date.day,
-        )
-        center.center_start_date.setDate(working_qdate)
-        center.center_end_date.setDate(working_qdate)
-        self.assertEqual(center.project_table.rowCount(), 1)
-        center.deleteLater()
-
-    def test_task_center_queue_shows_all_subtasks_in_main_task(self) -> None:
-        write_task_images(self.root)
-        first = replace(
-            make_task("working"),
-            assignee_id=self.actor.id,
-            assignee_name=self.actor.display_name,
-        )
-        second = replace(
-            first,
-            id=12,
-            task_code="春季项目-123-001-002",
-        )
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            first,
-            second,
-        ]
-        self.repository.project_attempts = [
-            {
-                "id": 71,
-                "task_id": first.id,
-                "attempt_no": 2,
-                "operator_id": self.actor.id,
-                "operator_name": self.actor.display_name,
-                "project_code": first.project_code,
-                "product_code": first.product_code,
-                "access_project_name": first.access_project_name,
-                "task_code": first.task_code,
-                "model": "gemini-3.1-flash-image",
-                "status": ATTEMPT_QUEUED,
-                "created_at": datetime.now(),
-                "generated_image_count": 0,
-                "result_count": 0,
-            },
-            {
-                "id": 72,
-                "task_id": second.id,
-                "attempt_no": 1,
-                "operator_id": self.actor.id,
-                "operator_name": self.actor.display_name,
-                "project_code": second.project_code,
-                "product_code": second.product_code,
-                "access_project_name": second.access_project_name,
-                "task_code": second.task_code,
-                "model": "gemini-3.1-flash-image",
-                "status": ATTEMPT_SUCCEEDED,
-                "created_at": datetime.now(),
-                "generated_image_count": 1,
-                "result_count": 1,
-            },
-        ]
-        center = TaskCenterPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            NanoBananaClient(lambda: "test-key"),
-            type(
-                "KeyStore",
-                (),
-                {"load": staticmethod(lambda: "test-key")},
-            )(),
-            FileStore(AppPaths(self.root / "queue-all-data")),
-            AppSettings(Database(self.root / "queue-all.db")),
-        )
-        center.resize(1480, 900)
-        center.show()
-        self.app.processEvents()
-        center._refresh_queue()
-        self.assertEqual(center.queue_table.rowCount(), 2)
-        self.assertEqual(center.queue_table.item(0, 2).text(), first.task_code)
-        self.assertEqual(center.queue_table.item(1, 2).text(), second.task_code)
-        center.task_table.selectRow(1)
-        self.app.processEvents()
-        center._refresh_queue()
-        self.assertEqual(center.queue_table.rowCount(), 2)
-        calls = []
-        original = self.repository.list_project_attempts
-        self.repository.list_project_attempts = (
-            lambda project_id: (
-                calls.append(project_id)
-                or original(project_id)
-            )
-        )
-        center.queue_refresh_button.click()
-        self.assertEqual(calls, [first.project_id])
-        center.deleteLater()
-
-    def test_task_center_skip_remaining_marks_project_tasks(self) -> None:
-        write_task_images(self.root)
-        working = make_task("awaiting_acceptance")
-        remaining = [
-            replace(
-                working,
-                id=20 + index,
-                task_code=f"春季项目-123-001-{index + 2:03d}",
-                status="available",
-                assignee_id=None,
-                assignee_name="",
-            )
-            for index in range(3)
-        ]
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            working,
-            *remaining,
-        ]
-        center = TaskCenterPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            NanoBananaClient(lambda: "test-key"),
-            type(
-                "KeyStore",
-                (),
-                {"load": staticmethod(lambda: "test-key")},
-            )(),
-            FileStore(AppPaths(self.root / "skip-data")),
-            AppSettings(Database(self.root / "skip.db")),
-        )
-        button_names = [
-            center.retry_button.text(),
-            center.save_button.text(),
-            center.upload_button.text(),
-            center.compare_button.text(),
-            center.submit_button.text(),
-        ]
-        self.assertEqual(button_names[-1], "提交验收")
-        self.assertEqual(center.skip_button.text(), "结束剩余子任务")
-        self.assertTrue(center.skip_button.isEnabled())
-        with (
-            patch(
-                "yixin.ui.task_center_page.QInputDialog.getMultiLineText",
-                return_value=("实际只需完成一张", True),
-            ),
-            patch(
-                "yixin.ui.task_center_page.QMessageBox.question",
-                return_value=QMessageBox.StandardButton.Yes,
-            ),
-            patch(
-                "yixin.ui.task_center_page.QMessageBox.information"
-            ),
-        ):
-            center._skip_remaining()
-        self.assertEqual(len(self.repository.skip_requests), 1)
-        self.assertEqual(
-            self.repository.skip_requests[0][2],
-            "实际只需完成一张",
-        )
-        center.deleteLater()
-
-    def test_task_center_completed_with_skipped_tasks(self) -> None:
-        write_task_images(self.root)
-        approved = make_task("approved")
-        skipped = replace(
-            approved,
-            id=31,
-            task_code="春季项目-123-001-009",
-            status="skipped",
-            assignee_id=None,
-            assignee_name="",
-        )
-        self.repository.list_board_tasks = lambda *_args, **_kwargs: [
-            approved,
-            skipped,
-        ]
-        center = TaskCenterPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-            NanoBananaClient(lambda: "test-key"),
-            type(
-                "KeyStore",
-                (),
-                {"load": staticmethod(lambda: "test-key")},
-            )(),
-            FileStore(AppPaths(self.root / "skipped-data")),
-            AppSettings(Database(self.root / "skipped.db")),
-        )
-        center.include_finished.setChecked(True)
-        self.app.processEvents()
-        self.assertEqual(center.project_table.item(0, 3).text(), "已完成")
-        self.assertIn(
-            "无需制作 1",
-            center.project_table.item(0, 2).text(),
-        )
-        self.assertEqual(center.task_table.rowCount(), 2)
-        center.deleteLater()
-
-    def test_project_history_filters_and_shows_attempt_results(self) -> None:
-        write_task_images(self.root)
-        task = make_task("working")
-        product_root = self.root / task.project_relative_root
-        result_path = (
-            product_root
-            / "AI成品"
-            / task.task_code
-            / "attempt_001"
-            / "result.png"
-        )
-        result_path.parent.mkdir(parents=True)
-        Image.new("RGB", (30, 40), "orange").save(result_path)
-        result = GenerationResult(
-            id=30,
-            attempt_id=40,
-            result_index=0,
-            relative_path=result_path.relative_to(product_root).as_posix(),
-            thumbnail_relative_path=result_path.relative_to(
-                product_root
-            ).as_posix(),
-            content_hash="b" * 64,
-            mime="image/png",
-            width=30,
-            height=40,
-            is_final=False,
-        )
-        self.repository.tasks_by_id[task.id] = task
-        self.repository.attempt_results[40] = [result]
-        self.repository.project_attempt_history = [
-            {
-                "id": 40,
-                "task_id": task.id,
-                "attempt_no": 1,
-                "project_code": task.project_code,
-                "task_code": task.task_code,
-                "product_code": task.product_code,
-                "project_name": task.project_name,
-                "access_project_name": "春季项目",
-                "operator_name": "AI制作Amy",
-                "model": "gemini-3.1-flash-image",
-                "status": "succeeded",
-                "prompt_text": "项目历史提示词",
-                "created_at": datetime.now(),
-                "result_count": 1,
-            },
-            {
-                "id": 41,
-                "task_id": task.id,
-                "attempt_no": 2,
-                "project_code": "春季项目-123-002",
-                "task_code": "春季项目-123-002-001",
-                "product_code": "123",
-                "project_name": "123",
-                "access_project_name": "春季项目",
-                "operator_name": "AI制作Amy",
-                "model": "gemini-3.1-flash-image",
-                "status": "succeeded",
-                "prompt_text": "同名项目",
-                "created_at": datetime.now(),
-                "result_count": 0,
-            },
-            {
-                "id": 42,
-                "task_id": task.id,
-                "attempt_no": 3,
-                "project_code": "刘一一-CD1A0954开衫-001",
-                "task_code": "刘一一-CD1A0954开衫-001-001",
-                "product_code": "CD1A0954开衫",
-                "project_name": "CD1A0954开衫",
-                "access_project_name": "刘一一",
-                "operator_name": "AI制作Amy",
-                "model": "gemini-3.1-flash-image",
-                "status": "succeeded",
-                "prompt_text": "外部项目",
-                "created_at": datetime.now(),
-                "result_count": 0,
-            },
-            {
-                "id": 43,
-                "task_id": task.id,
-                "attempt_no": 4,
-                "project_code": "旧项目编码",
-                "task_code": "旧项目编码-001",
-                "product_code": "旧货号",
-                "project_name": "旧货号",
-                "operator_name": "AI制作Amy",
-                "model": "gemini-3.1-flash-image",
-                "status": "succeeded",
-                "prompt_text": "旧数据",
-                "created_at": datetime.now(),
-                "result_count": 0,
-            },
-        ]
-        page = ProjectHistoryPage(
-            self.repository,
-            self.resolver,
-            self.actor,
-        )
-        self.assertEqual(page.table.rowCount(), 4)
-        self.assertEqual(
-            {
-                page.project_filter.itemText(index)
-                for index in range(page.project_filter.count())
-            },
-            {"全部项目", "春季项目", "刘一一", "旧货号"},
-        )
-        spring_index = page.project_filter.findData("春季项目")
-        page.project_filter.setCurrentIndex(spring_index)
-        self.assertEqual(page.table.rowCount(), 2)
-        page.project_filter.setCurrentIndex(0)
-        self.assertEqual(page.table.rowCount(), 4)
-        target_row = next(
-            row
-            for row in range(page.table.rowCount())
-            if page.table.item(row, 0).data(
-                Qt.ItemDataRole.UserRole
-            )
-            == 40
-        )
-        self.assertEqual(
-            page.table.item(target_row, 1).text(),
-            task.task_code,
-        )
-        page.table.selectRow(target_row)
-        self.app.processEvents()
-        self.assertEqual(page.gallery.list_widget.count(), 1)
-        self.assertEqual(
-            page.gallery.preview.current_path,
-            result_path.resolve(),
-        )
-        page.product_search.setText("不存在")
-        self.assertEqual(page.table.rowCount(), 0)
-        page.product_search.clear()
-        self.assertEqual(page.table.rowCount(), 4)
-        self.assertTrue(page.table.isSortingEnabled())
-        page.deleteLater()
-        database = Database(self.root / "history-tabs.db")
-        database.initialize()
-        paths = AppPaths(self.root / "history-tabs-data")
-        paths.ensure()
-        client = NanoBananaClient(lambda: "test-key")
-        history = UnifiedHistoryPage(
-            database,
-            LibraryService(database, FileStore(paths), paths),
-            TaskWorker(database, client, FileStore(paths)),
-            self.repository,
-            self.resolver,
-            self.actor,
-        )
-        self.assertFalse(hasattr(history, "tabs"))
-        history.deleteLater()
 
     def test_unified_history_merges_project_and_ordinary_records(self) -> None:
         write_task_images(self.root)
@@ -3315,8 +2012,21 @@ class CollaborationPageTests(unittest.TestCase):
         page.project_filter.setCurrentIndex(
             page.project_filter.findData("春季项目")
         )
-        self.assertEqual(page.table.rowCount(), 1)
-        self.assertEqual(page.table.item(0, 0).text(), "项目")
+        self.assertEqual(page.table.rowCount(), 2)
+        self.assertIn(
+            "项目",
+            {
+                page.table.item(row, 0).text()
+                for row in range(page.table.rowCount())
+            },
+        )
+        page.table.selectRow(
+            next(
+                row
+                for row in range(page.table.rowCount())
+                if page.table.item(row, 0).text() == "项目"
+            )
+        )
         self.assertEqual(
             page.dual_preview.result_pane.list_widget.count(),
             1,
@@ -3367,13 +2077,37 @@ class CollaborationPageTests(unittest.TestCase):
         reference_pane = page.dual_preview.reference_pane
         self.assertIsInstance(
             result_pane.preview,
-            ImageCompareView,
+            ImageZoomView,
         )
         self.assertFalse(hasattr(result_pane, "_zoom_dialog"))
         reference_strip.setCurrentRow(0)
         reference_strip.setCurrentRow(1)
         self.app.processEvents()
-        self.assertEqual(len(reference_pane.preview.images), 2)
+        self.assertEqual(
+            reference_pane.preview.current_path,
+            reference_pane.items[1][1],
+        )
+        manual_record = page._project_record(
+            {
+                "id": 99,
+                "task_id": task.id,
+                "status": "succeeded",
+                "created_at": datetime.now(),
+                "project_code": task.project_code,
+                "task_code": task.task_code,
+                "product_code": task.product_code,
+                "project_name": task.project_name,
+                "access_project_name": "春季项目",
+                "operator_name": "AI制作Amy",
+                "model": "gemini-3.1-flash-image",
+                "provider_name": "A6API",
+                "prompt_text": "PS",
+                "result_count": 1,
+                "manual_result_count": 1,
+            }
+        )
+        self.assertEqual(manual_record.status, "manual_ps")
+        self.assertEqual(manual_record.status_label, "PS成品")
         page.deleteLater()
 
     def test_unified_history_cancels_only_queued_project_attempt(self) -> None:
@@ -3520,40 +2254,31 @@ class CollaborationPageTests(unittest.TestCase):
         )
         page.deleteLater()
 
-    def test_image_compare_view_supports_pan_swap_and_zoom(self) -> None:
+    def test_image_zoom_view_supports_pan_and_zoom(self) -> None:
         first_path = self.root / "compare-left.png"
         second_path = self.root / "compare-right.png"
         Image.new("RGB", (320, 240), "purple").save(first_path)
         Image.new("RGB", (280, 320), "orange").save(second_path)
-        view = ImageCompareView()
-        view.set_images(
-            [
-                (first_path, "左图"),
-                (second_path, "右图"),
-            ]
-        )
+        view = ImageZoomView()
+        view.set_image(first_path, "单图")
         self.assertEqual(
             view.view.dragMode(),
             QGraphicsView.DragMode.ScrollHandDrag,
         )
-        self.assertEqual(len(view.images), 2)
-        first_paths = [path for path, _label in view.images]
-        view.swap_images()
-        self.assertEqual(
-            [path for path, _label in view.images],
-            list(reversed(first_paths)),
-        )
+        self.assertEqual(view.current_path, first_path)
+        self.assertFalse(hasattr(view, "swap_button"))
+        self.assertFalse(hasattr(view, "exit_compare_button"))
         view.set_zoom(0.01)
         self.assertEqual(view._scale, 0.1)
         view.set_zoom(8)
         self.assertEqual(view._scale, 4.0)
         view.fit_to_window()
         self.assertGreater(view._scale, 0)
-        view.exit_comparison()
-        self.assertEqual(len(view.images), 1)
+        view.set_image(second_path, "替换图")
+        self.assertEqual(view.current_path, second_path)
         view.deleteLater()
 
-    def test_image_preview_uses_first_left_and_replaces_right(self) -> None:
+    def test_image_preview_always_replaces_original_image(self) -> None:
         paths = []
         for index, color in enumerate(("red", "green", "blue"), start=1):
             path = self.root / f"pair-{index}.png"
@@ -3567,26 +2292,88 @@ class CollaborationPageTests(unittest.TestCase):
             ],
             default_row=0,
         )
-        self.assertEqual(len(pane.preview.images), 1)
-        self.assertEqual(pane.preview.images[0][0], paths[0])
+        self.assertEqual(pane.preview.current_path, paths[0])
         pane.list_widget.itemClicked.emit(pane.list_widget.item(1))
-        self.assertEqual(
-            [path for path, _label in pane.preview.images],
-            [paths[0], paths[1]],
-        )
+        self.assertEqual(pane.preview.current_path, paths[1])
         pane.list_widget.itemClicked.emit(pane.list_widget.item(2))
-        self.assertEqual(
-            [path for path, _label in pane.preview.images],
-            [paths[0], paths[2]],
-        )
-        pane.preview.swap_images()
-        self.assertEqual(
-            [path for path, _label in pane.preview.images],
-            [paths[2], paths[0]],
-        )
-        pane.preview.exit_comparison()
-        self.assertEqual(len(pane.preview.images), 1)
+        self.assertEqual(pane.preview.current_path, paths[2])
         pane.deleteLater()
+
+    def test_dual_preview_shared_toolbar_controls_active_side(self) -> None:
+        root = self.root / "dual-toolbar"
+        root.mkdir()
+        results = []
+        references = []
+        for index, color in enumerate(("red", "orange"), start=1):
+            path = root / f"result-{index}.png"
+            Image.new("RGB", (100, 140), color).save(path)
+            results.append((path, f"结果 {index}", index))
+        for index, color in enumerate(("blue", "green"), start=1):
+            path = root / f"reference-{index}.png"
+            Image.new("RGB", (100, 140), color).save(path)
+            references.append(
+                (path, "模特" if index == 2 else f"参考 {index}", index)
+            )
+        widget = DualImagePreview()
+        widget.set_assets(
+            results,
+            references,
+            default_reference_row=1,
+        )
+        QTest.qWait(30)
+        self.app.processEvents()
+        self.assertEqual(widget.active_role, "result")
+        self.assertEqual(
+            widget.result_pane.preview.current_path,
+            results[0][0],
+        )
+        self.assertEqual(
+            widget.reference_pane.preview.current_path,
+            references[1][0],
+        )
+
+        widget.result_pane.preview.set_zoom(2.0)
+        result_scale = widget.result_pane.preview.scale
+        self.assertGreater(result_scale, 1.0)
+        widget.reference_pane.list_widget.itemClicked.emit(
+            widget.reference_pane.list_widget.item(0)
+        )
+        QTest.qWait(30)
+        self.app.processEvents()
+        self.assertEqual(widget.active_role, "reference")
+        self.assertEqual(widget.active_label.text(), "当前：参考图")
+        reference_before = widget.reference_pane.preview.scale
+        widget.zoom_in_button.click()
+        self.app.processEvents()
+        self.assertGreater(
+            widget.reference_pane.preview.scale,
+            reference_before,
+        )
+        self.assertEqual(
+            widget.result_pane.preview.scale,
+            result_scale,
+        )
+
+        reference_path = widget.reference_pane.preview.current_path
+        widget.result_pane.list_widget.itemClicked.emit(
+            widget.result_pane.list_widget.item(1)
+        )
+        self.assertEqual(widget.active_role, "result")
+        self.assertEqual(
+            widget.result_pane.preview.current_path,
+            results[1][0],
+        )
+        self.assertEqual(
+            widget.reference_pane.preview.current_path,
+            reference_path,
+        )
+
+        empty = DualImagePreview()
+        empty.set_assets(results, [])
+        empty.set_active_role("reference")
+        self.assertEqual(empty.active_role, "result")
+        widget.deleteLater()
+        empty.deleteLater()
 
 
 if __name__ == "__main__":

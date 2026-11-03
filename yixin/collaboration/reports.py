@@ -131,7 +131,7 @@ def aggregate_report(rows: list[ReportTaskRow]) -> ReportData:
         if (
             value := calculate_duration_seconds(
                 row.work_started_at or row.claimed_at,
-                row.submitted_at,
+                row.submitted_at or row.approved_at,
             )
         )
         is not None

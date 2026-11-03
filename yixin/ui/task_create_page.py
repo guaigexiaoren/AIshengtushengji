@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSplitter,
     QStyle,
     QStyleOptionButton,
     QStyleOptionHeader,
@@ -52,6 +53,7 @@ from ..collaboration.types import (
     PAIRING_ALL,
     PAIRING_MANUAL,
     ROLE_ADMIN,
+    ROLE_AI,
     ROLE_OPERATIONS,
     AuthUser,
     PairingInput,
@@ -61,6 +63,7 @@ from ..collaboration.types import (
 from ..storage import SUPPORTED_IMAGE_SUFFIXES, atomic_copy_file, image_metadata
 from .async_thumbnails import ThumbnailLoader, get_thumbnail_loader
 from .async_queries import get_query_runner
+from .components import PageActionBar, PageHeader
 from .widgets import load_scaled_pixmap, scan_image_inputs
 
 
@@ -400,18 +403,17 @@ class TaskCreatePage(QWidget):
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(14)
         header = QHBoxLayout()
-        title_box = QVBoxLayout()
-        title = QLabel("AI提交")
-        title.setStyleSheet("font-size:22px;font-weight:700;color:#1f2d43;")
-        subtitle = QLabel("扫描共享盘货号，确认衣服与模特后创建任务。")
-        subtitle.setStyleSheet("color:#6d7a91;")
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        header.addLayout(title_box, 1)
+        page_header = PageHeader(
+            "AI提交",
+            "扫描共享盘货号，确认衣服与模特后创建任务。",
+        )
         self.refresh_button = QPushButton("刷新扫描")
         self.refresh_button.clicked.connect(self.refresh)
-        header.addWidget(self.refresh_button)
+        page_header.add_action(self.refresh_button)
+        header.addWidget(page_header)
         outer.addLayout(header)
 
         path_card = QGroupBox("账号目录")
@@ -486,8 +488,6 @@ class TaskCreatePage(QWidget):
             self._set_all_eligible
         )
         scan_layout.addWidget(self.product_table, 1)
-        outer.addWidget(scan_card, 1)
-
         detail_card = QGroupBox("素材预览")
         detail_layout = QVBoxLayout(detail_card)
         mode_row = QHBoxLayout()
@@ -502,9 +502,15 @@ class TaskCreatePage(QWidget):
         assets_row.addWidget(model_box, 1)
         detail_layout.addLayout(assets_row)
 
-        outer.addWidget(detail_card, 1)
+        body = QSplitter(Qt.Orientation.Horizontal)
+        body.setChildrenCollapsible(False)
+        body.addWidget(scan_card)
+        body.addWidget(detail_card)
+        body.setSizes([720, 560])
+        outer.addWidget(body, 1)
 
-        footer = QHBoxLayout()
+        action_bar = PageActionBar()
+        footer = action_bar.layout
         footer.addWidget(QLabel("备注"))
         self.note_edit = QLineEdit()
         self.note_edit.setPlaceholderText(
@@ -519,10 +525,10 @@ class TaskCreatePage(QWidget):
         self.create_button.setMinimumHeight(42)
         self.create_button.clicked.connect(self._create_selected)
         self.create_button.setEnabled(
-            self.actor.role in (ROLE_OPERATIONS, ROLE_ADMIN)
+            self.actor.role in (ROLE_OPERATIONS, ROLE_AI, ROLE_ADMIN)
         )
         footer.addWidget(self.create_button)
-        outer.addLayout(footer)
+        outer.addWidget(action_bar)
 
     def _asset_box(self, title: str, role: str) -> tuple[QListWidget, QGroupBox]:
         box = QGroupBox(title)
@@ -572,7 +578,7 @@ class TaskCreatePage(QWidget):
             self.create_button.setEnabled(False)
             return
         self.create_button.setEnabled(
-            self.actor.role in (ROLE_OPERATIONS, ROLE_ADMIN)
+            self.actor.role in (ROLE_OPERATIONS, ROLE_AI, ROLE_ADMIN)
         )
         scope, project_name = project
         project_root = (
@@ -745,7 +751,7 @@ class TaskCreatePage(QWidget):
 
     def _finish_scan_selection(self) -> None:
         self.create_button.setEnabled(
-            self.actor.role in (ROLE_OPERATIONS, ROLE_ADMIN)
+            self.actor.role in (ROLE_OPERATIONS, ROLE_AI, ROLE_ADMIN)
             and bool(self.states)
         )
         if self.product_table.rowCount():
@@ -978,13 +984,16 @@ class TaskCreatePage(QWidget):
             try:
                 if source.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
                     continue
+                if role == "garment" and len(target) >= 13:
+                    errors.append("衣服图最多 13 张，超出部分未导入")
+                    break
+                data = source.read_bytes()
+                image_metadata(data)
                 if source.resolve().parent == role_folder.resolve():
                     destination = source.resolve()
                 else:
                     destination = _unique_destination(role_folder, source)
                     atomic_copy_file(source.resolve(), destination)
-                data = destination.read_bytes()
-                image_metadata(data)
                 if destination.resolve() in known:
                     continue
                 target.append(destination.resolve())
@@ -1263,23 +1272,49 @@ class TaskCreatePage(QWidget):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
+        validated: list[tuple[str, ProductDraftState, object]] = []
+        for code in codes:
+            state = self.states[code]
+            if state.errors:
+                self.product_table.selectRow(self._row_for_code(code))
+                QMessageBox.warning(
+                    self,
+                    "货号资料不完整",
+                    f"{code}：{'；'.join(state.errors)}",
+                )
+                return
+            if not state.garments or not state.models:
+                self.product_table.selectRow(self._row_for_code(code))
+                QMessageBox.warning(
+                    self,
+                    "缺少素材",
+                    f"{code}：衣服图和模特图不能为空",
+                )
+                return
+            if len(state.garments) > 13:
+                self.product_table.selectRow(self._row_for_code(code))
+                QMessageBox.warning(
+                    self,
+                    "衣服图过多",
+                    f"{code}：单个模特任务最多 13 张衣服图",
+                )
+                return
+            result = self._current_pairs(state)
+            if result is None or result.errors:
+                self.product_table.selectRow(self._row_for_code(code))
+                QMessageBox.warning(
+                    self,
+                    "配对失败",
+                    f"{code}："
+                    + "；".join(
+                        result.errors if result else ["配对失败"]
+                    ),
+                )
+                return
+            validated.append((code, state, result))
         created = 0
         try:
-            for code in codes:
-                state = self.states[code]
-                if state.errors:
-                    raise ValueError(f"{code}：{'；'.join(state.errors)}")
-                if not state.garments or not state.models:
-                    raise ValueError(f"{code}：衣服图和模特图不能为空")
-                result = self._current_pairs(state)
-                if result is None or result.errors:
-                    self.product_table.selectRow(
-                        self._row_for_code(code)
-                    )
-                    raise ValueError(
-                        f"{code}："
-                        + "；".join(result.errors if result else ["配对失败"])
-                    )
+            for code, state, result in validated:
                 assets = project_assets(
                     state.path,
                     state.garments,

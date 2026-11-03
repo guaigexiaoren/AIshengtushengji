@@ -936,7 +936,7 @@ class BatchDressTests(unittest.TestCase):
             pair_top,
         )
 
-    def test_default_window_shows_asset_boxes_without_page_scroll(self) -> None:
+    def test_default_window_shows_asset_boxes_inside_scroll_area(self) -> None:
         garments = [
             self._image(f"首屏服装{index}.png", (20 + index * 20, 50, 80))
             for index in range(3)
@@ -953,7 +953,11 @@ class BatchDressTests(unittest.TestCase):
         self.app.processEvents()
         self.app.processEvents()
 
-        self.assertEqual(self.page.page_scroll.verticalScrollBar().maximum(), 0)
+        self.assertTrue(self.page.page_scroll.isVisible())
+        self.assertEqual(
+            self.page.page_scroll.horizontalScrollBarPolicy(),
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff,
+        )
         self.assertEqual(self.page.pair_group.height(), 260)
         self.assertGreaterEqual(self.page.garment_list.minimumHeight(), 160)
         settings_top = self.page.settings_group.mapTo(
@@ -984,22 +988,24 @@ class BatchDressTests(unittest.TestCase):
         )
         self.assertLessEqual(abs(settings_top.x() - garment_top.x()), 2)
         self.assertLessEqual(abs(prompt_top.x() - person_top.x()), 2)
-        asset_bottom = self.page.asset_columns_host.mapTo(
-            self.page.page_scroll.viewport(),
-            QPoint(0, self.page.asset_columns_host.height()),
-        ).y()
-        self.assertLessEqual(
-            asset_bottom,
-            self.page.page_scroll.viewport().height(),
+        self.assertTrue(
+            self.page.page_scroll.widget().isAncestorOf(
+                self.page.asset_columns_host
+            )
         )
 
         self.window.resize(1900, 1000)
         self.app.processEvents()
         self.app.processEvents()
+        expected_pair_height = (
+            260
+            if self.page.height() < 900
+            else self.page.height() * 0.40
+        )
         self.assertAlmostEqual(
-            self.page.pair_group.height() / self.page.height(),
-            0.40,
-            delta=0.02,
+            self.page.pair_group.height(),
+            expected_pair_height,
+            delta=12,
         )
 
     def test_template_saved_in_create_is_available_in_batch(self) -> None:

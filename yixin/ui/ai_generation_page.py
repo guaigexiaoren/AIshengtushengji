@@ -44,6 +44,7 @@ from ..storage import FileStore
 from ..worker import TaskWorker
 from .batch_dress_page import BatchDressPage, DressTaskGroup
 from .async_queries import get_query_runner
+from .components import PageHeader
 
 
 class AIGenerationPage(BatchDressPage):
@@ -80,6 +81,7 @@ class AIGenerationPage(BatchDressPage):
         self.api_providers = []
         self.project_progress: dict[int, tuple[int, int]] = {}
         self.force_direct_retry_task_id: int | None = None
+        self._loading_source_state = False
         self.async_mode = async_mode
         self.query_runner = (
             get_query_runner() if async_mode else None
@@ -98,6 +100,10 @@ class AIGenerationPage(BatchDressPage):
             auto_load=False,
             async_thumbnails=async_mode,
         )
+        self.count_spin.setRange(1, 1)
+        self.count_spin.setValue(1)
+        self.count_spin.hide()
+        self.count_label.hide()
         self.task_selector.currentIndexChanged.connect(
             self._task_changed
         )
@@ -126,12 +132,14 @@ class AIGenerationPage(BatchDressPage):
         card.setObjectName("Card")
         layout = QVBoxLayout(card)
         layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(2)
+        layout.setSpacing(8)
+        layout.addWidget(
+            PageHeader(
+                "AI生图",
+                "选择子任务后载入素材，调整配对和参数后加入生成队列。",
+            )
+        )
         title_row = QHBoxLayout()
-        title = QLabel("AI生图")
-        title.setStyleSheet("font-size:22px;font-weight:700;color:#1f2d43;")
-        title_row.addWidget(title)
-        title_row.addStretch(1)
         title_row.addWidget(QLabel("子任务"))
         self.task_search_edit = QLineEdit()
         self.task_search_edit.setPlaceholderText("搜索任务、货号或项目")
@@ -142,15 +150,14 @@ class AIGenerationPage(BatchDressPage):
         title_row.addWidget(self.task_selector)
         self.task_refresh_button = QPushButton("刷新子任务")
         title_row.addWidget(self.task_refresh_button)
+        self.restore_all_button = QPushButton("恢复全部素材")
+        self.restore_all_button.setEnabled(False)
+        self.restore_all_button.clicked.connect(self._restore_all_sources)
+        title_row.addWidget(self.restore_all_button)
         self.task_status_label = QLabel("尚未选择")
         self.task_status_label.setStyleSheet("color:#60708a;")
         title_row.addWidget(self.task_status_label)
-        subtitle = QLabel(
-            "选择子任务后自动载入共享盘素材，编辑配对并批量加入生成队列。"
-        )
-        subtitle.setStyleSheet("color:#6d7a91;")
         layout.addLayout(title_row)
-        layout.addWidget(subtitle)
         return card
 
     def _additional_settings_rows(self, form: QFormLayout) -> None:
@@ -370,6 +377,7 @@ class AIGenerationPage(BatchDressPage):
     def _clear_generation_editor(self) -> None:
         self.current_task = None
         self.local_store = None
+        self.restore_all_button.setEnabled(False)
         self.garment_assets = []
         self.person_assets = []
         self.pairs = []
@@ -400,12 +408,17 @@ class AIGenerationPage(BatchDressPage):
             QMessageBox.warning(self, "读取任务素材失败", str(exc))
             self._clear_generation_editor()
             return
+        self.restore_all_button.setEnabled(True)
         self.garment_assets = list(state.garments)
         self.person_assets = [state.model] if state.model else []
         self.selected_garment = None
         self.pairs = []
-        self._refresh_role("garment")
-        self._refresh_role("person")
+        self._loading_source_state = True
+        try:
+            self._refresh_role("garment")
+            self._refresh_role("person")
+        finally:
+            self._loading_source_state = False
         self._refresh_pairs()
         self._auto_match()
         prompt = task.prompt_text.strip()
@@ -437,17 +450,46 @@ class AIGenerationPage(BatchDressPage):
         if (
             self.current_task is None
             or self.local_store is None
-            or not self.garment_assets
-            or len(self.person_assets) != 1
         ):
             return
         try:
             self.local_store.replace_all(
-                self.garment_assets,
-                self.person_assets[0],
+                tuple(self.garment_assets),
+                self.person_assets[0] if len(self.person_assets) == 1 else None,
             )
-        except Exception:
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "保存本机素材失败",
+                str(exc),
+            )
+
+    def _refresh_role(self, role: str) -> None:
+        super()._refresh_role(role)
+        if not self._loading_source_state and self.local_store is not None:
+            self._persist_current_sources()
+
+    def _restore_all_sources(self) -> None:
+        if self.local_store is None:
             return
+        try:
+            state = self.local_store.restore_all()
+        except Exception as exc:
+            QMessageBox.warning(self, "恢复失败", str(exc))
+            return
+        self._loading_source_state = True
+        try:
+            self.garment_assets = list(state.garments)
+            self.person_assets = [state.model] if state.model else []
+            self.pairs = []
+            self.selected_pair_key = None
+            self._refresh_role("garment")
+            self._refresh_role("person")
+        finally:
+            self._loading_source_state = False
+        self._refresh_pairs()
+        self._auto_match()
+        self.feedback_label.setText("已恢复全部初始共享盘素材。")
 
     def _enqueue_all(self) -> None:
         task = self.current_task
@@ -545,7 +587,7 @@ class AIGenerationPage(BatchDressPage):
         )
         if resolution_index >= 0:
             self.resolution_combo.setCurrentIndex(resolution_index)
-        self.count_spin.setValue(max(1, int(attempt.n)))
+        self.count_spin.setValue(1)
         provider_index = self.provider_combo.findData(
             attempt.requested_provider_code or ""
         )
@@ -601,7 +643,7 @@ class AIGenerationPage(BatchDressPage):
                     model=model_id,
                     aspect_ratio=self.aspect_combo.currentData(),
                     resolution=self.resolution_combo.currentData(),
-                    n=self.count_spin.value(),
+                    n=1,
                     unit_price=self.repository.current_model_price(
                         model_id
                     ),
@@ -706,7 +748,7 @@ class AIGenerationPage(BatchDressPage):
             model=model_id,
             aspect_ratio=self.aspect_combo.currentData(),
             resolution=self.resolution_combo.currentData(),
-            n=self.count_spin.value(),
+            n=1,
             unit_price=self.repository.current_model_price(model_id),
             requested_provider_code=str(
                 self.provider_combo.currentData() or ""

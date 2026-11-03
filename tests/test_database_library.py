@@ -3,12 +3,14 @@ from __future__ import annotations
 import tempfile
 import unittest
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 
 from yixin.constants import (
     BUILTIN_PROMPT_TEMPLATES,
     TASK_CANCELLED,
     TASK_FAILED,
+    TASK_QUEUED,
     TASK_RUNNING,
     TASK_SUCCESS,
 )
@@ -110,6 +112,44 @@ class DatabaseLibraryTests(unittest.TestCase):
         self.assertEqual(self.database.request_cancel(task_id), TASK_CANCELLED)
         self.assertEqual(self.database.get_task(task_id)["status"], TASK_CANCELLED)
 
+    def test_cancel_detects_worker_claim_between_select_and_update(
+        self,
+    ) -> None:
+        database = Database(self.paths.database)
+
+        class Cursor:
+            def __init__(self):
+                self.rowcount = 0
+                self.responses = [
+                    {"status": TASK_QUEUED},
+                    {"status": TASK_RUNNING},
+                ]
+
+            def execute(self, _sql, _params=()):
+                return self
+
+            def fetchone(self):
+                return self.responses.pop(0)
+
+        class Connection:
+            def __init__(self):
+                self.fake_cursor = Cursor()
+
+            def execute(self, _sql, _params=()):
+                return self.fake_cursor
+
+        connection = Connection()
+
+        @contextmanager
+        def fake_connection():
+            yield connection
+
+        database.connection = fake_connection
+        self.assertEqual(
+            database.request_cancel(1),
+            TASK_RUNNING,
+        )
+
     def test_reference_order_is_preserved(self) -> None:
         first = self.store.save_reference(make_image(Path(self.temp.name) / "a.png", (1, 2, 3)))
         second = self.store.save_reference(make_image(Path(self.temp.name) / "b.png", (4, 5, 6)))
@@ -138,6 +178,8 @@ class DatabaseLibraryTests(unittest.TestCase):
         self.database.transition_task(ref_task, TASK_SUCCESS)
         work_one = self.library.save_task_result(ref_task, result_id)
         self.database.set_work_tags(work_one, ["人像", "春天"])
+        with self.assertRaises(ValueError):
+            self.library.save_task_result(ref_task, result_id)
 
         task_two, result_two, _ = self._create_completed_result("商业海报", (70, 100, 10))
         work_two = self.library.save_task_result(task_two, result_two)
@@ -166,6 +208,16 @@ class DatabaseLibraryTests(unittest.TestCase):
         self.assertTrue(self.library.delete_work(work_one))
         self.assertFalse(folder.exists())
         self.assertIsNone(self.database.get_work(work_one))
+        restored_result = self.database.get_task_results(ref_task)[0]
+        self.assertFalse(restored_result["saved"])
+        self.assertTrue(Path(restored_result["path"]).is_file())
+        self.assertTrue(
+            Path(restored_result["thumbnail_path"]).is_file()
+        )
+        self.assertIsInstance(
+            self.library.save_task_result(ref_task, result_id),
+            int,
+        )
 
     def test_templates_crud(self) -> None:
         template_id = self.database.save_template("人像", "柔和光线的人像")
