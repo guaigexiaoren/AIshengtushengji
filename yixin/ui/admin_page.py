@@ -714,6 +714,9 @@ class AdminPage(QWidget):
         self.api_key_button.clicked.connect(self._configure_api_key)
         self.clear_api_key_button = QPushButton("清除 API Key")
         self.clear_api_key_button.clicked.connect(self._clear_api_key)
+        self.delete_user_button = QPushButton("删除账号")
+        self.delete_user_button.setObjectName("DangerButton")
+        self.delete_user_button.clicked.connect(self._delete_user)
         refresh_button = QPushButton("刷新")
         refresh_button.clicked.connect(self._refresh_users)
         toolbar.addStretch(1)
@@ -756,6 +759,7 @@ class AdminPage(QWidget):
             reset_button,
             self.api_key_button,
             self.clear_api_key_button,
+            self.delete_user_button,
         ):
             action_bar.layout.addWidget(button)
         action_bar.layout.addStretch(1)
@@ -1294,6 +1298,38 @@ class AdminPage(QWidget):
             )
         except Exception as exc:
             QMessageBox.warning(self, "操作失败", str(exc))
+            return
+        self._refresh_users()
+
+    def _delete_user(self) -> None:
+        user = self._current_user()
+        if user is None:
+            QMessageBox.information(self, "未选择账号", "请先选择一个账号。")
+            return
+        if user.id == self.actor.id:
+            QMessageBox.warning(
+                self,
+                "不能删除",
+                "不能删除当前登录账号。",
+            )
+            return
+        answer = QMessageBox.warning(
+            self,
+            "删除账号",
+            (
+                f"确定删除账号“{user.display_name}”吗？\n"
+                "删除后该账号无法登录，但任务和历史记录会保留。"
+            ),
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.repository.delete_user(self.actor, user.id)
+        except Exception as exc:
+            QMessageBox.warning(self, "删除失败", str(exc))
             return
         self._refresh_users()
 

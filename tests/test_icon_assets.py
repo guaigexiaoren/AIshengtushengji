@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import os
 import unittest
 from pathlib import Path
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from tests.qt_test_support import flush_qt_deletes
 
 from PIL import Image
 from PySide6.QtGui import QIcon
@@ -44,6 +43,13 @@ class IconAssetTests(unittest.TestCase):
         icon = QIcon(str(resource_path("assets", "app_icon.ico")))
         self.assertFalse(icon.isNull())
         self.assertIn(16, [size.width() for size in icon.availableSizes()])
+
+    def tearDown(self) -> None:
+        flush_qt_deletes(self.app)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        flush_qt_deletes(cls.app)
 
 
 if __name__ == "__main__":

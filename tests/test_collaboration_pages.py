@@ -1,6 +1,5 @@
 import importlib.util
 import hashlib
-import os
 import tempfile
 import unittest
 from dataclasses import replace
@@ -8,6 +7,8 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
+
+from tests.qt_test_support import flush_qt_deletes
 
 HAS_PYSIDE = importlib.util.find_spec("PySide6") is not None
 
@@ -62,7 +63,7 @@ if HAS_PYSIDE:
     from yixin.ui.collaboration_login import LoginDialog
     from yixin.ui.components import FilterBar
     from yixin.ui.dialogs import SettingsDialog
-    from yixin.ui.main_window import MainWindow, SidebarNav, TopNavigation
+    from yixin.ui.main_window import MainWindow, TopNavigation
     from yixin.ui.submission_list_page import SubmissionListPage
     from yixin.ui.unified_history_page import (
         UnifiedHistoryPage,
@@ -213,6 +214,11 @@ class FakeCentralRepository:
     def reset_password(self, actor, user_id, password):
         self.user_updates.append(
             (actor, user_id, {"password": password})
+        )
+
+    def delete_user(self, actor, user_id):
+        self.user_updates.append(
+            (actor, user_id, {"delete": True})
         )
 
     def skip_remaining_subtasks(self, project_id, actor, *, reason):
@@ -425,7 +431,6 @@ def write_task_images(root: Path) -> None:
 class CollaborationPageTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
@@ -436,7 +441,12 @@ class CollaborationPageTests(unittest.TestCase):
         self.resolver = SharedPathResolver(self.root)
 
     def tearDown(self) -> None:
+        flush_qt_deletes(self.app)
         self.temp.cleanup()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        flush_qt_deletes(cls.app)
 
     def test_new_pages_build_with_empty_database(self) -> None:
         create = TaskCreatePage(
@@ -451,6 +461,9 @@ class CollaborationPageTests(unittest.TestCase):
             "records",
         )
         admin = AdminPage(self.repository, self.actor)
+        title = create.findChild(QLabel, "PageTitle")
+        self.assertIsNotNone(title)
+        self.assertEqual(title.text(), "任务提交")
         self.assertEqual(create.product_table.rowCount(), 0)
         self.assertEqual(records.project_table.rowCount(), 0)
         self.assertEqual(admin.user_table.rowCount(), 0)
@@ -965,61 +978,9 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertFalse(hasattr(dialog, "clear_button"))
         dialog.deleteLater()
 
-    def test_sidebar_shows_all_new_menu_items(self) -> None:
+    def test_top_navigation_uses_flat_single_row_menu(self) -> None:
         labels = [
-            "AI提交",
-            "提交记录",
-            "待分配",
-            "AI生图",
-            "普通创作",
-            "批量换装",
-            "历史记录",
-            "作品库",
-            "管理控制台",
-        ]
-        nav = SidebarNav(
-            labels,
-            group_before={
-                0: "AI图提交",
-                2: "任务中心",
-                4: "创造中心",
-            },
-            submenu_indices={0, 1, 2, 3, 4, 5},
-        )
-        nav.setStyleSheet(APP_STYLESHEET)
-        nav.resize(210, 650)
-        nav.show()
-        self.app.processEvents()
-        self.assertEqual(nav.count(), len(labels))
-        self.assertTrue(all(not button.isHidden() for button in nav._buttons))
-        self.assertTrue(
-            all(
-                nav._buttons[index].property("submenu") in (True, "true")
-                for index in (0, 1, 2, 3, 4, 5)
-            )
-        )
-        self.assertFalse(nav._buttons[6].property("submenu"))
-        group_label = nav.findChild(QLabel, "NavGroup")
-        self.assertIsNotNone(group_label)
-        self.assertEqual(
-            group_label.font().pixelSize(),
-            nav._buttons[6].font().pixelSize(),
-        )
-        self.assertEqual(
-            [
-                label.text()
-                for label in nav.findChildren(QLabel, "NavGroup")
-            ],
-            ["AI图提交", "任务中心", "创造中心"],
-        )
-        nav.close()
-        nav.deleteLater()
-
-    def test_top_navigation_groups_categories_and_hides_single_rows(
-        self,
-    ) -> None:
-        labels = [
-            "AI提交",
+            "任务提交",
             "提交记录",
             "待分配",
             "AI生图",
@@ -1031,38 +992,24 @@ class CollaborationPageTests(unittest.TestCase):
         ]
         nav = TopNavigation(
             labels,
-            group_before={
-                0: "AI图提交",
-                2: "任务中心",
-                4: "创造中心",
-            },
-            submenu_indices={0, 1, 2, 3, 4, 5},
-            display_name="管理员",
+            display_name="这是一个很长很长的管理员账号名称",
             role_label="管理员",
             settings_visible=True,
         )
-        nav.resize(1180, 92)
+        nav.resize(1180, 60)
+        nav.setStyleSheet(APP_STYLESHEET)
         nav.show()
         self.app.processEvents()
         self.assertEqual(
-            list(nav._category_buttons),
-            [
-                "AI图提交",
-                "任务中心",
-                "创造中心",
-                "历史记录",
-                "作品库",
-                "管理控制台",
-            ],
+            [button.text() for button in nav._buttons],
+            labels,
         )
+        self.assertFalse(hasattr(nav, "secondary_nav"))
+        self.assertLessEqual(nav.sizeHint().width(), 1180)
+        self.assertTrue(all(button.isVisible() for button in nav._buttons))
         nav.setCurrentRow(0)
-        self.assertTrue(nav.secondary_nav.isVisible())
-        self.assertEqual(
-            [button.text() for button in nav._buttons if button.isVisible()],
-            ["AI提交", "提交记录"],
-        )
-        nav.setCurrentRow(6)
-        self.assertFalse(nav.secondary_nav.isVisible())
+        self.assertTrue(nav._buttons[0].isChecked())
+        self.assertFalse(any(button.isChecked() for button in nav._buttons[1:]))
         nav.close()
         nav.deleteLater()
 
@@ -1323,6 +1270,34 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertIn("project_access", update)
         page.deleteLater()
 
+    def test_admin_can_delete_selected_account(self) -> None:
+        ai_user = AuthUser(
+            8,
+            "ai_amy",
+            "AI制作Amy",
+            "ai",
+        )
+        self.repository.list_users = lambda role=None: [ai_user]
+        page = AdminPage(self.repository, self.actor)
+        page.user_table.selectRow(0)
+        self.assertEqual(
+            page.delete_user_button.objectName(),
+            "DangerButton",
+        )
+        with (
+            patch(
+                "yixin.ui.admin_page.QMessageBox.warning",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(page, "_refresh_users"),
+        ):
+            page._delete_user()
+        self.assertEqual(
+            self.repository.user_updates[-1],
+            (self.actor, 8, {"delete": True}),
+        )
+        page.deleteLater()
+
     def test_admin_api_platform_tab_lists_provider_routes(self) -> None:
         provider = ApiProvider(
             id=3,
@@ -1514,7 +1489,7 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.assertEqual(
             labels,
-            ["AI提交", "提交记录"],
+            ["任务提交", "提交记录"],
         )
         with patch.object(window.new_task_page, "refresh") as refresh:
             window.show()
@@ -1639,7 +1614,7 @@ class CollaborationPageTests(unittest.TestCase):
         initial_index = next(
             index
             for index in range(window.nav_list.count())
-            if window.nav_list.item(index).text() == "AI提交"
+            if window.nav_list.item(index).text() == "任务提交"
         )
         create_index = next(
             index
@@ -1652,7 +1627,7 @@ class CollaborationPageTests(unittest.TestCase):
             window.nav_list.setCurrentRow(initial_index)
             self.app.processEvents()
             refresh.assert_not_called()
-            window._mark_pages_dirty("AI提交")
+            window._mark_pages_dirty("任务提交")
             window.nav_list.setCurrentRow(create_index)
             window.nav_list.setCurrentRow(initial_index)
             self.app.processEvents()
@@ -1767,7 +1742,7 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(set(calls), {"旧", "新"})
         page.deleteLater()
 
-    def test_ai_main_window_has_task_center_submenus(self) -> None:
+    def test_ai_main_window_uses_flat_navigation(self) -> None:
         paths = AppPaths(self.root / "ai-window-data")
         paths.ensure()
         database = Database(paths.database)
@@ -1808,7 +1783,7 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(
             labels,
             [
-                "AI提交",
+                "任务提交",
                 "待分配",
                 "AI生图",
                 "普通创作",
@@ -1817,22 +1792,8 @@ class CollaborationPageTests(unittest.TestCase):
                 "作品库",
             ],
         )
-        self.assertEqual(
-            window.nav_list._buttons[1].property("submenu"),
-            True,
-        )
-        self.assertEqual(
-            window.nav_list._buttons[2].property("submenu"),
-            True,
-        )
-        self.assertEqual(
-            window.nav_list._buttons[3].property("submenu"),
-            True,
-        )
-        self.assertEqual(
-            window.nav_list._buttons[4].property("submenu"),
-            True,
-        )
+        for button in window.nav_list._buttons:
+            self.assertFalse(button.property("submenu"))
         window.close()
         window.deleteLater()
 

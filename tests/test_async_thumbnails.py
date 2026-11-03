@@ -1,10 +1,11 @@
 import importlib.util
-import os
 import tempfile
 import time
 import unittest
 from datetime import date
 from pathlib import Path
+
+from tests.qt_test_support import flush_qt_deletes
 
 from PIL import Image
 
@@ -28,8 +29,14 @@ if HAS_PYSIDE:
 class AsyncThumbnailTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         cls.app = QApplication.instance() or QApplication([])
+
+    def tearDown(self) -> None:
+        flush_qt_deletes(self.app)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        flush_qt_deletes(cls.app)
 
     def test_loader_caches_and_serves_same_source_to_multiple_requests(
         self,

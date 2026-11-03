@@ -85,67 +85,6 @@ class ElidedLabel(QLabel):
         )
 
 
-class SidebarNav(QWidget):
-    currentRowChanged = Signal(int)
-
-    def __init__(
-        self,
-        labels: list[str],
-        parent: QWidget | None = None,
-        *,
-        group_before: dict[int, str] | None = None,
-        submenu_indices: set[int] | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self._current_row = -1
-        self._buttons: list[QPushButton] = []
-        self._items = [NavItem(text) for text in labels]
-        self._button_group = QButtonGroup(self)
-        self._button_group.setExclusive(True)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-        groups = group_before or {}
-        submenu_rows = submenu_indices or set()
-        for index, text in enumerate(labels):
-            if index in groups:
-                group_label = QLabel(groups[index])
-                group_label.setObjectName("NavGroup")
-                layout.addWidget(group_label)
-            button = QPushButton(text)
-            button.setObjectName("NavButton")
-            button.setProperty("submenu", index in submenu_rows)
-            button.setCheckable(True)
-            button.setFixedHeight(38)
-            button.clicked.connect(
-                lambda _checked=False, row=index: self.setCurrentRow(row)
-            )
-            self._button_group.addButton(button, index)
-            self._buttons.append(button)
-            layout.addWidget(button)
-        layout.addStretch(1)
-
-    def count(self) -> int:
-        return len(self._items)
-
-    def item(self, index: int) -> NavItem | None:
-        if 0 <= index < len(self._items):
-            return self._items[index]
-        return None
-
-    def currentRow(self) -> int:
-        return self._current_row
-
-    def setCurrentRow(self, index: int) -> None:
-        if not 0 <= index < len(self._buttons):
-            return
-        changed = index != self._current_row
-        self._current_row = index
-        self._buttons[index].setChecked(True)
-        if changed:
-            self.currentRowChanged.emit(index)
-
-
 class TopNavigation(QWidget):
     currentRowChanged = Signal(int)
     settings_requested = Signal()
@@ -155,8 +94,6 @@ class TopNavigation(QWidget):
         labels: list[str],
         parent: QWidget | None = None,
         *,
-        group_before: dict[int, str] | None = None,
-        submenu_indices: set[int] | None = None,
         display_name: str = "",
         role_label: str = "",
         settings_visible: bool = False,
@@ -165,39 +102,14 @@ class TopNavigation(QWidget):
         self._current_row = -1
         self._buttons: list[QPushButton] = []
         self._items = [NavItem(text) for text in labels]
-        self._category_rows: dict[str, list[int]] = {}
-        self._category_buttons: dict[str, QPushButton] = {}
-        self._page_categories: dict[int, str] = {}
-        self._category_group = QButtonGroup(self)
-        self._category_group.setExclusive(True)
         self._page_group = QButtonGroup(self)
         self._page_group.setExclusive(True)
-        groups = group_before or {}
-        submenu_rows = submenu_indices or set()
-        current_category = ""
-        for index, text in enumerate(labels):
-            if index in groups:
-                current_category = groups[index]
-            elif index == 0 or text in (
-                "历史记录",
-                "作品库",
-                "管理控制台",
-            ):
-                current_category = text
-            self._page_categories[index] = current_category
-            self._category_rows.setdefault(
-                current_category,
-                [],
-            ).append(index)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
         header = QFrame()
         header.setObjectName("TopHeader")
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(24, 8, 24, 8)
-        header_layout.setSpacing(18)
+        header_layout.setContentsMargins(18, 8, 18, 8)
+        header_layout.setSpacing(6)
         brand_box = QVBoxLayout()
         brand_box.setSpacing(0)
         brand = QLabel("亦欣 AI")
@@ -207,17 +119,16 @@ class TopNavigation(QWidget):
         brand_box.addWidget(brand)
         brand_box.addWidget(brand_subtitle)
         header_layout.addLayout(brand_box)
-        for category in self._category_rows:
-            button = QPushButton(category)
+        for index, text in enumerate(labels):
+            button = QPushButton(text)
             button.setObjectName("TopCategory")
             button.setCheckable(True)
             button.clicked.connect(
-                lambda _checked=False, name=category: self._select_category(
-                    name
-                )
+                lambda _checked=False, row=index: self.setCurrentRow(row)
             )
-            self._category_group.addButton(button)
-            self._category_buttons[category] = button
+            button.setToolTip(text)
+            self._page_group.addButton(button, index)
+            self._buttons.append(button)
             header_layout.addWidget(button)
         header_layout.addStretch(1)
         user_box = QVBoxLayout()
@@ -235,29 +146,11 @@ class TopNavigation(QWidget):
             self.settings_requested.emit
         )
         header_layout.addWidget(self.settings_button)
-        layout.addWidget(header)
 
-        self.secondary_nav = QFrame()
-        self.secondary_nav.setObjectName("SecondaryNav")
-        secondary_layout = QHBoxLayout(self.secondary_nav)
-        secondary_layout.setContentsMargins(24, 6, 24, 6)
-        secondary_layout.setSpacing(6)
-        for index, text in enumerate(labels):
-            button = QPushButton(text)
-            button.setObjectName("TopSubPage")
-            button.setProperty(
-                "submenu",
-                index in submenu_rows,
-            )
-            button.setCheckable(True)
-            button.clicked.connect(
-                lambda _checked=False, row=index: self.setCurrentRow(row)
-            )
-            self._page_group.addButton(button, index)
-            self._buttons.append(button)
-            secondary_layout.addWidget(button)
-        secondary_layout.addStretch(1)
-        layout.addWidget(self.secondary_nav)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(header)
 
     def count(self) -> int:
         return len(self._items)
@@ -275,23 +168,9 @@ class TopNavigation(QWidget):
             return
         changed = index != self._current_row
         self._current_row = index
-        category = self._page_categories[index]
-        self._show_category(category)
         self._buttons[index].setChecked(True)
         if changed:
             self.currentRowChanged.emit(index)
-
-    def _select_category(self, category: str) -> None:
-        rows = self._category_rows.get(category, [])
-        if rows:
-            self.setCurrentRow(rows[0])
-
-    def _show_category(self, category: str) -> None:
-        rows = set(self._category_rows.get(category, []))
-        for index, button in enumerate(self._buttons):
-            button.setVisible(index in rows)
-        self._category_buttons[category].setChecked(True)
-        self.secondary_nav.setVisible(len(rows) > 1)
 
 
 class MainWindow(QMainWindow):
@@ -346,7 +225,7 @@ class MainWindow(QMainWindow):
         )
         allowed_menu_keys = configured & role_allowed
         label_keys = {
-            "AI提交": "new_task",
+            "任务提交": "new_task",
             "提交记录": "submission_history",
             "待分配": "assign_tasks",
             "AI生图": "ai_generate",
@@ -395,8 +274,8 @@ class MainWindow(QMainWindow):
         initial_label = labels[0]
         if self.actor.role == ROLE_AI and "AI生图" in labels:
             initial_label = "AI生图"
-        elif self.actor.role == ROLE_ADMIN and "AI提交" in labels:
-            initial_label = "AI提交"
+        elif self.actor.role == ROLE_ADMIN and "任务提交" in labels:
+            initial_label = "任务提交"
         self._initial_page_label = initial_label
         for label, _factory, _attribute in available_specs:
             if self.lazy_pages and label != initial_label:
@@ -438,7 +317,7 @@ class MainWindow(QMainWindow):
     ) -> list[tuple[str, Callable[[], QWidget], str]]:
         specs: list[tuple[str, Callable[[], QWidget], str]] = [
             (
-                "AI提交",
+                "任务提交",
                 lambda: TaskCreatePage(
                     self.repository,
                     self.resolver,
@@ -642,45 +521,8 @@ class MainWindow(QMainWindow):
 
     def _build_sidebar(self) -> QWidget:
         labels = [text for text, _ in self.page_specs]
-        submenu_labels = (
-            "AI提交",
-            "提交记录",
-            "待分配",
-            "AI生图",
-            "普通创作",
-            "批量换装",
-        )
-        submenu_indices = {
-            index
-            for index, label in enumerate(labels)
-            if label in submenu_labels
-        }
-        group_before = {}
-        ai_indices = [
-            index
-            for index, label in enumerate(labels)
-            if label in ("AI提交", "提交记录")
-        ]
-        task_indices = [
-            index
-            for index, label in enumerate(labels)
-            if label in ("待分配", "AI生图")
-        ]
-        creation_indices = [
-            index
-            for index, label in enumerate(labels)
-            if label in ("普通创作", "批量换装")
-        ]
-        if ai_indices:
-            group_before[min(ai_indices)] = "AI图提交"
-        if task_indices:
-            group_before[min(task_indices)] = "任务中心"
-        if creation_indices:
-            group_before[min(creation_indices)] = "创造中心"
         self.nav_list = TopNavigation(
             labels,
-            group_before=group_before or None,
-            submenu_indices=submenu_indices,
             display_name=self.actor.display_name,
             role_label=ROLE_LABELS.get(
                 self.actor.role,

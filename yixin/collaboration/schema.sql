@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 CREATE TABLE IF NOT EXISTS users (
     id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
-    username VARCHAR(64) NOT NULL UNIQUE,
+    username VARCHAR(64) NOT NULL,
     display_name VARCHAR(100) NOT NULL,
     role VARCHAR(24) NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
@@ -14,9 +14,17 @@ CREATE TABLE IF NOT EXISTS users (
     urgent_quota_per_day INT NOT NULL DEFAULT 3,
     max_generation_concurrency INT NOT NULL DEFAULT 2,
     last_login_at DATETIME(6) NULL,
+    deleted_at DATETIME(6) NULL,
     created_at DATETIME(6) NOT NULL,
     updated_at DATETIME(6) NOT NULL,
-    UNIQUE KEY uk_users_display_name (display_name),
+    active_username VARCHAR(64) GENERATED ALWAYS AS (
+        IF(deleted_at IS NULL, username, NULL)
+    ) STORED,
+    active_display_name VARCHAR(100) GENERATED ALWAYS AS (
+        IF(deleted_at IS NULL, display_name, NULL)
+    ) STORED,
+    UNIQUE KEY uk_users_active_username (active_username),
+    UNIQUE KEY uk_users_active_display_name (active_display_name),
     INDEX idx_users_role_active (role, is_active)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 

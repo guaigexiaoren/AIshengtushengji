@@ -1,7 +1,8 @@
 import importlib.util
-import os
 import unittest
 from pathlib import Path
+
+from tests.qt_test_support import flush_qt_deletes
 
 HAS_PYSIDE = importlib.util.find_spec("PySide6") is not None
 
@@ -27,8 +28,14 @@ if HAS_PYSIDE:
 class ChineseDialogTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         cls.app = QApplication.instance() or QApplication([])
+
+    def tearDown(self) -> None:
+        flush_qt_deletes(self.app)
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        flush_qt_deletes(cls.app)
 
     def test_standard_buttons_are_chinese(self) -> None:
         dialog = QDialog()

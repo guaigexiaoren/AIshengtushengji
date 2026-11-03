@@ -407,7 +407,7 @@ class TaskCreatePage(QWidget):
         outer.setSpacing(14)
         header = QHBoxLayout()
         page_header = PageHeader(
-            "AI提交",
+            "任务提交",
             "扫描共享盘货号，确认衣服与模特后创建任务。",
         )
         self.refresh_button = QPushButton("刷新扫描")

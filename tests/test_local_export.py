@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from tests.qt_test_support import flush_qt_deletes
 
 from PySide6.QtWidgets import QApplication, QLabel, QWidget
 
@@ -41,7 +40,12 @@ class LocalExportTests(unittest.TestCase):
         self.exporter = LocalImageExporter(self.database, self.settings)
 
     def tearDown(self) -> None:
+        flush_qt_deletes(self.app)
         self.temp.cleanup()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        flush_qt_deletes(cls.app)
 
     def _completed_task(self, prompt: str = "人物:海报?") -> tuple[int, int, Path]:
         source = make_image(self.root / "references" / "last.png", (10, 40, 90))

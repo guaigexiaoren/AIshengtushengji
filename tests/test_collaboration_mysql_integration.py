@@ -4,7 +4,12 @@ import unittest
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-from yixin.collaboration.repository import MySQLCentralRepository, MySQLConfig
+from yixin.collaboration.repository import (
+    MySQLCentralRepository,
+    MySQLConfig,
+    PermissionDeniedError,
+    StateConflictError,
+)
 from yixin.collaboration.reports import ReportFilter
 from yixin.collaboration.types import (
     GeneratedResultInput,
@@ -300,6 +305,11 @@ class MySQLIntegrationTests(unittest.TestCase):
                 thread.join()
             self.assertEqual(outcomes.count("conflict"), 1)
             winner = ai_one if ai_one.username in outcomes else ai_two
+            with self.assertRaisesRegex(
+                StateConflictError,
+                "已领取任务",
+            ):
+                repository.delete_user(admin, winner.id)
 
             attempt = repository.create_generation_attempt(
                 task.id,
@@ -471,6 +481,33 @@ class MySQLIntegrationTests(unittest.TestCase):
             self.assertEqual(
                 repository.get_project(project_id).status,
                 "completed",
+            )
+            repository.delete_user(admin, operator.id)
+            self.assertNotIn(
+                operator.username,
+                {user.username for user in repository.list_users()},
+            )
+            with self.assertRaises(PermissionDeniedError):
+                repository.authenticate_user(
+                    operator.username,
+                    "TempOps123",
+                )
+            recreated_operator = repository.create_user(
+                admin,
+                operator.username,
+                operator.display_name,
+                "operations",
+                "TempOps456",
+                project_access=operator.project_access,
+            )
+            users.append(recreated_operator.id)
+            self.assertEqual(
+                recreated_operator.username,
+                operator.username,
+            )
+            self.assertEqual(
+                recreated_operator.display_name,
+                operator.display_name,
             )
         finally:
             with repository.connection() as connection:

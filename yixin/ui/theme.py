@@ -12,20 +12,15 @@ QFrame#TopHeader {
     border: none;
     border-bottom: 1px solid #e5ebf4;
 }
-QFrame#SecondaryNav {
-    background: #f7f9fd;
-    border: none;
-    border-bottom: 1px solid #e7edf6;
-}
 QPushButton#TopCategory {
     background: transparent;
     border: none;
-    border-radius: 10px;
+    border-radius: 9px;
     color: #526078;
-    font-size: 14px;
+    font-size: 13px;
     font-weight: 600;
-    min-height: 38px;
-    padding: 0 14px;
+    min-height: 36px;
+    padding: 0 9px;
 }
 QPushButton#TopCategory:hover {
     background: #eef3fb;
@@ -34,23 +29,6 @@ QPushButton#TopCategory:hover {
 QPushButton#TopCategory:checked {
     background: #eaf0ff;
     color: #2859bd;
-}
-QPushButton#TopSubPage {
-    background: transparent;
-    border: 1px solid transparent;
-    border-radius: 14px;
-    color: #657389;
-    min-height: 30px;
-    padding: 0 14px;
-}
-QPushButton#TopSubPage:hover {
-    background: #eef3fb;
-}
-QPushButton#TopSubPage:checked {
-    background: #ffffff;
-    border-color: #cfdaf0;
-    color: #2859bd;
-    font-weight: 700;
 }
 QLabel#PageTitle {
     color: #1f2d43;
@@ -126,33 +104,6 @@ QLabel#BrandTitle {
 QLabel#BrandSubtitle {
     color: #9fb0ca;
     font-size: 11px;
-}
-QLabel#NavGroup {
-    color: #7f94b5;
-    font-size: 14px;
-    font-weight: 700;
-    padding: 10px 14px 2px 14px;
-}
-QPushButton#NavButton {
-    background: transparent;
-    border: none;
-    border-radius: 9px;
-    color: #d8e2f0;
-    padding: 0 16px;
-    text-align: left;
-    font-size: 14px;
-}
-QPushButton#NavButton:hover {
-    background: #233552;
-}
-QPushButton#NavButton:checked {
-    background: #2e5fb7;
-    color: #ffffff;
-    font-weight: 600;
-}
-QPushButton#NavButton[submenu="true"] {
-    padding-left: 30px;
-    font-size: 13px;
 }
 QFrame#Card, QGroupBox#Card {
     background: #ffffff;

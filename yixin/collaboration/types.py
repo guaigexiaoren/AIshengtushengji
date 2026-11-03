@@ -16,7 +16,7 @@ ROLE_LABELS = {
 }
 
 MENU_KEYS = {
-    "new_task": "AI提交",
+    "new_task": "任务提交",
     "submission_history": "提交记录",
     "assign_tasks": "待分配",
     "ai_generate": "AI生图",

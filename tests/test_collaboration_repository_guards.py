@@ -5,6 +5,7 @@ import unittest
 from yixin.collaboration.repository import (
     MySQLCentralRepository,
     MySQLConfig,
+    PermissionDeniedError,
 )
 from yixin.collaboration.types import (
     ROLE_ADMIN,
@@ -46,6 +47,18 @@ class RecordingConnection:
 
 
 class RepositoryGuardTests(unittest.TestCase):
+    def test_delete_user_rejects_non_admin_and_current_admin(self) -> None:
+        repository = MySQLCentralRepository(
+            MySQLConfig("localhost", 3306, "test", "user", "password")
+        )
+        operator = AuthUser(3, "operator", "运营", "operations")
+        with self.assertRaises(PermissionDeniedError):
+            repository.delete_user(operator, 8)
+
+        admin = AuthUser(1, "admin", "管理员", ROLE_ADMIN)
+        with self.assertRaisesRegex(ValueError, "当前登录账号"):
+            repository.delete_user(admin, admin.id)
+
     def test_create_user_uses_one_open_transaction_cursor(self) -> None:
         repository = MySQLCentralRepository(
             MySQLConfig("localhost", 3306, "test", "user", "password")

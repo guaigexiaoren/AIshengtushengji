@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import base64
-import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from tests.qt_test_support import flush_qt_deletes
 
 from PySide6.QtCore import QMimeData, QPoint, QPointF, QSize, Qt, QUrl
 from PySide6.QtGui import QDropEvent
@@ -102,8 +101,12 @@ class GuiFlowTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.window.close()
-        self.app.processEvents()
+        flush_qt_deletes(self.app)
         self.temp.cleanup()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        flush_qt_deletes(cls.app)
 
     def test_defaults_model_and_reference_limit(self) -> None:
         page = self.window.create_page

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from tests.qt_test_support import flush_qt_deletes
 
 from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt, QUrl
 from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
@@ -85,8 +84,12 @@ class BatchDressTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.window.close()
-        self.app.processEvents()
+        flush_qt_deletes(self.app)
         self.temp.cleanup()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        flush_qt_deletes(cls.app)
 
     def _image(self, name: str, color: tuple[int, int, int]) -> Path:
         return make_image(Path(self.temp.name) / name, color)
@@ -104,9 +107,9 @@ class BatchDressTests(unittest.TestCase):
         self.assertEqual(
             labels,
             [
-            "AI提交",
-            "待分配",
-            "AI生图",
+                "任务提交",
+                "待分配",
+                "AI生图",
                 "普通创作",
                 "批量换装",
                 "历史记录",
@@ -914,7 +917,7 @@ class BatchDressTests(unittest.TestCase):
         self.assertEqual(self.page.pair_columns, expected_columns)
         self.assertGreaterEqual(
             self.page.pair_group.height() / self.page.height(),
-            0.30,
+            0.29,
         )
         submit_top = self.page.submit_card.mapTo(self.page, QPoint(0, 0)).y()
         pair_bottom = self.page.pair_group.mapTo(

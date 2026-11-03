@@ -71,7 +71,7 @@ from .types import (
     ROLE_ALLOWED_MENUS,
 )
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 LEGACY_SHARED_ROOT = (
     r"\\fe80--211-32ff-fe87-ba49.ipv6-literal.net\AI作图"
 )
@@ -190,6 +190,7 @@ class MySQLCentralRepository:
                     self._apply_schema_v7(cursor)
                     self._apply_schema_v8(cursor)
                     self._apply_schema_v9(cursor)
+                    self._apply_schema_v10(cursor)
                     self._apply_shared_root_update(cursor)
                     cursor.execute(
                         "INSERT IGNORE INTO schema_migrations(version, applied_at) "
@@ -480,6 +481,13 @@ class MySQLCentralRepository:
     @staticmethod
     def _apply_schema_v9(cursor) -> None:
         cursor.execute(
+            "SELECT COALESCE(MAX(version), 0) AS version "
+            "FROM schema_migrations"
+        )
+        previous_version = int(cursor.fetchone()["version"])
+        if previous_version >= 9:
+            return
+        cursor.execute(
             """
             SELECT display_name, COUNT(*) AS count
             FROM users
@@ -503,6 +511,45 @@ class MySQLCentralRepository:
             "users",
             "uk_users_display_name",
             "(display_name)",
+            unique=True,
+        )
+
+    @staticmethod
+    def _apply_schema_v10(cursor) -> None:
+        _add_column_if_missing(
+            cursor,
+            "users",
+            "deleted_at",
+            "DATETIME(6) NULL",
+        )
+        _drop_index_if_exists(cursor, "users", "username")
+        _drop_index_if_exists(cursor, "users", "uk_users_display_name")
+        _add_column_if_missing(
+            cursor,
+            "users",
+            "active_username",
+            "VARCHAR(64) GENERATED ALWAYS AS "
+            "(IF(deleted_at IS NULL, username, NULL)) STORED",
+        )
+        _add_column_if_missing(
+            cursor,
+            "users",
+            "active_display_name",
+            "VARCHAR(100) GENERATED ALWAYS AS "
+            "(IF(deleted_at IS NULL, display_name, NULL)) STORED",
+        )
+        _add_index_if_missing(
+            cursor,
+            "users",
+            "uk_users_active_username",
+            "(active_username)",
+            unique=True,
+        )
+        _add_index_if_missing(
+            cursor,
+            "users",
+            "uk_users_active_display_name",
+            "(active_display_name)",
             unique=True,
         )
 
@@ -542,7 +589,9 @@ class MySQLCentralRepository:
         display_name = _validate_display_name(display_name)
         with self.connection() as connection:
             with connection.cursor() as cursor:
-                cursor.execute("SELECT id FROM users LIMIT 1")
+                cursor.execute(
+                    "SELECT id FROM users WHERE deleted_at IS NULL LIMIT 1"
+                )
                 if cursor.fetchone() is not None:
                     raise StateConflictError("用户表已有账号，不能重复初始化管理员")
                 user_id = self._insert_user(
@@ -573,7 +622,8 @@ class MySQLCentralRepository:
             with self.connection() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
-                        "SELECT * FROM users WHERE username = %s",
+                        "SELECT * FROM users "
+                        "WHERE username = %s AND deleted_at IS NULL",
                         (clean_username,),
                     )
                     row = cursor.fetchone()
@@ -599,7 +649,8 @@ class MySQLCentralRepository:
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT password_hash FROM users WHERE id = %s",
+                    "SELECT password_hash FROM users "
+                    "WHERE id = %s AND deleted_at IS NULL",
                     (user_id,),
                 )
                 row = cursor.fetchone()
@@ -617,10 +668,10 @@ class MySQLCentralRepository:
                 )
 
     def list_users(self, role: str | None = None) -> list[AuthUser]:
-        query = "SELECT * FROM users"
+        query = "SELECT * FROM users WHERE deleted_at IS NULL"
         params: tuple[Any, ...] = ()
         if role:
-            query += " WHERE role = %s"
+            query += " AND role = %s"
             params = (role,)
         query += " ORDER BY is_active DESC, role, display_name"
         with self.connection() as connection:
@@ -773,7 +824,9 @@ class MySQLCentralRepository:
             with self.connection() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
-                        "SELECT id FROM users WHERE display_name = %s LIMIT 1",
+                        "SELECT id FROM users "
+                        "WHERE display_name = %s AND deleted_at IS NULL "
+                        "LIMIT 1",
                         (display_name,),
                     )
                     if cursor.fetchone() is not None:
@@ -866,7 +919,8 @@ class MySQLCentralRepository:
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT role, is_active FROM users WHERE id = %s FOR UPDATE",
+                    "SELECT role, is_active FROM users "
+                    "WHERE id = %s AND deleted_at IS NULL FOR UPDATE",
                     (user_id,),
                 )
                 target = cursor.fetchone()
@@ -880,15 +934,141 @@ class MySQLCentralRepository:
                     cursor.execute(
                         """
                         SELECT COUNT(*) AS count FROM users
-                        WHERE role = %s AND is_active = 1 AND id <> %s
+                        WHERE role = %s AND is_active = 1
+                          AND deleted_at IS NULL AND id <> %s
                         """,
                         (ROLE_ADMIN, user_id),
                     )
                     if int(cursor.fetchone()["count"]) == 0:
                         raise ValueError("必须保留至少一个启用的管理员账号")
                 cursor.execute(
-                    "UPDATE users SET is_active = %s, updated_at = %s WHERE id = %s",
+                    "UPDATE users SET is_active = %s, updated_at = %s "
+                    "WHERE id = %s AND deleted_at IS NULL",
                     (int(active), utc_now(), user_id),
+                )
+
+    def delete_user(self, actor: AuthUser, user_id: int) -> None:
+        if actor.role != ROLE_ADMIN:
+            raise PermissionDeniedError("只有管理员可以删除账号")
+        if user_id == actor.id:
+            raise ValueError("不能删除当前登录账号")
+        now = utc_now()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT id, role, is_active, deleted_at
+                    FROM users
+                    WHERE id = %s
+                    FOR UPDATE
+                    """,
+                    (user_id,),
+                )
+                target = cursor.fetchone()
+                if target is None or target["deleted_at"] is not None:
+                    raise ValueError("账号不存在")
+                if target["role"] == ROLE_ADMIN and bool(target["is_active"]):
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*) AS count FROM users
+                        WHERE role = %s AND is_active = 1
+                          AND deleted_at IS NULL AND id <> %s
+                        """,
+                        (ROLE_ADMIN, user_id),
+                    )
+                    if int(cursor.fetchone()["count"]) == 0:
+                        raise ValueError(
+                            "必须保留至少一个启用的管理员账号"
+                        )
+                cursor.execute(
+                    """
+                    SELECT task_code
+                    FROM project_tasks
+                    WHERE assignee_id = %s
+                      AND status NOT IN (%s, %s, %s, %s)
+                    ORDER BY id
+                    LIMIT 10
+                    """,
+                    (
+                        user_id,
+                        TASK_APPROVED,
+                        TASK_SKIPPED,
+                        TASK_CANCELLED,
+                        TASK_EXPANDED,
+                    ),
+                )
+                claimed = cursor.fetchall()
+                if claimed:
+                    task_codes = "、".join(
+                        row["task_code"] for row in claimed
+                    )
+                    raise StateConflictError(
+                        "账号仍有已领取任务，请先完成、取消或改派："
+                        + task_codes
+                    )
+                cursor.execute(
+                    """
+                    SELECT t.task_code
+                    FROM generation_attempts a
+                    JOIN project_tasks t ON t.id = a.task_id
+                    WHERE a.operator_id = %s
+                      AND a.status IN (%s, %s)
+                    ORDER BY a.id
+                    LIMIT 10
+                    """,
+                    (user_id, ATTEMPT_QUEUED, ATTEMPT_RUNNING),
+                )
+                active_attempts = cursor.fetchall()
+                if active_attempts:
+                    task_codes = "、".join(
+                        row["task_code"] for row in active_attempts
+                    )
+                    raise StateConflictError(
+                        "账号仍有排队中或生成中的任务，"
+                        "请先等待完成或取消："
+                        + task_codes
+                    )
+                cursor.execute(
+                    """
+                    SELECT DISTINCT project_id
+                    FROM project_tasks
+                    WHERE assignee_id = %s AND status = %s
+                    """,
+                    (user_id, TASK_AVAILABLE),
+                )
+                released_project_ids = [
+                    int(row["project_id"])
+                    for row in cursor.fetchall()
+                ]
+                cursor.execute(
+                    """
+                    UPDATE project_tasks
+                    SET assignee_id = NULL, updated_at = %s
+                    WHERE assignee_id = %s AND status = %s
+                    """,
+                    (now, user_id, TASK_AVAILABLE),
+                )
+                for project_id in released_project_ids:
+                    self._update_project_status(cursor, project_id)
+                cursor.execute(
+                    "DELETE FROM user_api_keys WHERE user_id = %s",
+                    (user_id,),
+                )
+                cursor.execute(
+                    "DELETE FROM user_menu_permissions WHERE user_id = %s",
+                    (user_id,),
+                )
+                cursor.execute(
+                    "DELETE FROM user_project_access WHERE user_id = %s",
+                    (user_id,),
+                )
+                cursor.execute(
+                    """
+                    UPDATE users
+                    SET is_active = 0, deleted_at = %s, updated_at = %s
+                    WHERE id = %s AND deleted_at IS NULL
+                    """,
+                    (now, now, user_id),
                 )
 
     def set_user_policies(
@@ -913,7 +1093,7 @@ class MySQLCentralRepository:
                     SET urgent_quota_per_day = %s,
                         max_generation_concurrency = %s,
                         updated_at = %s
-                    WHERE id = %s
+                    WHERE id = %s AND deleted_at IS NULL
                     """,
                     (
                         urgent_quota_per_day,
@@ -938,6 +1118,7 @@ class MySQLCentralRepository:
                     """
                     SELECT id FROM users
                     WHERE display_name = %s AND id <> %s
+                      AND deleted_at IS NULL
                     LIMIT 1
                     """,
                     (clean, user_id),
@@ -948,7 +1129,7 @@ class MySQLCentralRepository:
                     """
                     UPDATE users
                     SET display_name = %s, updated_at = %s
-                    WHERE id = %s
+                    WHERE id = %s AND deleted_at IS NULL
                     """,
                     (clean, utc_now(), user_id),
                 )
@@ -985,7 +1166,8 @@ class MySQLCentralRepository:
             with self.connection() as connection:
                 with connection.cursor() as cursor:
                     cursor.execute(
-                        "SELECT id FROM users WHERE id = %s FOR UPDATE",
+                        "SELECT id FROM users "
+                        "WHERE id = %s AND deleted_at IS NULL FOR UPDATE",
                         (user_id,),
                     )
                     if cursor.fetchone() is None:
@@ -994,6 +1176,7 @@ class MySQLCentralRepository:
                         """
                         SELECT id FROM users
                         WHERE username = %s AND id <> %s
+                          AND deleted_at IS NULL
                         LIMIT 1
                         """,
                         (clean_username, user_id),
@@ -1004,6 +1187,7 @@ class MySQLCentralRepository:
                         """
                         SELECT id FROM users
                         WHERE display_name = %s AND id <> %s
+                          AND deleted_at IS NULL
                         LIMIT 1
                         """,
                         (clean_display_name, user_id),
@@ -1014,7 +1198,8 @@ class MySQLCentralRepository:
                         cursor.execute(
                             """
                             SELECT COUNT(*) AS count FROM users
-                            WHERE role = %s AND is_active = 1 AND id <> %s
+                            WHERE role = %s AND is_active = 1
+                              AND deleted_at IS NULL AND id <> %s
                             """,
                             (ROLE_ADMIN, user_id),
                         )
@@ -1026,7 +1211,7 @@ class MySQLCentralRepository:
                         SET username = %s, display_name = %s, role = %s,
                             is_active = %s, urgent_quota_per_day = %s,
                             max_generation_concurrency = %s, updated_at = %s
-                        WHERE id = %s
+                        WHERE id = %s AND deleted_at IS NULL
                         """,
                         (
                             clean_username,
@@ -1112,7 +1297,8 @@ class MySQLCentralRepository:
                 if not bool(provider["is_enabled"]):
                     raise ValueError("API 平台已停用")
                 cursor.execute(
-                    "SELECT role, is_active FROM users WHERE id = %s",
+                    "SELECT role, is_active FROM users "
+                    "WHERE id = %s AND deleted_at IS NULL",
                     (user_id,),
                 )
                 target = cursor.fetchone()
@@ -1542,7 +1728,7 @@ class MySQLCentralRepository:
                     """
                     UPDATE users
                     SET password_hash = %s, must_change_password = 1, updated_at = %s
-                    WHERE id = %s
+                    WHERE id = %s AND deleted_at IS NULL
                     """,
                     (hash_password(temporary_password), utc_now(), user_id),
                 )
@@ -3248,7 +3434,7 @@ class MySQLCentralRepository:
                 cursor.execute(
                     """
                     SELECT urgent_quota_per_day, max_generation_concurrency
-                    FROM users WHERE id = %s
+                    FROM users WHERE id = %s AND deleted_at IS NULL
                     """,
                     (user_id,),
                 )
@@ -3289,7 +3475,7 @@ class MySQLCentralRepository:
                     cursor.execute(
                         """
                         SELECT urgent_quota_per_day
-                        FROM users WHERE id = %s
+                        FROM users WHERE id = %s AND deleted_at IS NULL
                         """,
                         (task["owner_id"],),
                     )
@@ -3420,7 +3606,8 @@ class MySQLCentralRepository:
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    "SELECT urgent_quota_per_day FROM users WHERE id = %s",
+                        "SELECT urgent_quota_per_day FROM users "
+                        "WHERE id = %s AND deleted_at IS NULL",
                     (actor.id,),
                 )
                 row = cursor.fetchone()
@@ -4781,7 +4968,8 @@ class MySQLCentralRepository:
             with connection.cursor() as cursor:
                 task = self._task_row_for_update(cursor, task_id)
                 cursor.execute(
-                    "SELECT role, is_active FROM users WHERE id = %s",
+                    "SELECT role, is_active FROM users "
+                    "WHERE id = %s AND deleted_at IS NULL",
                     (target_user_id,),
                 )
                 target = cursor.fetchone()
@@ -5914,7 +6102,7 @@ class MySQLCentralRepository:
         cursor.execute(
             """
             SELECT max_generation_concurrency
-            FROM users WHERE id = %s FOR UPDATE
+            FROM users WHERE id = %s AND deleted_at IS NULL FOR UPDATE
             """,
             (user_id,),
         )
@@ -6015,6 +6203,21 @@ def _add_index_if_missing(
         cursor.execute(
             f"CREATE {unique_sql}INDEX `{index}` ON `{table}` {columns}"
         )
+
+
+def _drop_index_if_exists(cursor, table: str, index: str) -> None:
+    cursor.execute(
+        """
+        SELECT COUNT(*) AS count
+        FROM information_schema.STATISTICS
+        WHERE TABLE_SCHEMA = DATABASE()
+          AND TABLE_NAME = %s
+          AND INDEX_NAME = %s
+        """,
+        (table, index),
+    )
+    if int(cursor.fetchone()["count"]) > 0:
+        cursor.execute(f"DROP INDEX `{index}` ON `{table}`")
 
 
 def _split_sql(schema: str) -> list[str]:
