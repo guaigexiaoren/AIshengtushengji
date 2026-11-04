@@ -223,6 +223,12 @@ class AddUserDialog(QDialog):
         actions.layout.addWidget(save)
         layout.addWidget(actions)
 
+    def selected_menu_permissions(self) -> tuple[str, ...]:
+        return self.permissions.selected_menu_permissions()
+
+    def selected_project_access(self) -> tuple[tuple[str, str], ...]:
+        return self.permissions.selected_project_access()
+
 
 class EditUserDialog(QDialog):
     def __init__(

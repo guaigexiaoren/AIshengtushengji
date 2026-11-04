@@ -1305,6 +1305,55 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertIn("project_access", update)
         page.deleteLater()
 
+    def test_admin_can_add_user_with_selected_permissions(self) -> None:
+        self.repository.list_shared_projects = lambda: {
+            "internal": ("春季项目",),
+            "external": (),
+        }
+        page = AdminPage(self.repository, self.actor, auto_load=False)
+        dialog = AddUserDialog(
+            self.repository.list_shared_projects(),
+            page,
+        )
+        dialog.username.setText("operator_new")
+        dialog.display_name.setText("运营新账号")
+        dialog.role.setCurrentIndex(
+            dialog.role.findData(ROLE_OPERATIONS)
+        )
+        dialog.password.setText("123456")
+        dialog.permissions.project_checks[
+            ("internal", "春季项目")
+        ].setChecked(True)
+        with (
+            patch(
+                "yixin.ui.admin_page.AddUserDialog",
+                return_value=dialog,
+            ),
+            patch.object(
+                dialog,
+                "exec",
+                return_value=QDialog.DialogCode.Accepted,
+            ),
+        ):
+            page._add_user()
+        self.assertEqual(len(self.repository.user_updates), 1)
+        payload = self.repository.user_updates[0][2]
+        self.assertEqual(
+            payload["create"],
+            ("operator_new", "运营新账号", ROLE_OPERATIONS, "123456"),
+        )
+        self.assertEqual(
+            set(payload["menu_permissions"]),
+            {"new_task", "submission_history"},
+        )
+        self.assertEqual(
+            payload["project_access"],
+            (("internal", "春季项目"),),
+        )
+        page.deleteLater()
+        dialog.deleteLater()
+        flush_qt_deletes()
+
     def test_admin_can_delete_selected_account(self) -> None:
         ai_user = AuthUser(
             8,
