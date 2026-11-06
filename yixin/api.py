@@ -584,16 +584,23 @@ class OpenAIChatImageClient:
                         json=payload,
                     )
             except httpx.TimeoutException as exc:
+                if images:
+                    # 前面已经生成并计费的图片先返回，避免整批丢弃。
+                    break
                 raise ApiError(
                     "请求超时，任务可能仍在服务端处理并产生费用",
                     error_code="timeout",
                 ) from exc
             except httpx.NetworkError as exc:
+                if images:
+                    break
                 raise ApiError(
                     "网络连接失败，请检查网络后手动重试",
                     error_code="network",
                 ) from exc
             except httpx.HTTPError as exc:
+                if images:
+                    break
                 raise ApiError(
                     "请求未能完成，请手动重试",
                     error_code="http_client",
@@ -601,11 +608,17 @@ class OpenAIChatImageClient:
 
             response_payload = _response_json(response)
             if response_payload is None:
+                if images:
+                    break
                 raise _http_api_error(response, response_payload)
             if not response.is_success:
+                if images:
+                    break
                 raise _http_api_error(response, response_payload)
             batch = _images_from_chat_payload(response_payload)
             if not batch:
+                if images:
+                    break
                 raise _http_api_error(response, response_payload)
             images.extend(batch)
             raw_responses.append(redact_data(response_payload))

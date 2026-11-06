@@ -17,6 +17,7 @@ from yixin.collaboration.repository import (  # noqa: E402
     MySQLCentralRepository,
     MySQLConfig,
 )
+from yixin.collaboration.types import ROLE_ADMIN, AuthUser  # noqa: E402
 
 
 def main() -> int:
@@ -58,14 +59,21 @@ def main() -> int:
                 None,
             )
             if admin is None:
+                bootstrap = AuthUser(
+                    id=0,
+                    username="bootstrap",
+                    display_name="维护脚本",
+                    role=ROLE_ADMIN,
+                )
                 repository.create_user(
+                    bootstrap,
                     args.admin_account,
                     args.admin_name,
-                    "admin",
+                    ROLE_ADMIN,
                     temporary,
                 )
             else:
-                repository.reset_password(admin.id, temporary)
+                repository.reset_password(admin, admin.id, temporary)
         else:
             repository.create_initial_admin(
                 args.admin_account,

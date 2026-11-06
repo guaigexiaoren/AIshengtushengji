@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 
 from ..storage import SUPPORTED_IMAGE_SUFFIXES, image_metadata
+from .product_code import PRODUCT_CODE_EXAMPLE, ProductCode, parse_product_code
 from .types import ProjectAssetInput
 
 
@@ -30,6 +31,7 @@ class ProductFolder:
     garments: tuple[Path, ...]
     models: tuple[Path, ...]
     errors: tuple[str, ...]
+    code_info: ProductCode | None = None
 
 
 @dataclass(frozen=True)
@@ -37,20 +39,6 @@ class AccountDirectory:
     path: Path
     source_date: date
     date_recognized: bool
-
-
-def default_account_directory(
-    shared_root: Path,
-    display_name: str,
-    *,
-    today: date | None = None,
-) -> Path:
-    current = today or date.today()
-    return (
-        Path(shared_root).expanduser()
-        / display_name
-        / f"{current.month}.{current.day}"
-    )
 
 
 def resolve_account_directory(
@@ -86,27 +74,17 @@ def parse_date_folder(label: str, *, today: date | None = None) -> date | None:
         return None
 
 
-def list_date_folders(account_root: Path) -> list[DateFolder]:
-    result: list[DateFolder] = []
-    if not account_root.is_dir():
-        return result
-    for path in account_root.iterdir():
-        if not path.is_dir():
-            continue
-        parsed = parse_date_folder(path.name)
-        if parsed is not None:
-            result.append(DateFolder(path.name, path, parsed))
-    result.sort(key=lambda item: item.source_date, reverse=True)
-    return result
-
-
 def current_date_folder(account_root: Path) -> DateFolder:
     today = date.today()
     label = f"{today.month}.{today.day}"
     return DateFolder(label, account_root / label, today)
 
 
-def scan_product_folders(date_root: Path) -> list[ProductFolder]:
+def scan_product_folders(
+    date_root: Path,
+    *,
+    check_product_code: bool = False,
+) -> list[ProductFolder]:
     products: list[ProductFolder] = []
     if not date_root.is_dir():
         return products
@@ -116,22 +94,47 @@ def scan_product_folders(date_root: Path) -> list[ProductFolder]:
     ):
         garment_dir = product_dir / "衣服图"
         model_dir = product_dir / "模特图"
-        if not garment_dir.is_dir() or not model_dir.is_dir():
+        if not check_product_code and (
+            not garment_dir.is_dir() or not model_dir.is_dir()
+        ):
             continue
-        garment_paths, garment_errors = _scan_images(garment_dir)
-        model_paths, model_errors = _scan_images(model_dir)
+        code_info = (
+            parse_product_code(product_dir.name)
+            if check_product_code
+            else None
+        )
+        garment_paths, garment_errors = (
+            _scan_images(garment_dir)
+            if garment_dir.is_dir()
+            else ([], [])
+        )
+        model_paths, model_errors = (
+            _scan_images(model_dir)
+            if model_dir.is_dir()
+            else ([], [])
+        )
         errors = tuple(
             [
                 *garment_errors,
                 *model_errors,
                 *(
+                    ["缺少衣服图目录"]
+                    if not garment_dir.is_dir()
+                    else []
+                ),
+                *(
+                    ["缺少模特图目录"]
+                    if not model_dir.is_dir()
+                    else []
+                ),
+                *(
                     ["没有可用的衣服图"]
-                    if not garment_paths
+                    if garment_dir.is_dir() and not garment_paths
                     else []
                 ),
                 *(
                     ["没有可用的模特图"]
-                    if not model_paths
+                    if model_dir.is_dir() and not model_paths
                     else []
                 ),
                 *(
@@ -139,17 +142,54 @@ def scan_product_folders(date_root: Path) -> list[ProductFolder]:
                     if len(garment_paths) > 13
                     else []
                 ),
+                *(
+                    [
+                        "货号格式不符合内部项目规则，"
+                        f"示例：{PRODUCT_CODE_EXAMPLE}"
+                    ]
+                    if check_product_code and code_info is None
+                    else []
+                ),
             ]
         )
         products.append(
             ProductFolder(
-                product_code=product_dir.name,
+                product_code=(
+                    code_info.base_code
+                    if code_info is not None
+                    else product_dir.name
+                ),
                 path=product_dir,
                 garments=tuple(garment_paths),
                 models=tuple(model_paths),
                 errors=errors,
+                code_info=code_info,
             )
         )
+    return _mark_duplicate_codes(products)
+
+
+def _mark_duplicate_codes(
+    products: list[ProductFolder],
+) -> list[ProductFolder]:
+    grouped: dict[str, list[int]] = {}
+    for index, product in enumerate(products):
+        if product.code_info is None:
+            continue
+        grouped.setdefault(product.product_code, []).append(index)
+    for indexes in grouped.values():
+        if len(indexes) < 2:
+            continue
+        names = "、".join(products[index].path.name for index in indexes)
+        for index in indexes:
+            product = products[index]
+            products[index] = replace(
+                product,
+                errors=(
+                    *product.errors,
+                    f"多个目录对应同一货号（{names}），请只保留一个",
+                ),
+            )
     return products
 
 

@@ -125,6 +125,9 @@ class FileStore:
         )
         if not destination.exists():
             atomic_write_bytes(destination, data)
+        else:
+            # 复用旧文件时刷新时间戳，避免被临时文件清理当成过期文件删除。
+            destination.touch()
         return StoredImage(
             path=destination,
             content_hash=content_hash,

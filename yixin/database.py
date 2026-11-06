@@ -367,6 +367,8 @@ class Database:
         }
         now = utc_now_iso()
         with self.connection() as connection:
+            # 先拿写锁再读状态，避免“读取状态”和“写入状态”之间被其他线程插入。
+            connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT status FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()
@@ -376,7 +378,7 @@ class Database:
             if target_status not in allowed.get(current, set()):
                 raise StateTransitionError(f"不能从 {current} 切换到 {target_status}")
             finished_at = now if target_status in (TASK_SUCCESS, TASK_FAILED, TASK_CANCELLED) else None
-            connection.execute(
+            updated = connection.execute(
                 """
                 UPDATE tasks
                 SET status = ?, updated_at = ?, finished_at = COALESCE(?, finished_at),
@@ -387,7 +389,7 @@ class Database:
                     remote_task_id = COALESCE(?, remote_task_id),
                     input_tokens = COALESCE(?, input_tokens),
                     output_tokens = COALESCE(?, output_tokens)
-                WHERE id = ?
+                WHERE id = ? AND status = ?
                 """,
                 (
                     target_status,
@@ -401,8 +403,13 @@ class Database:
                     input_tokens,
                     output_tokens,
                     task_id,
+                    current,
                 ),
             )
+            if updated.rowcount == 0:
+                raise StateTransitionError(
+                    f"任务状态已被其他操作修改（期望 {current}）"
+                )
 
     def update_task_from_api(
         self,
@@ -740,6 +747,23 @@ class Database:
                     "生成结果不存在或已经保存，作品保存已回滚"
                 )
             return work_id
+
+    def release_saved_task_result(
+        self,
+        task_id: int,
+        saved_path: Path,
+    ) -> bool:
+        """成品文件已丢失时把结果恢复为未保存，避免永久无法再保存。"""
+        with self.connection() as connection:
+            updated = connection.execute(
+                """
+                UPDATE task_results
+                SET saved = 0, path = '', thumbnail_path = ''
+                WHERE task_id = ? AND path = ? AND saved = 1
+                """,
+                (task_id, str(saved_path)),
+            )
+            return updated.rowcount == 1
 
     def restore_saved_task_result(
         self,

@@ -73,7 +73,14 @@ class TaskWorker:
                 self._wake.wait(1.0)
                 self._wake.clear()
                 continue
-            self.process_task(dict(task))
+            try:
+                self.process_task(dict(task))
+            except Exception:
+                # 单条任务异常不应让队列线程退出。
+                self.logger.error(
+                    "处理任务异常：%s",
+                    sanitize_text(traceback.format_exc()),
+                )
 
     def process_task(self, task: dict) -> None:
         task_id = int(task["id"])

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 
-from PySide6.QtCore import QTimer, Signal
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -48,8 +48,6 @@ from .components import PageHeader
 
 
 class AIGenerationPage(BatchDressPage):
-    project_attempt_cancelled = Signal(int)
-
     def __init__(
         self,
         repository: MySQLCentralRepository,
@@ -210,6 +208,12 @@ class AIGenerationPage(BatchDressPage):
         self.provider_combo.blockSignals(False)
 
     def refresh(self) -> None:
+        try:
+            shared_root = self.repository.get_shared_setting("share_root")
+        except Exception:
+            shared_root = None
+        if shared_root:
+            self.resolver = SharedPathResolver(shared_root)
         if not self.async_mode:
             self._refresh_providers()
         self.refresh_templates()
@@ -280,9 +284,10 @@ class AIGenerationPage(BatchDressPage):
             self.current_task = self._generation_tasks_by_id.get(
                 current_id
             )
+            self._refresh_task_status_label()
 
     def _request_generation_tasks(self) -> None:
-        page = PageRequest(page=1, page_size=100)
+        page = PageRequest(page=1, page_size=10000)
         query = TaskQuery(
             keyword=self.task_search_edit.text().strip()
         )
@@ -304,14 +309,14 @@ class AIGenerationPage(BatchDressPage):
                 )
             except Exception:
                 progress = {}
-            providers = list(self.api_providers)
-            if not providers:
-                try:
-                    providers = self.repository.list_api_providers(
+            try:
+                providers = list(
+                    self.repository.list_api_providers(
                         include_disabled=False
                     )
-                except Exception:
-                    providers = []
+                )
+            except Exception:
+                providers = list(self.api_providers)
             return result.items, progress, providers
 
         self._active_task_request = self.query_runner.submit(load)
@@ -336,6 +341,14 @@ class AIGenerationPage(BatchDressPage):
         progress: dict[int, tuple[int, int]],
     ) -> None:
         current_id = self.task_selector.currentData()
+        forced_id = self.force_direct_retry_task_id
+        tasks = list(tasks)
+        if forced_id is not None and all(
+            task.id != forced_id for task in tasks
+        ):
+            forced_task = self._generation_tasks_by_id.get(forced_id)
+            if forced_task is not None:
+                tasks.append(forced_task)
         self.generation_tasks = list(tasks)
         self.project_progress = progress
         self._generation_tasks_by_id = {
@@ -373,6 +386,7 @@ class AIGenerationPage(BatchDressPage):
             self.current_task = self._generation_tasks_by_id.get(
                 current_id
             )
+            self._refresh_task_status_label()
 
     def _clear_generation_editor(self) -> None:
         self.current_task = None
@@ -445,6 +459,17 @@ class AIGenerationPage(BatchDressPage):
             f" · {TASK_STATUS_LABELS.get(task.status, task.status)}"
         )
         self._update_asset_actions()
+
+    def _refresh_task_status_label(self) -> None:
+        task = self.current_task
+        if task is None:
+            self.task_status_label.setText("尚未选择")
+            return
+        completed, total = self.project_progress.get(task.project_id, (0, 0))
+        self.task_status_label.setText(
+            f"主任务 {completed}/{total} · "
+            f"{TASK_STATUS_LABELS.get(task.status, task.status)}"
+        )
 
     def _persist_current_sources(self) -> None:
         if (
@@ -562,6 +587,7 @@ class AIGenerationPage(BatchDressPage):
         )
         if attempt is None:
             raise ValueError("生成轮次不存在")
+        self.force_direct_retry_task_id = task.id
         self._generation_tasks_by_id[task.id] = task
         self.generation_tasks = [
             item for item in self.generation_tasks if item.id != task.id
@@ -856,6 +882,11 @@ class AIGenerationPage(BatchDressPage):
                     self._job_failed(item, message)
                 )
             )
+            worker.signals.deferred.connect(
+                lambda _task_id, _attempt_id, item=worker: (
+                    self._job_deferred(item)
+                )
+            )
             self.active_workers.add(worker)
             worker.start()
         self._refresh_queue_state()
@@ -864,6 +895,18 @@ class AIGenerationPage(BatchDressPage):
         self.active_workers.discard(worker)
         self._refresh_generation_tasks()
         self._pump_queue()
+
+    def _job_deferred(self, worker: ProjectGenerationWorker) -> None:
+        # 账号并发名额已满，轮次仍保持排队，稍后自动重试。
+        self.active_workers.discard(worker)
+        self.waiting_jobs.appendleft(
+            {
+                "task": worker.task,
+                "attempt": worker.reserved_attempt,
+            }
+        )
+        self._refresh_queue_state()
+        QTimer.singleShot(5000, self._pump_queue)
 
     def _job_failed(
         self,

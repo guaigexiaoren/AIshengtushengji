@@ -92,7 +92,7 @@ class AppSettings:
         folder = Path(value)
         if folder.is_dir():
             return folder
-        self.database.set_setting(key, "")
+        # 目录暂时不可用时只返回 None，不清空已保存的路径。
         return None
 
     def set_input_folder(self, scope: str, folder: Path | None) -> None:

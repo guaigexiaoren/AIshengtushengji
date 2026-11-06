@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -128,14 +128,3 @@ class ApiError(Exception):
 class ConfigurationError(Exception):
     pass
 
-
-@dataclass(frozen=True)
-class WorkerTask:
-    id: int
-    mode: str
-    model: str
-    prompt: str
-    aspect_ratio: str
-    resolution: str | None
-    n: int
-    references: tuple[StoredImage, ...] = field(default_factory=tuple)

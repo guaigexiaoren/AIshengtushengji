@@ -1055,9 +1055,13 @@ class CreatePage(QWidget):
         if asset is None or not asset.is_result:
             return
         result = asset.payload
-        saved_path = self.local_save_controller.save(
-            self.current_task_id, int(result["id"])
-        )
+        try:
+            saved_path = self.local_save_controller.save(
+                self.current_task_id, int(result["id"])
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
         if saved_path:
             show_saved_toast(self, saved_path)
 

@@ -261,6 +261,12 @@ class TaskAssignmentPage(QWidget):
 
     def refresh(self) -> None:
         try:
+            shared_root = self.repository.get_shared_setting("share_root")
+        except Exception:
+            shared_root = None
+        if shared_root:
+            self.resolver = SharedPathResolver(shared_root)
+        try:
             self._refresh_project_filter()
         except Exception as exc:
             QMessageBox.warning(self, "读取项目筛选失败", str(exc))
@@ -269,9 +275,6 @@ class TaskAssignmentPage(QWidget):
             self._request_projects()
             return
         try:
-            shared_root = self.repository.get_shared_setting("share_root")
-            if shared_root:
-                self.resolver = SharedPathResolver(shared_root)
             self.projects = self.repository.list_assignment_projects(
                 self.actor,
                 project_name=self.project_filter.currentData(),
@@ -379,7 +382,7 @@ class TaskAssignmentPage(QWidget):
         self.source_strip.clear()
         page = PageRequest(
             page=1,
-            page_size=100,
+            page_size=10000,
             sort_field=self._task_sort_field,
             sort_direction=self._task_sort_direction,
         )
@@ -418,7 +421,14 @@ class TaskAssignmentPage(QWidget):
             self._active_task_request,
         ):
             return
-        self._selection_changed()
+        # 失败时只恢复按钮状态并提示，不再自动重发查询，避免弹窗套娃。
+        selected_ids = self._selected_project_ids()
+        self.claim_button.setText(
+            f"领取所选（{len(selected_ids)}）"
+            if selected_ids
+            else "领取所选"
+        )
+        self.claim_button.setEnabled(bool(selected_ids))
         QMessageBox.warning(self, "读取待分配任务失败", message)
 
     def _render_projects(
@@ -473,8 +483,12 @@ class TaskAssignmentPage(QWidget):
             result.page,
             result.page_size,
         )
-        if self.projects and not selected_ids:
+        if self.projects and (
+            not selected_ids or self.project_table.currentRow() < 0
+        ):
+            self.project_table.blockSignals(True)
             self.project_table.selectRow(0)
+            self.project_table.blockSignals(False)
         if not self.projects:
             self.tasks = []
             self._tasks_by_id = {}
@@ -538,7 +552,9 @@ class TaskAssignmentPage(QWidget):
                 ),
                 0,
             )
+            self.task_table.blockSignals(True)
             self.task_table.selectRow(target_row)
+            self.task_table.blockSignals(False)
             self._task_selected()
         else:
             self.source_strip.clear()

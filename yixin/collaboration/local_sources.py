@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -16,6 +17,25 @@ from ..storage import (
 )
 from .shared_paths import SharedPathResolver
 from .types import ProjectTask
+
+
+def cleanup_old_attempt_snapshots(root: Path, days: int = 30) -> None:
+    """删除超过保留期的生成轮次参考图快照，避免本机磁盘无限增长。"""
+    base = Path(root).expanduser()
+    if not base.is_dir():
+        return
+    cutoff = time.time() - days * 24 * 60 * 60
+    for path in base.rglob("*"):
+        if path.parent.name != "attempt_sources":
+            continue
+        try:
+            if path.stat().st_mtime < cutoff:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    path.unlink(missing_ok=True)
+        except OSError:
+            continue
 
 
 @dataclass(frozen=True)

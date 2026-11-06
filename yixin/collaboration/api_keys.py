@@ -8,7 +8,7 @@ from cryptography.fernet import Fernet, InvalidToken
 
 from ..logging_utils import register_sensitive_value
 from ..private_config import API_KEY_MASTER_SECRET
-from ..security import mask_secret, validate_api_key
+from ..security import validate_api_key
 from .types import AuthUser
 
 if TYPE_CHECKING:
@@ -75,6 +75,3 @@ class DatabaseApiKeyStore:
 
     def clear(self) -> None:
         raise ApiKeyError("API Key 只能由管理员在管理控制台清除")
-
-    def masked(self) -> str:
-        return mask_secret(self.load())

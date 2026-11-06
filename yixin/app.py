@@ -4,11 +4,12 @@ import ctypes
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QLocale, QTimer
+from PySide6.QtCore import QLocale, QLockFile, QTimer
 from PySide6.QtGui import QFont, QIcon
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .collaboration.cleanup import cleanup_expired_candidates
+from .collaboration.local_sources import cleanup_old_attempt_snapshots
 from .collaboration.api_keys import DatabaseApiKeyStore
 from .collaboration.repository import (
     MySQLCentralRepository,
@@ -71,9 +72,19 @@ def run() -> int:
     paths = AppPaths.default()
     try:
         paths.ensure()
+        # 同一数据目录只允许一个实例，避免第二个实例把运行中的任务判为失败。
+        instance_lock = QLockFile(str(paths.root / "app.lock"))
+        if not instance_lock.tryLock(100):
+            QMessageBox.warning(
+                None,
+                "程序已在运行",
+                "本机的亦欣 AI 生图工作台已经启动，请勿重复打开。",
+            )
+            return 0
+        # 先完成旧数据备份/迁移，再删除旧版密钥文件，避免备份里缺文件。
+        prepare_legacy_data(paths)
         paths.api_key_file.unlink(missing_ok=True)
         (paths.config / "database.bin").unlink(missing_ok=True)
-        prepare_legacy_data(paths)
         logger = setup_logging(paths.log_file)
         logger.info("应用启动，数据目录：%s", paths.root)
         database = Database(paths.database)
@@ -130,6 +141,13 @@ def run() -> int:
             )
         except Exception:
             logger.exception("自动清理临时文件失败")
+        try:
+            cleanup_old_attempt_snapshots(
+                file_store.paths.root / "local_sources",
+                days=TEMP_RETENTION_DAYS,
+            )
+        except Exception:
+            logger.exception("自动清理轮次快照失败")
         _cleanup_collaboration_candidates(repository, resolver)
 
     cleanup_timer = QTimer(window)

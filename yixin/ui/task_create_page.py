@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
-    QFrame,
     QGroupBox,
     QHeaderView,
     QHBoxLayout,
@@ -28,7 +27,6 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
-    QScrollArea,
     QSplitter,
     QStyle,
     QStyleOptionButton,
@@ -47,11 +45,11 @@ from ..collaboration.folders import (
     scan_product_folders,
 )
 from ..collaboration.matching import MatchAsset, build_pairs
+from ..collaboration.product_code import ProductCode
 from ..collaboration.repository import MySQLCentralRepository
 from ..collaboration.shared_paths import SharedPathResolver
 from ..collaboration.types import (
     PAIRING_ALL,
-    PAIRING_MANUAL,
     ROLE_ADMIN,
     ROLE_AI,
     ROLE_OPERATIONS,
@@ -76,6 +74,7 @@ class ProductDraftState:
     errors: list[str] = field(default_factory=list)
     manual_pairs: list[PairingInput] = field(default_factory=list)
     existing_tasks: list = field(default_factory=list)
+    code_info: ProductCode | None = None
 
 
 class DroppableImageList(QListWidget):
@@ -210,153 +209,6 @@ class CheckableHeaderView(QHeaderView):
         super().mousePressEvent(event)
 
 
-class PairPreviewCard(QFrame):
-    selected = Signal(int)
-
-    def __init__(
-        self,
-        model_path: Path,
-        garment_paths: list[Path],
-        *,
-        index: int = -1,
-        selectable: bool = False,
-        thumbnail_loader: ThumbnailLoader | None = None,
-        parent: QWidget | None = None,
-    ) -> None:
-        super().__init__(parent)
-        self.index = index
-        self.selectable = selectable
-        self._selected = False
-        self.thumbnail_loader = thumbnail_loader
-        self._thumbnail_contexts: dict[int, tuple[QLabel, QSize]] = {}
-        if self.thumbnail_loader is not None:
-            self.thumbnail_loader.thumbnail_ready.connect(
-                self._thumbnail_ready
-            )
-            self.thumbnail_loader.thumbnail_failed.connect(
-                self._thumbnail_failed
-            )
-        self.setObjectName("PairPreviewCard")
-        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet(
-            "QFrame#PairPreviewCard {"
-            "background:#f8faff;border:1px solid #dce5f2;"
-            "border-radius:8px;padding:8px;}"
-            "QFrame#PairPreviewCard[selected=\"true\"] {"
-            "background:#edf4ff;border:2px solid #2e64c4;}"
-        )
-        if selectable:
-            self.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.setToolTip("点击选中此配对，可移除所选配对")
-        layout = QVBoxLayout(self)
-        summary = QLabel(
-            f"衣服 {len(garment_paths)} 张 · 1 个子任务"
-        )
-        summary.setStyleSheet("color:#60708a;")
-        thumb_host = QWidget()
-        thumbs = QHBoxLayout(thumb_host)
-        self.thumbnail_layout = thumbs
-        thumbs.setContentsMargins(0, 0, 0, 0)
-        thumbs.setSpacing(4)
-        model = QLabel()
-        self.model_thumbnail = model
-        model.setObjectName("ModelThumbnail")
-        model.setFixedSize(58, 72)
-        model.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        model.setToolTip(model_path.name)
-        thumbs.addWidget(model)
-        self._set_thumbnail(
-            model,
-            model_path,
-            QSize(56, 70),
-        )
-        self.garment_thumbnails: list[QLabel] = []
-        for path in garment_paths:
-            image = QLabel()
-            image.setObjectName("GarmentThumbnail")
-            image.setFixedSize(58, 72)
-            image.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            image.setToolTip(path.name)
-            thumbs.addWidget(image)
-            self.garment_thumbnails.append(image)
-            self._set_thumbnail(
-                image,
-                path,
-                QSize(56, 70),
-            )
-        thumb_scroll = QScrollArea()
-        thumb_scroll.setWidgetResizable(False)
-        thumb_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
-        )
-        thumb_scroll.setVerticalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
-        )
-        thumb_scroll.setWidget(thumb_host)
-        thumb_scroll.setFixedHeight(94)
-        thumb_host.adjustSize()
-        layout.addWidget(summary)
-        layout.addWidget(thumb_scroll)
-
-    def _set_thumbnail(
-        self,
-        label: QLabel,
-        path: Path,
-        target: QSize,
-    ) -> None:
-        if self.thumbnail_loader is None:
-            pixmap = load_scaled_pixmap(path, target)
-            if not pixmap.isNull():
-                label.setPixmap(pixmap)
-            return
-        request = self.thumbnail_loader.request_thumbnail(path, target)
-        self._thumbnail_contexts[request.request_id] = (label, target)
-
-    def _thumbnail_ready(
-        self,
-        request_id: int,
-        _path: str,
-        image: QImage,
-    ) -> None:
-        context = self._thumbnail_contexts.pop(request_id, None)
-        if context is None:
-            return
-        label, target = context
-        scaled = image.scaled(
-            target,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
-        label.setPixmap(QPixmap.fromImage(scaled))
-
-    def _thumbnail_failed(
-        self,
-        request_id: int,
-        _path: str,
-        _message: str,
-    ) -> None:
-        self._thumbnail_contexts.pop(request_id, None)
-
-    def set_selected(self, selected: bool) -> None:
-        if selected == self._selected:
-            return
-        self._selected = selected
-        self.setProperty("selected", selected)
-        self.style().unpolish(self)
-        self.style().polish(self)
-        self.update()
-
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if (
-            self.selectable
-            and event.button() == Qt.MouseButton.LeftButton
-        ):
-            self.selected.emit(self.index)
-            event.accept()
-            return
-        super().mousePressEvent(event)
-
-
 class TaskCreatePage(QWidget):
     def __init__(
         self,
@@ -377,7 +229,7 @@ class TaskCreatePage(QWidget):
             get_query_runner() if async_mode else None
         )
         self._active_scan_request = -1
-        self.states: dict[str, ProductDraftState] = {}
+        self.states: dict[Path, ProductDraftState] = {}
         self.current_state: ProductDraftState | None = None
         self.account_directory: AccountDirectory | None = None
         self.accessible_projects: tuple[tuple[str, str], ...] = ()
@@ -673,15 +525,20 @@ class TaskCreatePage(QWidget):
     def _scan_directory(self) -> None:
         if self.account_directory is None:
             return
+        project = self.project_combo.currentData()
+        check_product_code = bool(project) and project[0] == "internal"
         if self.async_mode:
             account_directory = self.account_directory
             self.scan_summary.setText("正在扫描共享盘货号目录…")
             self.create_button.setEnabled(False)
 
             def load():
-                products = scan_product_folders(account_directory.path)
+                products = scan_product_folders(
+                    account_directory.path,
+                    check_product_code=check_product_code,
+                )
                 existing = {
-                    product.product_code: (
+                    product.path: (
                         self.repository.find_tasks_by_product(
                             self.actor.id,
                             account_directory.source_date,
@@ -695,7 +552,10 @@ class TaskCreatePage(QWidget):
             self._active_scan_request = self.query_runner.submit(load)
             return
         try:
-            products = scan_product_folders(self.account_directory.path)
+            products = scan_product_folders(
+                self.account_directory.path,
+                check_product_code=check_product_code,
+            )
         except Exception as exc:
             QMessageBox.warning(self, "扫描失败", str(exc))
             return
@@ -706,13 +566,14 @@ class TaskCreatePage(QWidget):
                 self.account_directory.source_date,
                 product.product_code,
             )
-            self.states[product.product_code] = ProductDraftState(
+            self.states[product.path] = ProductDraftState(
                 product_code=product.product_code,
                 path=product.path,
                 garments=list(product.garments),
                 models=list(product.models),
                 errors=list(product.errors),
                 existing_tasks=existing,
+                code_info=product.code_info,
             )
         self._refresh_product_table()
         self._finish_scan_selection()
@@ -726,15 +587,16 @@ class TaskCreatePage(QWidget):
         products, existing = result
         self.states = {}
         for product in products:
-            self.states[product.product_code] = ProductDraftState(
+            self.states[product.path] = ProductDraftState(
                 product_code=product.product_code,
                 path=product.path,
                 garments=list(product.garments),
                 models=list(product.models),
                 errors=list(product.errors),
                 existing_tasks=list(
-                    existing.get(product.product_code, [])
+                    existing.get(product.path, [])
                 ),
+                code_info=product.code_info,
             )
         self._refresh_product_table()
         self._finish_scan_selection()
@@ -766,9 +628,15 @@ class TaskCreatePage(QWidget):
         self.product_table.blockSignals(True)
         self.product_table.setRowCount(0)
         selectable = 0
+        unrecognized = 0
+        project = self.project_combo.currentData()
+        check_product_code = bool(project) and project[0] == "internal"
         for state in sorted(
             self.states.values(),
-            key=lambda item: item.product_code.casefold(),
+            key=lambda item: (
+                item.product_code.casefold(),
+                str(item.path).casefold(),
+            ),
         ):
             row = self.product_table.rowCount()
             self.product_table.insertRow(row)
@@ -787,10 +655,22 @@ class TaskCreatePage(QWidget):
             )
             if can_select:
                 selectable += 1
+            code_invalid = check_product_code and state.code_info is None
+            if code_invalid:
+                unrecognized += 1
+            if code_invalid:
+                status_text = "货号不符"
+            elif can_select:
+                status_text = "可创建"
+            else:
+                status_text = "需处理"
+            status_item = QTableWidgetItem(status_text)
+            if state.errors:
+                status_item.setToolTip("；".join(state.errors))
             self.product_table.setItem(
                 row,
                 0,
-                QTableWidgetItem("可创建" if can_select else "需处理"),
+                status_item,
             )
             self.product_table.setItem(row, 1, check)
             values = (
@@ -813,11 +693,14 @@ class TaskCreatePage(QWidget):
                 )
             self.product_table.item(row, 1).setData(
                 Qt.ItemDataRole.UserRole,
-                state.product_code,
+                str(state.path),
             )
-        self.scan_summary.setText(
-            f"共 {len(self.states)} 个货号，可直接创建 {selectable} 个"
-        )
+        summary = f"共 {len(self.states)} 个货号，可直接创建 {selectable} 个"
+        if unrecognized:
+            summary += (
+                f"；{unrecognized} 个货号格式不符，未识别（仅提示）"
+            )
+        self.scan_summary.setText(summary)
         self.product_table.blockSignals(False)
         self._update_select_header()
 
@@ -862,16 +745,19 @@ class TaskCreatePage(QWidget):
         self.product_table.blockSignals(False)
         self._update_select_header()
 
-    def _selected_product_code(self) -> str | None:
+    def _selected_state_key(self) -> Path | None:
         row = self.product_table.currentRow()
         if row < 0:
             return None
         item = self.product_table.item(row, 1)
-        return str(item.data(Qt.ItemDataRole.UserRole)) if item else None
+        if item is None:
+            return None
+        raw = item.data(Qt.ItemDataRole.UserRole)
+        return Path(raw) if raw else None
 
     def _product_selected(self) -> None:
-        code = self._selected_product_code()
-        self.current_state = self.states.get(code) if code else None
+        key = self._selected_state_key()
+        self.current_state = self.states.get(key) if key else None
         self._show_state()
 
     def _show_state(self) -> None:
@@ -943,17 +829,6 @@ class TaskCreatePage(QWidget):
         _message: str,
     ) -> None:
         self._asset_thumbnail_contexts.pop(request_id, None)
-
-    def _clear_pair_preview(self) -> None:
-        while self.pair_preview_layout.count():
-            item = self.pair_preview_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
-        for row in range(self.pair_preview_layout.rowCount()):
-            self.pair_preview_layout.setRowStretch(row, 0)
-        self.pair_cards.clear()
-        self.selected_pair_model_index = None
 
     def _selected_paths(self, role: str) -> list[Path]:
         widget = self.garment_list if role == "garment" else self.model_list
@@ -1086,15 +961,6 @@ class TaskCreatePage(QWidget):
         state.manual_pairs.clear()
         self._show_state()
 
-    def _pairing_changed(self) -> None:
-        self._update_mode_visibility()
-        self._refresh_pair_preview()
-
-    def _update_mode_visibility(self) -> None:
-        self.pairing_tools.setCurrentIndex(
-            1 if self.mode_combo.currentData() == PAIRING_MANUAL else 0
-        )
-
     def _current_pairs(self, state: ProductDraftState | None = None):
         current = state or self.current_state
         if current is None:
@@ -1114,121 +980,20 @@ class TaskCreatePage(QWidget):
             current.manual_pairs,
         )
 
-    def _refresh_pair_preview(self) -> None:
-        state = self.current_state
-        if state is None:
-            return
-        result = self._current_pairs()
-        self._clear_pair_preview()
-        if result is None:
-            return
-        if result.errors:
-            self.pair_summary.setText("暂不能创建：" + "；".join(result.errors[:5]))
-            self.pair_summary.setStyleSheet("color:#b23a48;")
-            return
-        grouped: dict[int, list[int]] = {}
-        for pair in result.pairs:
-            grouped.setdefault(pair.model_index, []).append(
-                pair.garment_index
-            )
-        manual = self.mode_combo.currentData() == PAIRING_MANUAL
-        for position, model_index in enumerate(sorted(grouped)):
-            model_path = state.models[model_index]
-            garment_paths = [
-                state.garments[index]
-                for index in dict.fromkeys(grouped[model_index])
-            ]
-            card = PairPreviewCard(
-                model_path,
-                garment_paths,
-                index=model_index,
-                selectable=manual,
-                thumbnail_loader=self.thumbnail_loader,
-            )
-            card.selected.connect(self._select_manual_pair)
-            self.pair_cards.append(card)
-            self.pair_preview_layout.addWidget(
-                card,
-                position // 4,
-                position % 4,
-            )
-        if self.pair_cards:
-            self.pair_preview_layout.setRowStretch(
-                (len(self.pair_cards) + 3) // 4,
-                1,
-            )
-        self.pair_summary.setText(
-            f"将创建 {len(grouped)} 个子任务，共引用 {len(result.pairs)} 组衣服。"
-        )
-        self.pair_summary.setStyleSheet("color:#2a7a50;")
-
-    def _select_manual_pair(self, model_index: int) -> None:
-        if self.mode_combo.currentData() != PAIRING_MANUAL:
-            return
-        self.selected_pair_model_index = model_index
-        for card in self.pair_cards:
-            card.set_selected(card.index == model_index)
-
-    def _add_manual_pair(self) -> None:
-        state = self.current_state
-        if state is None:
-            return
-        model_items = self.model_list.selectedItems()
-        garment_items = self.garment_list.selectedItems()
-        if len(model_items) != 1 or not garment_items:
-            QMessageBox.information(
-                self,
-                "选择不完整",
-                "请选择 1 张模特图和至少 1 张衣服图。",
-            )
-            return
-        model_path = Path(model_items[0].data(Qt.ItemDataRole.UserRole))
-        model_index = state.models.index(model_path)
-        for garment_item in garment_items:
-            garment_path = Path(
-                garment_item.data(Qt.ItemDataRole.UserRole)
-            )
-            pair = PairingInput(
-                state.garments.index(garment_path),
-                model_index,
-            )
-            if pair not in state.manual_pairs:
-                state.manual_pairs.append(pair)
-        self.selected_pair_model_index = model_index
-        self._refresh_pair_preview()
-        self._select_manual_pair(model_index)
-
-    def _remove_manual_pair(self) -> None:
-        state = self.current_state
-        if state is None:
-            return
-        model_index = self.selected_pair_model_index
-        if model_index is None:
-            QMessageBox.information(
-                self,
-                "尚未选择配对",
-                "请先点击要移除的配对卡片。",
-            )
-            return
-        state.manual_pairs[:] = [
-            pair
-            for pair in state.manual_pairs
-            if pair.model_index != model_index
-        ]
-        self.selected_pair_model_index = None
-        self._refresh_pair_preview()
-
-    def _selected_codes(self) -> list[str]:
-        return [
-            str(item.data(Qt.ItemDataRole.UserRole))
-            for row in range(self.product_table.rowCount())
-            if (item := self.product_table.item(row, 1)) is not None
-            and item.checkState() == Qt.CheckState.Checked
-        ]
+    def _selected_keys(self) -> list[Path]:
+        keys: list[Path] = []
+        for row in range(self.product_table.rowCount()):
+            item = self.product_table.item(row, 1)
+            if item is None or item.checkState() != Qt.CheckState.Checked:
+                continue
+            raw = item.data(Qt.ItemDataRole.UserRole)
+            if raw:
+                keys.append(Path(raw))
+        return keys
 
     def _create_selected(self) -> None:
-        codes = self._selected_codes()
-        if not codes:
+        keys = self._selected_keys()
+        if not keys:
             QMessageBox.warning(self, "未选择货号", "请至少勾选一个货号。")
             return
         account_directory = self.account_directory
@@ -1247,10 +1012,10 @@ class TaskCreatePage(QWidget):
         if is_urgent:
             new_urgent_count = sum(
                 1
-                for code in codes
+                for key in keys
                 if not (
-                    self.states[code].existing_tasks
-                    and self.states[code].existing_tasks[0].is_urgent
+                    self.states[key].existing_tasks
+                    and self.states[key].existing_tasks[0].is_urgent
                 )
             )
             remaining = self.repository.remaining_urgent_quota(
@@ -1268,53 +1033,53 @@ class TaskCreatePage(QWidget):
         answer = QMessageBox.question(
             self,
             "确认创建",
-            f"确认创建 {len(codes)} 个总任务吗？",
+            f"确认创建 {len(keys)} 个总任务吗？",
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        validated: list[tuple[str, ProductDraftState, object]] = []
-        for code in codes:
-            state = self.states[code]
+        validated: list[tuple[ProductDraftState, object]] = []
+        for key in keys:
+            state = self.states[key]
             if state.errors:
-                self.product_table.selectRow(self._row_for_code(code))
+                self.product_table.selectRow(self._row_for_key(key))
                 QMessageBox.warning(
                     self,
                     "货号资料不完整",
-                    f"{code}：{'；'.join(state.errors)}",
+                    f"{state.product_code}：{'；'.join(state.errors)}",
                 )
                 return
             if not state.garments or not state.models:
-                self.product_table.selectRow(self._row_for_code(code))
+                self.product_table.selectRow(self._row_for_key(key))
                 QMessageBox.warning(
                     self,
                     "缺少素材",
-                    f"{code}：衣服图和模特图不能为空",
+                    f"{state.product_code}：衣服图和模特图不能为空",
                 )
                 return
             if len(state.garments) > 13:
-                self.product_table.selectRow(self._row_for_code(code))
+                self.product_table.selectRow(self._row_for_key(key))
                 QMessageBox.warning(
                     self,
                     "衣服图过多",
-                    f"{code}：单个模特任务最多 13 张衣服图",
+                    f"{state.product_code}：单个模特任务最多 13 张衣服图",
                 )
                 return
             result = self._current_pairs(state)
             if result is None or result.errors:
-                self.product_table.selectRow(self._row_for_code(code))
+                self.product_table.selectRow(self._row_for_key(key))
                 QMessageBox.warning(
                     self,
                     "配对失败",
-                    f"{code}："
+                    f"{state.product_code}："
                     + "；".join(
                         result.errors if result else ["配对失败"]
                     ),
                 )
                 return
-            validated.append((code, state, result))
+            validated.append((state, result))
         created = 0
         try:
-            for code, state, result in validated:
+            for state, result in validated:
                 assets = project_assets(
                     state.path,
                     state.garments,
@@ -1376,10 +1141,10 @@ class TaskCreatePage(QWidget):
         )
         self._scan_directory()
 
-    def _row_for_code(self, code: str) -> int:
+    def _row_for_key(self, key: Path) -> int:
         for row in range(self.product_table.rowCount()):
             item = self.product_table.item(row, 1)
-            if item.data(Qt.ItemDataRole.UserRole) == code:
+            if item.data(Qt.ItemDataRole.UserRole) == str(key):
                 return row
         return 0
 

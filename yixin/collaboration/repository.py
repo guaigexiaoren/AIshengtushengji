@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import queue
 import re
+import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
@@ -98,6 +100,10 @@ class StateConflictError(CentralRepositoryError):
     pass
 
 
+class GenerationSlotBusyError(StateConflictError):
+    """账号并发名额已满，排队轮次应保持排队稍后重试。"""
+
+
 @dataclass(frozen=True)
 class MySQLConfig:
     host: str
@@ -107,28 +113,83 @@ class MySQLConfig:
     password: str
     charset: str = "utf8mb4"
 
-    def to_safe_dict(self) -> dict[str, Any]:
-        return {
-            "host": self.host,
-            "port": self.port,
-            "database": self.database,
-            "user": self.user,
-            "charset": self.charset,
-        }
-
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+class _ConnectionPool:
+    """复用小数量 MySQL 连接，避免每次查询都重新握手认证。"""
+
+    def __init__(self, factory, max_size: int = 8) -> None:
+        self._factory = factory
+        self._max_size = max_size
+        self._free: queue.LifoQueue = queue.LifoQueue(maxsize=max_size)
+        self._lock = threading.Lock()
+        self._created = 0
+
+    def acquire(self) -> Connection:
+        while True:
+            try:
+                connection = self._free.get_nowait()
+            except queue.Empty:
+                break
+            if self._alive(connection):
+                return connection
+            self._discard(connection)
+        with self._lock:
+            can_create = self._created < self._max_size
+            if can_create:
+                self._created += 1
+        if can_create:
+            try:
+                return self._factory()
+            except Exception:
+                with self._lock:
+                    self._created -= 1
+                raise
+        try:
+            connection = self._free.get(timeout=30)
+        except queue.Empty as exc:
+            raise CentralRepositoryError(
+                "等待数据库连接超时，请稍后重试"
+            ) from exc
+        if self._alive(connection):
+            return connection
+        self._discard(connection)
+        return self.acquire()
+
+    def release(self, connection: Connection) -> None:
+        try:
+            self._free.put_nowait(connection)
+        except queue.Full:
+            self._discard(connection)
+
+    @staticmethod
+    def _alive(connection: Connection) -> bool:
+        try:
+            connection.ping(reconnect=False)
+            return True
+        except Exception:
+            return False
+
+    def _discard(self, connection: Connection) -> None:
+        with self._lock:
+            self._created = max(0, self._created - 1)
+        try:
+            connection.close()
+        except Exception:
+            pass
+
+
 class MySQLCentralRepository:
     def __init__(self, config: MySQLConfig) -> None:
         self.config = config
+        self._pool = _ConnectionPool(self._connect, max_size=16)
 
-    @contextmanager
-    def connection(self) -> Iterator[Connection]:
+    def _connect(self) -> Connection:
         try:
-            connection = pymysql.connect(
+            return pymysql.connect(
                 host=self.config.host,
                 port=self.config.port,
                 user=self.config.user,
@@ -145,14 +206,21 @@ class MySQLCentralRepository:
             raise CentralRepositoryError(
                 f"无法连接内网数据库：{_mysql_error_message(exc)}"
             ) from exc
+
+    @contextmanager
+    def connection(self) -> Iterator[Connection]:
+        connection = self._pool.acquire()
         try:
             yield connection
             connection.commit()
         except Exception:
-            connection.rollback()
+            try:
+                connection.rollback()
+            except Exception:
+                pass
             raise
         finally:
-            connection.close()
+            self._pool.release(connection)
 
     def test_connection(self) -> dict[str, Any]:
         try:
@@ -472,6 +540,18 @@ class MySQLCentralRepository:
             "generation_attempts",
             "idx_attempts_created_id",
             "(created_at, id)",
+        )
+        _add_index_if_missing(
+            cursor,
+            "generation_results",
+            "idx_generation_results_result_path",
+            "(relative_path)",
+        )
+        _add_index_if_missing(
+            cursor,
+            "generation_results",
+            "idx_generation_results_thumb_path",
+            "(thumbnail_relative_path)",
         )
         cursor.execute(
             """
@@ -1300,37 +1380,6 @@ class MySQLCentralRepository:
                     ),
                 )
 
-    def set_user_display_name(
-        self,
-        actor: AuthUser,
-        user_id: int,
-        display_name: str,
-    ) -> None:
-        if actor.role != ROLE_ADMIN:
-            raise PermissionDeniedError("只有管理员可以修改账号名称")
-        clean = _validate_display_name(display_name)
-        with self.connection() as connection:
-            with connection.cursor() as cursor:
-                cursor.execute(
-                    """
-                    SELECT id FROM users
-                    WHERE display_name = %s AND id <> %s
-                      AND deleted_at IS NULL
-                    LIMIT 1
-                    """,
-                    (clean, user_id),
-                )
-                if cursor.fetchone() is not None:
-                    raise StateConflictError("显示名称或项目名已被其他账号使用")
-                cursor.execute(
-                    """
-                    UPDATE users
-                    SET display_name = %s, updated_at = %s
-                    WHERE id = %s AND deleted_at IS NULL
-                    """,
-                    (clean, utc_now(), user_id),
-                )
-
     def update_user(
         self,
         actor: AuthUser,
@@ -1984,15 +2033,17 @@ class MySQLCentralRepository:
                             (actor.id,),
                         )
                         quota = int(cursor.fetchone()["urgent_quota_per_day"])
+                        # 用锁定读取统计，避免 REPEATABLE READ 下读到旧快照导致超额。
                         cursor.execute(
                             """
-                            SELECT COUNT(*) AS count FROM projects
+                            SELECT id FROM projects
                             WHERE owner_id = %s AND urgent_date = %s
                               AND is_urgent = 1
+                            FOR UPDATE
                             """,
                             (actor.id, urgent_day),
                         )
-                        if int(cursor.fetchone()["count"]) >= quota:
+                        if len(cursor.fetchall()) >= quota:
                             raise StateConflictError(
                                 f"今日加急额度已用完（上限 {quota} 个）"
                             )
@@ -2595,7 +2646,11 @@ class MySQLCentralRepository:
                     LEFT JOIN project_tasks t
                       ON t.project_id = p.id AND t.status <> 'expanded'
                     WHERE p.owner_id = %s AND p.source_date = %s
-                      AND p.product_code = %s AND p.status <> %s
+                      AND (
+                        p.product_code = %s
+                        OR p.product_code LIKE %s
+                      )
+                      AND p.status <> %s
                     GROUP BY p.id, owner.display_name
                     ORDER BY p.id DESC
                     """,
@@ -2605,6 +2660,7 @@ class MySQLCentralRepository:
                         owner_id,
                         source_date,
                         product_code,
+                        f"{product_code}_",
                         PROJECT_CANCELLED,
                     ),
                 )
@@ -2620,81 +2676,6 @@ class MySQLCentralRepository:
                     (project_id,),
                 )
                 return [_project_task(row) for row in cursor.fetchall()]
-
-    def get_project_draft(self, project_id: int) -> ProjectDraft | None:
-        with self.connection() as connection:
-            with connection.cursor() as cursor:
-                project = self._project_row(cursor, project_id)
-                if project is None:
-                    return None
-                cursor.execute(
-                    """
-                    SELECT * FROM project_assets
-                    WHERE project_id = %s
-                    ORDER BY role = 'model', id
-                    """,
-                    (project_id,),
-                )
-                asset_rows = cursor.fetchall()
-                cursor.execute(
-                    """
-                    SELECT garment_asset_id, model_asset_id
-                    FROM project_tasks
-                    WHERE project_id = %s
-                    ORDER BY task_no
-                    """,
-                    (project_id,),
-                )
-                task_rows = cursor.fetchall()
-        assets = tuple(
-            ProjectAssetInput(
-                role=row["role"],
-                relative_path=row["relative_path"],
-                original_name=row["original_name"],
-                content_hash=row["content_hash"],
-                mime=row["mime"],
-                width=int(row["width"]),
-                height=int(row["height"]),
-            )
-            for row in asset_rows
-        )
-        garment_indexes = {
-            int(row["id"]): index
-            for index, row in enumerate(
-                asset for asset in asset_rows if asset["role"] == "garment"
-            )
-        }
-        model_indexes = {
-            int(row["id"]): index
-            for index, row in enumerate(
-                asset for asset in asset_rows if asset["role"] == "model"
-            )
-        }
-        pairs = tuple(
-            PairingInput(
-                garment_indexes[int(row["garment_asset_id"])],
-                model_indexes[int(row["model_asset_id"])],
-            )
-            for row in task_rows
-        )
-        return ProjectDraft(
-            project_code=project["project_code"],
-            name=project["name"],
-            deadline=project["deadline"],
-            priority=project["priority"],
-            project_relative_root=project["project_relative_root"],
-            pairing_mode=project["pairing_mode"],
-            assets=assets,
-            pairs=pairs,
-            brand_platform=project["brand_platform"],
-            category=project["category"],
-            note=project["note"],
-            source_date=project.get("source_date"),
-            product_code=project.get("product_code") or "",
-            project_scope=project.get("project_scope") or "internal",
-            access_project_name=project.get("project_name") or "",
-            is_urgent=bool(project.get("is_urgent")),
-        )
 
     def list_board_tasks(
         self,
@@ -3120,17 +3101,31 @@ class MySQLCentralRepository:
                 )
                 cursor.execute(
                     """
-                    UPDATE project_tasks
-                    SET status = %s, updated_at = %s
-                    WHERE id = %s AND status = %s
+                    SELECT COUNT(*) AS count FROM generation_attempts
+                    WHERE task_id = %s AND id <> %s
+                      AND status IN (%s, %s)
                     """,
                     (
-                        TASK_CLAIMED,
-                        now,
                         int(attempt["task_id"]),
-                        TASK_WORKING,
+                        attempt_id,
+                        ATTEMPT_QUEUED,
+                        ATTEMPT_RUNNING,
                     ),
                 )
+                if int(cursor.fetchone()["count"]) == 0:
+                    cursor.execute(
+                        """
+                        UPDATE project_tasks
+                        SET status = %s, updated_at = %s
+                        WHERE id = %s AND status = %s
+                        """,
+                        (
+                            TASK_CLAIMED,
+                            now,
+                            int(attempt["task_id"]),
+                            TASK_WORKING,
+                        ),
+                    )
                 self._update_project_status(
                     cursor,
                     int(attempt["project_id"]),
@@ -3551,36 +3546,29 @@ class MySQLCentralRepository:
                         )
                     attempt_id: int | None = None
                     if not pair.skipped:
-                        cursor.execute(
-                            """
-                            INSERT INTO generation_attempts(
-                                task_id, attempt_no, operator_id, model,
-                                prompt_text, aspect_ratio, resolution, n,
-                                status, source_revision, unit_price,
-                                requested_provider_code,
-                                requested_provider_name, created_at
-                            ) VALUES (
-                                %s, 1, %s, %s, %s, %s, %s, %s,
-                                %s, %s, %s, %s, %s, %s
-                            )
-                            """,
-                            (
-                                child_task_id,
-                                actor.id,
-                                pair.model,
-                                prompt,
-                                pair.aspect_ratio,
-                                pair.resolution,
-                                pair.n,
-                                ATTEMPT_QUEUED,
-                                int(source["source_revision"] or 1),
-                                pair.unit_price,
-                                pair.requested_provider_code,
-                                pair.requested_provider_name,
-                                now,
+                        attempt_id = self._insert_attempt(
+                            cursor,
+                            task_id=child_task_id,
+                            attempt_no=1,
+                            operator_id=actor.id,
+                            model=pair.model,
+                            prompt_text=prompt,
+                            aspect_ratio=pair.aspect_ratio,
+                            resolution=pair.resolution,
+                            n=pair.n,
+                            status=ATTEMPT_QUEUED,
+                            source_revision=int(
+                                source["source_revision"] or 1
+                            ),
+                            unit_price=pair.unit_price,
+                            created_at=now,
+                            requested_provider_code=(
+                                pair.requested_provider_code
+                            ),
+                            requested_provider_name=(
+                                pair.requested_provider_name
                             ),
                         )
-                        attempt_id = int(cursor.lastrowid)
                         self._event(
                             cursor,
                             int(source["project_id"]),
@@ -3695,89 +3683,6 @@ class MySQLCentralRepository:
                 row["max_generation_concurrency"]
             ),
         }
-
-    def set_subtask_urgent(
-        self,
-        task_id: int,
-        actor: AuthUser,
-        urgent: bool,
-    ) -> None:
-        if actor.role not in (ROLE_OPERATIONS, ROLE_ADMIN):
-            raise PermissionDeniedError("只有运营或管理员可以设置加急")
-        today = date.today()
-        now = utc_now()
-        with self.connection() as connection:
-            with connection.cursor() as cursor:
-                task = self._task_row_for_update(cursor, task_id)
-                if actor.role != ROLE_ADMIN and int(task["owner_id"]) != actor.id:
-                    raise PermissionDeniedError("只能加急自己提交的子任务")
-                if task["status"] in (
-                    TASK_AWAITING_ACCEPTANCE,
-                    TASK_APPROVED,
-                    TASK_CANCELLED,
-                ):
-                    raise StateConflictError("当前子任务状态不能修改加急")
-                if bool(task["is_urgent"]) == urgent:
-                    return
-                if urgent:
-                    cursor.execute(
-                        """
-                        SELECT urgent_quota_per_day
-                        FROM users WHERE id = %s AND deleted_at IS NULL
-                        """,
-                        (task["owner_id"],),
-                    )
-                    quota = int(cursor.fetchone()["urgent_quota_per_day"])
-                    cursor.execute(
-                        """
-                        SELECT COUNT(*) AS count
-                        FROM project_tasks t
-                        JOIN projects p ON p.id = t.project_id
-                        WHERE p.owner_id = %s
-                          AND t.is_urgent = 1
-                          AND t.urgent_date = %s
-                          AND t.status <> %s
-                        """,
-                        (task["owner_id"], today, TASK_CANCELLED),
-                    )
-                    if int(cursor.fetchone()["count"]) >= quota:
-                        raise StateConflictError(
-                            f"今日加急额度已用完（{quota} 个）"
-                        )
-                cursor.execute(
-                    """
-                    UPDATE project_tasks
-                    SET is_urgent = %s,
-                        urgent_date = %s,
-                        urgent_by = %s,
-                        updated_at = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        int(urgent),
-                        today if urgent else None,
-                        actor.id if urgent else None,
-                        now,
-                        task_id,
-                    ),
-                )
-                self._update_project_status(
-                    cursor,
-                    int(task["project_id"]),
-                )
-                self._event(
-                    cursor,
-                    int(task["project_id"]),
-                    task_id,
-                    actor.id,
-                    "subtask_urgent" if urgent else "subtask_urgent_cleared",
-                    task["status"],
-                    task["status"],
-                    {
-                        "urgent": urgent,
-                        "urgent_date": today.isoformat() if urgent else "",
-                    },
-                )
 
     def set_project_urgent(
         self,
@@ -4020,6 +3925,175 @@ class MySQLCentralRepository:
                     },
                 )
 
+    @staticmethod
+    def _next_attempt_no(cursor, task_id: int) -> int:
+        cursor.execute(
+            "SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_no "
+            "FROM generation_attempts WHERE task_id = %s",
+            (task_id,),
+        )
+        return int(cursor.fetchone()["next_no"])
+
+    @staticmethod
+    def _insert_attempt(
+        cursor,
+        *,
+        task_id: int,
+        attempt_no: int,
+        operator_id: int,
+        model: str,
+        prompt_text: str,
+        aspect_ratio: str,
+        resolution: str | None,
+        n: int,
+        status: str,
+        source_revision: int,
+        unit_price: Decimal,
+        created_at: datetime,
+        started_at: datetime | None = None,
+        requested_provider_code: str = "",
+        requested_provider_name: str = "",
+    ) -> int:
+        cursor.execute(
+            """
+            INSERT INTO generation_attempts(
+                task_id, attempt_no, operator_id, model, prompt_text,
+                aspect_ratio, resolution, n, status, source_revision,
+                unit_price, requested_provider_code, requested_provider_name,
+                created_at, started_at
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s
+            )
+            """,
+            (
+                task_id,
+                attempt_no,
+                operator_id,
+                model,
+                prompt_text,
+                aspect_ratio,
+                resolution,
+                n,
+                status,
+                source_revision,
+                unit_price,
+                requested_provider_code,
+                requested_provider_name,
+                created_at,
+                started_at,
+            ),
+        )
+        return int(cursor.lastrowid)
+
+    @staticmethod
+    def _assign_task_to_actor(
+        cursor,
+        task_id: int,
+        actor_id: int,
+        now: datetime,
+        *,
+        keep_claimed_at: bool = False,
+    ) -> None:
+        claimed_at_sql = (
+            "COALESCE(claimed_at, %s)" if keep_claimed_at else "%s"
+        )
+        cursor.execute(
+            f"""
+            UPDATE project_tasks
+            SET assignee_id = %s, status = %s,
+                claimed_at = {claimed_at_sql}, updated_at = %s
+            WHERE id = %s
+            """,
+            (actor_id, TASK_CLAIMED, now, now, task_id),
+        )
+
+    @staticmethod
+    def _update_task_generation_params(
+        cursor,
+        task_id: int,
+        *,
+        prompt: str,
+        model: str,
+        aspect_ratio: str,
+        resolution: str | None,
+        n: int,
+        now: datetime,
+        start_working: bool = False,
+        work_started_at: datetime | None = None,
+    ) -> None:
+        if start_working:
+            cursor.execute(
+                """
+                UPDATE project_tasks
+                SET status = %s, prompt_text = %s, model = %s,
+                    aspect_ratio = %s, resolution = %s, n = %s,
+                    work_started_at = %s, updated_at = %s
+                WHERE id = %s
+                """,
+                (
+                    TASK_WORKING,
+                    prompt,
+                    model,
+                    aspect_ratio,
+                    resolution,
+                    n,
+                    work_started_at,
+                    now,
+                    task_id,
+                ),
+            )
+            return
+        cursor.execute(
+            """
+            UPDATE project_tasks
+            SET prompt_text = %s, model = %s, aspect_ratio = %s,
+                resolution = %s, n = %s, updated_at = %s
+            WHERE id = %s
+            """,
+            (prompt, model, aspect_ratio, resolution, n, now, task_id),
+        )
+
+    @staticmethod
+    def _attempt_record(
+        *,
+        attempt_id: int,
+        task_id: int,
+        attempt_no: int,
+        actor: AuthUser,
+        model: str,
+        prompt_text: str,
+        aspect_ratio: str,
+        resolution: str | None,
+        n: int,
+        status: str,
+        source_revision: int,
+        unit_price: Decimal,
+        created_at: datetime,
+        operator_name: str = "",
+        requested_provider_code: str = "",
+        requested_provider_name: str = "",
+    ) -> GenerationAttempt:
+        return GenerationAttempt(
+            id=attempt_id,
+            task_id=task_id,
+            attempt_no=attempt_no,
+            operator_id=actor.id,
+            model=model,
+            prompt_text=prompt_text,
+            aspect_ratio=aspect_ratio,
+            resolution=resolution,
+            n=n,
+            status=status,
+            source_revision=source_revision,
+            unit_price=unit_price,
+            generated_image_count=0,
+            operator_name=operator_name,
+            created_at=created_at,
+            requested_provider_code=requested_provider_code,
+            requested_provider_name=requested_provider_name,
+        )
+
     def create_generation_attempt(
         self,
         task_id: int,
@@ -4053,79 +4127,49 @@ class MySQLCentralRepository:
                 ):
                     raise PermissionDeniedError("请先领取该任务")
                 if actor.role == ROLE_ADMIN and not task["assignee_id"]:
-                    cursor.execute(
-                        """
-                        UPDATE project_tasks
-                        SET assignee_id = %s, status = %s,
-                            claimed_at = COALESCE(claimed_at, %s),
-                            updated_at = %s
-                        WHERE id = %s
-                        """,
-                        (actor.id, TASK_CLAIMED, now, now, task_id),
+                    self._assign_task_to_actor(
+                        cursor,
+                        task_id,
+                        actor.id,
+                        now,
+                        keep_claimed_at=True,
                     )
                     task["status"] = TASK_CLAIMED
                 if task["status"] not in (TASK_CLAIMED, TASK_WORKING, TASK_RETURNED):
                     raise StateConflictError("当前任务状态不能生成图片")
                 self._assert_generation_slot(cursor, actor.id)
-                cursor.execute(
-                    "SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_no "
-                    "FROM generation_attempts WHERE task_id = %s",
-                    (task_id,),
+                attempt_no = self._next_attempt_no(cursor, task_id)
+                attempt_id = self._insert_attempt(
+                    cursor,
+                    task_id=task_id,
+                    attempt_no=attempt_no,
+                    operator_id=actor.id,
+                    model=model,
+                    prompt_text=prompt,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                    n=n,
+                    status=ATTEMPT_RUNNING,
+                    source_revision=int(task.get("source_revision") or 1),
+                    unit_price=unit_price,
+                    created_at=now,
+                    started_at=now,
+                    requested_provider_code=requested_provider_code,
+                    requested_provider_name=requested_provider_name,
                 )
-                attempt_no = int(cursor.fetchone()["next_no"])
-                cursor.execute(
-                    """
-                    INSERT INTO generation_attempts(
-                        task_id, attempt_no, operator_id, model, prompt_text,
-                        aspect_ratio, resolution, n, status, source_revision,
-                        unit_price, requested_provider_code,
-                        requested_provider_name,
-                        created_at, started_at
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s
-                    )
-                    """,
-                    (
-                        task_id,
-                        attempt_no,
-                        actor.id,
-                        model,
-                        prompt,
-                        aspect_ratio,
-                        resolution,
-                        n,
-                        ATTEMPT_RUNNING,
-                        int(task.get("source_revision") or 1),
-                        unit_price,
-                        requested_provider_code,
-                        requested_provider_name,
-                        now,
-                        now,
-                    ),
-                )
-                attempt_id = int(cursor.lastrowid)
                 previous_status = task["status"]
                 work_started_at = task["work_started_at"] or now
-                cursor.execute(
-                    """
-                    UPDATE project_tasks
-                    SET status = %s, prompt_text = %s, model = %s,
-                        aspect_ratio = %s, resolution = %s, n = %s,
-                        work_started_at = %s, updated_at = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        TASK_WORKING,
-                        prompt,
-                        model,
-                        aspect_ratio,
-                        resolution,
-                        n,
-                        work_started_at,
-                        now,
-                        task_id,
-                    ),
+                self._update_task_generation_params(
+                    cursor,
+                    task_id,
+                    prompt=prompt,
+                    model=model,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                    n=n,
+                    now=now,
+                    start_working=True,
+                    work_started_at=work_started_at,
                 )
                 self._update_project_status(cursor, int(task["project_id"]))
                 self._event(
@@ -4142,11 +4186,11 @@ class MySQLCentralRepository:
                         "model": model,
                     },
                 )
-        return GenerationAttempt(
-            id=attempt_id,
+        return self._attempt_record(
+            attempt_id=attempt_id,
             task_id=task_id,
             attempt_no=attempt_no,
-            operator_id=actor.id,
+            actor=actor,
             model=model,
             prompt_text=prompt,
             aspect_ratio=aspect_ratio,
@@ -4155,7 +4199,6 @@ class MySQLCentralRepository:
             status=ATTEMPT_RUNNING,
             source_revision=int(task.get("source_revision") or 1),
             unit_price=unit_price,
-            generated_image_count=0,
             created_at=now,
             requested_provider_code=requested_provider_code,
             requested_provider_name=requested_provider_name,
@@ -4195,15 +4238,12 @@ class MySQLCentralRepository:
                 ):
                     raise PermissionDeniedError("请先领取该任务")
                 if actor.role == ROLE_ADMIN and not task["assignee_id"]:
-                    cursor.execute(
-                        """
-                        UPDATE project_tasks
-                        SET assignee_id = %s, status = %s,
-                            claimed_at = COALESCE(claimed_at, %s),
-                            updated_at = %s
-                        WHERE id = %s
-                        """,
-                        (actor.id, TASK_CLAIMED, now, now, task_id),
+                    self._assign_task_to_actor(
+                        cursor,
+                        task_id,
+                        actor.id,
+                        now,
+                        keep_claimed_at=True,
                     )
                     task["status"] = TASK_CLAIMED
                 reopen = (
@@ -4231,58 +4271,33 @@ class MySQLCentralRepository:
                         """,
                         (TASK_CLAIMED, now, task_id),
                     )
-                cursor.execute(
-                    "SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_no "
-                    "FROM generation_attempts WHERE task_id = %s",
-                    (task_id,),
+                attempt_no = self._next_attempt_no(cursor, task_id)
+                attempt_id = self._insert_attempt(
+                    cursor,
+                    task_id=task_id,
+                    attempt_no=attempt_no,
+                    operator_id=actor.id,
+                    model=model,
+                    prompt_text=prompt,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                    n=n,
+                    status=ATTEMPT_QUEUED,
+                    source_revision=int(task["source_revision"] or 1),
+                    unit_price=unit_price,
+                    created_at=now,
+                    requested_provider_code=requested_provider_code,
+                    requested_provider_name=requested_provider_name,
                 )
-                attempt_no = int(cursor.fetchone()["next_no"])
-                cursor.execute(
-                    """
-                    INSERT INTO generation_attempts(
-                        task_id, attempt_no, operator_id, model, prompt_text,
-                        aspect_ratio, resolution, n, status, source_revision,
-                        unit_price, requested_provider_code,
-                        requested_provider_name, created_at
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s
-                    )
-                    """,
-                    (
-                        task_id,
-                        attempt_no,
-                        actor.id,
-                        model,
-                        prompt,
-                        aspect_ratio,
-                        resolution,
-                        n,
-                        ATTEMPT_QUEUED,
-                        int(task["source_revision"] or 1),
-                        unit_price,
-                        requested_provider_code,
-                        requested_provider_name,
-                        now,
-                    ),
-                )
-                attempt_id = int(cursor.lastrowid)
-                cursor.execute(
-                    """
-                    UPDATE project_tasks
-                    SET prompt_text = %s, model = %s, aspect_ratio = %s,
-                        resolution = %s, n = %s, updated_at = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        prompt,
-                        model,
-                        aspect_ratio,
-                        resolution,
-                        n,
-                        now,
-                        task_id,
-                    ),
+                self._update_task_generation_params(
+                    cursor,
+                    task_id,
+                    prompt=prompt,
+                    model=model,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                    n=n,
+                    now=now,
                 )
                 if reopen:
                     self._update_project_status(
@@ -4314,11 +4329,11 @@ class MySQLCentralRepository:
                     task["status"],
                     {"attempt_id": attempt_id, "attempt_no": attempt_no},
                 )
-        return GenerationAttempt(
-            id=attempt_id,
+        return self._attempt_record(
+            attempt_id=attempt_id,
             task_id=task_id,
             attempt_no=attempt_no,
-            operator_id=actor.id,
+            actor=actor,
             model=model,
             prompt_text=prompt,
             aspect_ratio=aspect_ratio,
@@ -4327,9 +4342,8 @@ class MySQLCentralRepository:
             status=ATTEMPT_QUEUED,
             source_revision=int(task["source_revision"] or 1),
             unit_price=unit_price,
-            generated_image_count=0,
-            operator_name=actor.display_name,
             created_at=now,
+            operator_name=actor.display_name,
             requested_provider_code=requested_provider_code,
             requested_provider_name=requested_provider_name,
         )
@@ -4374,10 +4388,8 @@ class MySQLCentralRepository:
                 elif task["status"] == TASK_RETURNED and (
                     int(assignee_id or 0) == actor.id or actor.role == ROLE_ADMIN
                 ):
-                    claimed_here = (
-                        int(assignee_id or 0) != actor.id
-                        and actor.role != ROLE_ADMIN
-                    )
+                    # 管理员接手别人的退回任务时，把任务改派给自己。
+                    claimed_here = int(assignee_id or 0) != actor.id
                 elif int(assignee_id or 0) == actor.id and task["status"] in (
                     TASK_CLAIMED,
                     TASK_WORKING,
@@ -4387,14 +4399,11 @@ class MySQLCentralRepository:
                 else:
                     raise StateConflictError("任务已被其他人员领取")
                 if claimed_here:
-                    cursor.execute(
-                        """
-                        UPDATE project_tasks
-                        SET assignee_id = %s, status = %s,
-                            claimed_at = %s, updated_at = %s
-                        WHERE id = %s
-                        """,
-                        (actor.id, TASK_CLAIMED, now, now, task_id),
+                    self._assign_task_to_actor(
+                        cursor,
+                        task_id,
+                        actor.id,
+                        now,
                     )
                     self._event(
                         cursor,
@@ -4406,58 +4415,33 @@ class MySQLCentralRepository:
                         TASK_CLAIMED,
                         {},
                     )
-                cursor.execute(
-                    "SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_no "
-                    "FROM generation_attempts WHERE task_id = %s",
-                    (task_id,),
+                attempt_no = self._next_attempt_no(cursor, task_id)
+                attempt_id = self._insert_attempt(
+                    cursor,
+                    task_id=task_id,
+                    attempt_no=attempt_no,
+                    operator_id=actor.id,
+                    model=model,
+                    prompt_text=prompt,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                    n=n,
+                    status=ATTEMPT_QUEUED,
+                    source_revision=int(task["source_revision"] or 1),
+                    unit_price=unit_price,
+                    created_at=now,
+                    requested_provider_code=requested_provider_code,
+                    requested_provider_name=requested_provider_name,
                 )
-                attempt_no = int(cursor.fetchone()["next_no"])
-                cursor.execute(
-                    """
-                    INSERT INTO generation_attempts(
-                        task_id, attempt_no, operator_id, model, prompt_text,
-                        aspect_ratio, resolution, n, status, source_revision,
-                        unit_price, requested_provider_code,
-                        requested_provider_name, created_at
-                    ) VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s
-                    )
-                    """,
-                    (
-                        task_id,
-                        attempt_no,
-                        actor.id,
-                        model,
-                        prompt,
-                        aspect_ratio,
-                        resolution,
-                        n,
-                        ATTEMPT_QUEUED,
-                        int(task["source_revision"] or 1),
-                        unit_price,
-                        requested_provider_code,
-                        requested_provider_name,
-                        now,
-                    ),
-                )
-                attempt_id = int(cursor.lastrowid)
-                cursor.execute(
-                    """
-                    UPDATE project_tasks
-                    SET prompt_text = %s, model = %s, aspect_ratio = %s,
-                        resolution = %s, n = %s, updated_at = %s
-                    WHERE id = %s
-                    """,
-                    (
-                        prompt,
-                        model,
-                        aspect_ratio,
-                        resolution,
-                        n,
-                        now,
-                        task_id,
-                    ),
+                self._update_task_generation_params(
+                    cursor,
+                    task_id,
+                    prompt=prompt,
+                    model=model,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                    n=n,
+                    now=now,
                 )
                 self._update_project_status(
                     cursor,
@@ -4478,11 +4462,11 @@ class MySQLCentralRepository:
                         "claimed_here": claimed_here,
                     },
                 )
-        return GenerationAttempt(
-            id=attempt_id,
+        return self._attempt_record(
+            attempt_id=attempt_id,
             task_id=task_id,
             attempt_no=attempt_no,
-            operator_id=actor.id,
+            actor=actor,
             model=model,
             prompt_text=prompt,
             aspect_ratio=aspect_ratio,
@@ -4491,9 +4475,8 @@ class MySQLCentralRepository:
             status=ATTEMPT_QUEUED,
             source_revision=int(task["source_revision"] or 1),
             unit_price=unit_price,
-            generated_image_count=0,
-            operator_name=actor.display_name,
             created_at=now,
+            operator_name=actor.display_name,
             requested_provider_code=requested_provider_code,
             requested_provider_name=requested_provider_name,
         )
@@ -4615,10 +4598,8 @@ class MySQLCentralRepository:
                 elif task["status"] == TASK_RETURNED and (
                     assignee_id == actor.id or actor.role == ROLE_ADMIN
                 ):
-                    claimed_here = (
-                        assignee_id != actor.id
-                        and actor.role != ROLE_ADMIN
-                    )
+                    # 管理员接手别人的退回任务时，把任务改派给自己。
+                    claimed_here = assignee_id != actor.id
                 elif (
                     (assignee_id == actor.id or actor.role == ROLE_ADMIN)
                     and task["status"] in (
@@ -4636,14 +4617,11 @@ class MySQLCentralRepository:
                 ):
                     raise StateConflictError("当前子任务状态不能上传成品")
                 if claimed_here:
-                    cursor.execute(
-                        """
-                        UPDATE project_tasks
-                        SET assignee_id = %s, status = %s,
-                            claimed_at = %s, updated_at = %s
-                        WHERE id = %s
-                        """,
-                        (actor.id, TASK_CLAIMED, now, now, task_id),
+                    self._assign_task_to_actor(
+                        cursor,
+                        task_id,
+                        actor.id,
+                        now,
                     )
                     self._event(
                         cursor,
@@ -4656,37 +4634,23 @@ class MySQLCentralRepository:
                         {"claimed_for_manual_upload": True},
                     )
                 self._assert_generation_slot(cursor, actor.id)
-                cursor.execute(
-                    "SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_no "
-                    "FROM generation_attempts WHERE task_id = %s",
-                    (task_id,),
+                attempt_no = self._next_attempt_no(cursor, task_id)
+                attempt_id = self._insert_attempt(
+                    cursor,
+                    task_id=task_id,
+                    attempt_no=attempt_no,
+                    operator_id=actor.id,
+                    model="manual_ps",
+                    prompt_text=task["prompt_text"],
+                    aspect_ratio=task["aspect_ratio"],
+                    resolution=task["resolution"],
+                    n=0,
+                    status=ATTEMPT_RUNNING,
+                    source_revision=int(task["source_revision"] or 1),
+                    unit_price=Decimal("0"),
+                    created_at=now,
+                    started_at=now,
                 )
-                attempt_no = int(cursor.fetchone()["next_no"])
-                cursor.execute(
-                    """
-                    INSERT INTO generation_attempts(
-                        task_id, attempt_no, operator_id, model, prompt_text,
-                        aspect_ratio, resolution, n, status, source_revision,
-                        unit_price, created_at, started_at
-                    ) VALUES (
-                        %s, %s, %s, 'manual_ps', %s,
-                        %s, %s, 0, %s, %s, 0, %s, %s
-                    )
-                    """,
-                    (
-                        task_id,
-                        attempt_no,
-                        actor.id,
-                        task["prompt_text"],
-                        task["aspect_ratio"],
-                        task["resolution"],
-                        ATTEMPT_RUNNING,
-                        int(task["source_revision"] or 1),
-                        now,
-                        now,
-                    ),
-                )
-                attempt_id = int(cursor.lastrowid)
                 cursor.execute(
                     """
                     UPDATE project_tasks
@@ -4709,11 +4673,11 @@ class MySQLCentralRepository:
                     TASK_WORKING,
                     {"attempt_id": attempt_id, "attempt_no": attempt_no},
                 )
-        return GenerationAttempt(
-            id=attempt_id,
+        return self._attempt_record(
+            attempt_id=attempt_id,
             task_id=task_id,
             attempt_no=attempt_no,
-            operator_id=actor.id,
+            actor=actor,
             model="manual_ps",
             prompt_text=task["prompt_text"],
             aspect_ratio=task["aspect_ratio"],
@@ -4722,7 +4686,6 @@ class MySQLCentralRepository:
             status=ATTEMPT_RUNNING,
             source_revision=int(task["source_revision"] or 1),
             unit_price=Decimal("0"),
-            generated_image_count=0,
             created_at=now,
         )
 
@@ -5599,20 +5562,56 @@ class MySQLCentralRepository:
 
     def recover_stale_generation_attempts(self, hours: int = 24) -> int:
         cutoff = utc_now() - timedelta(hours=hours)
+        now = utc_now()
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
+                    SELECT id, task_id FROM generation_attempts
+                    WHERE status = %s AND started_at < %s
+                    FOR UPDATE
+                    """,
+                    (ATTEMPT_RUNNING, cutoff),
+                )
+                stale = cursor.fetchall()
+                if not stale:
+                    return 0
+                attempt_ids = tuple(int(row["id"]) for row in stale)
+                attempt_placeholders = ", ".join(["%s"] * len(attempt_ids))
+                cursor.execute(
+                    f"""
                     UPDATE generation_attempts
                     SET status = %s,
                         error_code = 'stale_running',
                         error_message = '客户端中断，生成任务已自动结束',
                         finished_at = %s
-                    WHERE status = %s AND started_at < %s
+                    WHERE id IN ({attempt_placeholders})
                     """,
-                    (ATTEMPT_FAILED, utc_now(), ATTEMPT_RUNNING, cutoff),
+                    (ATTEMPT_FAILED, now, *attempt_ids),
                 )
-                return cursor.rowcount
+                task_ids = tuple({int(row["task_id"]) for row in stale})
+                task_placeholders = ", ".join(["%s"] * len(task_ids))
+                cursor.execute(
+                    f"""
+                    SELECT id, project_id FROM project_tasks
+                    WHERE id IN ({task_placeholders}) AND status = %s
+                    """,
+                    (*task_ids, TASK_WORKING),
+                )
+                stale_tasks = cursor.fetchall()
+                cursor.execute(
+                    f"""
+                    UPDATE project_tasks
+                    SET status = %s, updated_at = %s
+                    WHERE id IN ({task_placeholders}) AND status = %s
+                    """,
+                    (TASK_CLAIMED, now, *task_ids, TASK_WORKING),
+                )
+                for project_id in {
+                    int(row["project_id"]) for row in stale_tasks
+                }:
+                    self._update_project_status(cursor, project_id)
+                return len(stale)
 
     def list_results(self, task_id: int) -> list[GenerationResult]:
         with self.connection() as connection:
@@ -5644,6 +5643,81 @@ class MySQLCentralRepository:
                 )
                 return [_generation_result(row) for row in cursor.fetchall()]
 
+    def expired_candidate_results_for_tasks(
+        self,
+        task_ids: Sequence[int],
+    ) -> list[tuple[int, GenerationResult]]:
+        clean_ids = tuple(dict.fromkeys(int(value) for value in task_ids))
+        if not clean_ids:
+            return []
+        placeholders = ", ".join(["%s"] * len(clean_ids))
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT ga.task_id AS task_id, gr.*
+                    FROM generation_results gr
+                    JOIN generation_attempts ga ON ga.id = gr.attempt_id
+                    WHERE ga.task_id IN ({placeholders})
+                      AND gr.is_final = 0
+                      AND gr.expire_at IS NOT NULL AND gr.expire_at <= %s
+                    """,
+                    (*clean_ids, utc_now()),
+                )
+                return [
+                    (int(row["task_id"]), _generation_result(row))
+                    for row in cursor.fetchall()
+                ]
+
+    def task_project_roots(
+        self,
+        task_ids: Sequence[int],
+    ) -> dict[int, str]:
+        clean_ids = tuple(dict.fromkeys(int(value) for value in task_ids))
+        if not clean_ids:
+            return {}
+        placeholders = ", ".join(["%s"] * len(clean_ids))
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT t.id AS id, p.project_relative_root AS root
+                    FROM project_tasks t
+                    JOIN projects p ON p.id = t.project_id
+                    WHERE t.id IN ({placeholders})
+                    """,
+                    clean_ids,
+                )
+                return {
+                    int(row["id"]): str(row["root"])
+                    for row in cursor.fetchall()
+                }
+
+    def result_paths_in_use(
+        self,
+        relative_paths: Sequence[str],
+    ) -> set[str]:
+        clean_paths = tuple(
+            dict.fromkeys(path for path in relative_paths if path)
+        )
+        if not clean_paths:
+            return set()
+        placeholders = ", ".join(["%s"] * len(clean_paths))
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT relative_path AS path FROM generation_results
+                    WHERE relative_path IN ({placeholders})
+                    UNION
+                    SELECT thumbnail_relative_path AS path
+                    FROM generation_results
+                    WHERE thumbnail_relative_path IN ({placeholders})
+                    """,
+                    (*clean_paths, *clean_paths),
+                )
+                return {str(row["path"]) for row in cursor.fetchall()}
+
     def result_path_reference_count(
         self,
         relative_path: str,
@@ -5669,10 +5743,13 @@ class MySQLCentralRepository:
                 )
                 return int(cursor.fetchone()["count"])
 
-    def delete_generation_results(self, result_ids: Sequence[int]) -> None:
+    def delete_generation_results(
+        self,
+        result_ids: Sequence[int],
+    ) -> list[int]:
         clean_ids = tuple(dict.fromkeys(int(value) for value in result_ids))
         if not clean_ids:
-            return
+            return []
         placeholders = ", ".join(["%s"] * len(clean_ids))
         with self.connection() as connection:
             with connection.cursor() as cursor:
@@ -5681,6 +5758,15 @@ class MySQLCentralRepository:
                     f"AND id IN ({placeholders})",
                     clean_ids,
                 )
+                cursor.execute(
+                    f"SELECT id FROM generation_results "
+                    f"WHERE id IN ({placeholders})",
+                    clean_ids,
+                )
+                remaining = {int(row["id"]) for row in cursor.fetchall()}
+                return [
+                    value for value in clean_ids if value not in remaining
+                ]
 
     def list_templates(self, actor: AuthUser) -> list[dict[str, Any]]:
         with self.connection() as connection:
@@ -6050,34 +6136,65 @@ class MySQLCentralRepository:
                 ]
                 provider_query = f"""
                     SELECT
-                        COALESCE(NULLIF(ga.provider_name, ''), '历史/未记录')
-                            AS provider_name,
-                        ga.model,
+                        providers.provider_name,
+                        providers.model,
                         COUNT(DISTINCT p.id) AS project_count,
                         COUNT(DISTINCT t.id) AS task_count,
-                        SUM(ga.status = %s) AS successful_attempt_count,
-                        SUM(ga.status = %s) AS failed_attempt_count,
+                        COUNT(
+                            DISTINCT CASE WHEN t.status = %s
+                                THEN t.id END
+                        ) AS approved_task_count,
                         SUM(
-                            CASE WHEN ga.status = %s
-                                THEN ga.generated_image_count ELSE 0 END
-                        ) AS generated_image_count,
-                        SUM(
-                            CASE WHEN ga.status = %s
-                                THEN ga.generated_image_count * ga.unit_price
-                                ELSE 0 END
-                        ) AS generation_cost
-                    FROM generation_attempts ga
-                    JOIN project_tasks t ON t.id = ga.task_id
+                            CASE WHEN t.status = %s
+                                THEN t.final_quantity ELSE 0 END
+                        ) AS final_image_count,
+                        SUM(providers.successful_attempt_count)
+                            AS successful_attempt_count,
+                        SUM(providers.failed_attempt_count)
+                            AS failed_attempt_count,
+                        SUM(providers.generated_image_count)
+                            AS generated_image_count,
+                        SUM(providers.generation_cost) AS generation_cost
+                    FROM (
+                        SELECT
+                            ga.task_id,
+                            COALESCE(
+                                NULLIF(ga.provider_name, ''),
+                                '历史/未记录'
+                            ) AS provider_name,
+                            ga.model,
+                            SUM(ga.status = %s) AS successful_attempt_count,
+                            SUM(ga.status = %s) AS failed_attempt_count,
+                            SUM(
+                                CASE WHEN ga.status = %s
+                                    THEN ga.generated_image_count
+                                    ELSE 0 END
+                            ) AS generated_image_count,
+                            SUM(
+                                CASE WHEN ga.status = %s
+                                    THEN ga.generated_image_count
+                                        * ga.unit_price
+                                    ELSE 0 END
+                            ) AS generation_cost
+                        FROM generation_attempts ga
+                        JOIN project_tasks t ON t.id = ga.task_id
+                        JOIN projects p ON p.id = t.project_id
+                        WHERE {base_where_sql}
+                          AND ga.status IN (%s, %s)
+                          AND ga.model <> 'manual_ps'
+                        GROUP BY ga.task_id, provider_name, ga.model
+                    ) providers
+                    JOIN project_tasks t ON t.id = providers.task_id
                     JOIN projects p ON p.id = t.project_id
-                    WHERE {base_where_sql}
-                      AND ga.status IN (%s, %s)
-                      AND ga.model <> 'manual_ps'
-                    GROUP BY ga.provider_name, ga.model
-                    ORDER BY generated_image_count DESC, provider_name
+                    GROUP BY providers.provider_name, providers.model
+                    ORDER BY generated_image_count DESC,
+                             providers.provider_name
                 """
                 cursor.execute(
                     provider_query,
                     (
+                        TASK_APPROVED,
+                        TASK_APPROVED,
                         ATTEMPT_SUCCEEDED,
                         ATTEMPT_FAILED,
                         ATTEMPT_SUCCEEDED,
@@ -6098,9 +6215,11 @@ class MySQLCentralRepository:
                             label=f"{row['provider_name']} / {row['model']}",
                             project_count=int(row["project_count"] or 0),
                             task_count=int(row["task_count"] or 0),
-                            approved_task_count=int(row["task_count"] or 0),
+                            approved_task_count=int(
+                                row["approved_task_count"] or 0
+                            ),
                             final_image_count=int(
-                                row["generated_image_count"] or 0
+                                row["final_image_count"] or 0
                             ),
                             generated_image_count=int(
                                 row["generated_image_count"] or 0
@@ -6540,7 +6659,7 @@ class MySQLCentralRepository:
             (user_id, ATTEMPT_RUNNING),
         )
         if int(cursor.fetchone()["count"]) >= limit:
-            raise StateConflictError(
+            raise GenerationSlotBusyError(
                 f"当前账号并发任务已达到上限（{limit} 个）"
             )
 

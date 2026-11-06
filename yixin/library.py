@@ -446,6 +446,12 @@ class LibraryService:
                     raise ValueError(
                         "历史生成结果状态异常，未删除作品"
                     )
+            else:
+                # 成品文件已丢失：把结果恢复为未保存，避免删除后永久无法再保存。
+                self.database.release_saved_task_result(
+                    int(task_id),
+                    saved_path,
+                )
         deleted = self.database.delete_work(work_id)
         if deleted is None:
             return False

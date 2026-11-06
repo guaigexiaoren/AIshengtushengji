@@ -107,11 +107,15 @@ def clear_mysql() -> None:
         with connection.cursor() as cursor:
             cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
             try:
+                # 用 DELETE 而不是 TRUNCATE：TRUNCATE 会隐式提交，失败时无法回滚。
                 for table in DATA_TABLES:
-                    cursor.execute(f"TRUNCATE TABLE `{table}`")
+                    cursor.execute(f"DELETE FROM `{table}`")
             finally:
                 cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
         connection.commit()
+        with connection.cursor() as cursor:
+            for table in DATA_TABLES:
+                cursor.execute(f"ALTER TABLE `{table}` AUTO_INCREMENT = 1")
     except Exception:
         connection.rollback()
         raise

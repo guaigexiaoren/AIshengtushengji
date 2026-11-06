@@ -260,14 +260,17 @@ class SubmissionListPage(QWidget):
         return OptionalDateEdit(placeholder)
 
     def refresh(self) -> None:
+        try:
+            shared_root = self.repository.get_shared_setting("share_root")
+        except Exception:
+            shared_root = None
+        if shared_root:
+            self.resolver = SharedPathResolver(shared_root)
+            self.dual_preview.set_resolver(self.resolver)
         if self.async_mode:
             self._request_project_page()
             return
         try:
-            shared_root = self.repository.get_shared_setting("share_root")
-            if shared_root:
-                self.resolver = SharedPathResolver(shared_root)
-                self.dual_preview.set_resolver(self.resolver)
             self._all_tasks = self.repository.list_board_tasks(
                 self.actor,
                 include_finished=True,
@@ -350,11 +353,10 @@ class SubmissionListPage(QWidget):
         self.task_table.blockSignals(False)
         self.reference_gallery.clear()
         self.result_gallery.clear()
-        self._update_actions()
         query = self._task_query()
         page = PageRequest(
             page=1,
-            page_size=100,
+            page_size=10000,
             sort_field=self._task_sort_field,
             sort_direction=self._task_sort_direction,
         )
@@ -383,7 +385,6 @@ class SubmissionListPage(QWidget):
             if task is not None and task.id == self._active_result_task_id:
                 self.result_gallery.set_task(task, result)
                 self._update_preview_counts()
-                self._update_actions()
 
     def _query_failed(self, request_id: int, message: str) -> None:
         if not self.async_mode or request_id not in (
@@ -394,7 +395,6 @@ class SubmissionListPage(QWidget):
             return
         self.info_line.setText(f"加载失败：{message}")
         QMessageBox.warning(self, "读取任务失败", message)
-        self._update_actions()
 
     def _render_project_page(
         self,
@@ -457,7 +457,6 @@ class SubmissionListPage(QWidget):
             self.reference_preview.set_placeholder("尚无参考图")
             self.result_gallery.set_task(self._empty_task(), [])
             self._update_preview_counts()
-            self._update_actions()
             return
         target_id = getattr(self, "_pending_project_selection", None)
         target_row = next(
@@ -468,7 +467,9 @@ class SubmissionListPage(QWidget):
             ),
             0,
         )
+        self.project_table.blockSignals(True)
         self.project_table.selectRow(target_row)
+        self.project_table.blockSignals(False)
         self._project_selected()
 
     def _render_task_page(
@@ -532,7 +533,9 @@ class SubmissionListPage(QWidget):
                 ),
                 0,
             )
+            self.task_table.blockSignals(True)
             self.task_table.selectRow(target_row)
+            self.task_table.blockSignals(False)
             self._task_selected()
             self._pending_task_selection = None
         else:
@@ -542,7 +545,6 @@ class SubmissionListPage(QWidget):
             self.reference_preview.set_placeholder("尚无参考图")
             self.result_gallery.clear()
             self._update_preview_counts()
-            self._update_actions()
 
     def _filter_changed(self, *_args) -> None:
         self._project_page = PageRequest(
@@ -748,7 +750,6 @@ class SubmissionListPage(QWidget):
                 [],
             )
             self._update_preview_counts()
-        self._update_actions()
 
     def _current_project(self) -> ProjectRecord | None:
         row = self.project_table.currentRow()
@@ -817,7 +818,6 @@ class SubmissionListPage(QWidget):
                 f"{project.source_date or ''} · {project.owner_name} · "
                 f"{project.note or '无备注'}"
             )
-        self._update_actions()
 
     @staticmethod
     def _task_matches(
@@ -865,7 +865,6 @@ class SubmissionListPage(QWidget):
             self.reference_preview.set_placeholder("尚未选择任务")
             self.result_gallery.clear()
             self._update_preview_counts()
-            self._update_actions()
             return
         self.info_line.setText(
             f"{project.product_code or project.name} · "
@@ -886,7 +885,6 @@ class SubmissionListPage(QWidget):
                 self.repository.list_results(task.id),
             )
         self._update_preview_counts()
-        self._update_actions()
 
     def _set_reference_preview(self, task: ProjectTask) -> None:
         items = []
@@ -914,9 +912,6 @@ class SubmissionListPage(QWidget):
         self.reference_header.setText(
             f"参考图（{self.reference_strip.count()}）"
         )
-
-    def _update_actions(self) -> None:
-        return
 
     @staticmethod
     def _empty_task() -> ProjectTask:

@@ -655,6 +655,7 @@ class MainWindow(QMainWindow):
             )
             return
         page = self._ensure_page("AI生图")
+        self._select_page(page)
         try:
             page.prepare_history_retry(
                 task_id,
@@ -663,7 +664,6 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "载入失败", str(exc))
             return
-        self._select_page(page)
         self.statusBar().showMessage(
             "已载入项目子任务参数，请确认后手动加入生成队列",
             8000,

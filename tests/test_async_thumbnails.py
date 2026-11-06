@@ -78,7 +78,7 @@ class AsyncThumbnailTests(unittest.TestCase):
                 / "内部项目"
                 / "春季项目"
                 / f"{today.month}.{today.day}"
-                / "BENCH"
+                / "DV263q25445p80723"
             )
             (product / "衣服图").mkdir(parents=True)
             (product / "模特图").mkdir(parents=True)
@@ -131,7 +131,7 @@ class AsyncThumbnailTests(unittest.TestCase):
                 / "内部项目"
                 / "春季项目"
                 / f"{today.month}.{today.day}"
-                / "ASYNC"
+                / "DV263q25445p80723"
             )
             (product / "衣服图").mkdir(parents=True)
             (product / "模特图").mkdir(parents=True)
@@ -162,7 +162,10 @@ class AsyncThumbnailTests(unittest.TestCase):
                     break
                 QTest.qWait(10)
             self.assertTrue(loaded)
-            self.assertEqual(page.product_table.item(0, 2).text(), "ASYNC")
+            self.assertEqual(
+                page.product_table.item(0, 2).text(),
+                "DV263q25445p8072",
+            )
             thumbnails_loaded = False
             for _ in range(150):
                 self.app.processEvents()

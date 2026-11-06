@@ -15,41 +15,50 @@ def cleanup_expired_candidates(
 ) -> list[str]:
     logger = logging.getLogger("yixin.collaboration.cleanup")
     removed: list[str] = []
-    for task_id in task_ids:
-        task = repository.get_task(task_id)
-        if task is None:
+    ids = tuple(dict.fromkeys(int(value) for value in task_ids))
+    if not ids:
+        return removed
+    # 一次性取出所有任务的过期候选图，避免逐任务、逐文件查询。
+    expired = repository.expired_candidate_results_for_tasks(ids)
+    if not expired:
+        return removed
+    roots = repository.task_project_roots(ids)
+    # 先删数据库行，只有确实删除的行才去清文件，避免误删刚被设为最终图的文件。
+    deleted_ids = set(
+        repository.delete_generation_results(
+            [result.id for _task_id, result in expired]
+        )
+    )
+    pending = [
+        (task_id, result)
+        for task_id, result in expired
+        if result.id in deleted_ids
+    ]
+    paths = [
+        path
+        for _task_id, result in pending
+        for path in (result.relative_path, result.thumbnail_relative_path)
+        if path
+    ]
+    in_use = repository.result_paths_in_use(paths)
+    for task_id, result in pending:
+        root = roots.get(task_id)
+        if root is None:
             continue
-        expired = repository.expired_candidate_results(task_id)
-        if not expired:
-            continue
-        delete_ids: list[int] = []
-        for result in expired:
-            for relative_path in (
-                result.relative_path,
-                result.thumbnail_relative_path,
-            ):
-                if not relative_path:
-                    continue
-                try:
-                    path = resolver.resolve_project_path(
-                        task.project_relative_root,
-                        relative_path,
-                    )
-                    if (
-                        path.is_file()
-                        and repository.result_path_reference_count(
-                            relative_path,
-                            result.id,
-                        )
-                        == 0
-                    ):
-                        path.unlink()
-                        removed.append(str(path))
-                except Exception as exc:
-                    logger.warning(
-                        "候选图清理失败：%s",
-                        sanitize_text(str(exc)),
-                    )
-            delete_ids.append(result.id)
-        repository.delete_generation_results(delete_ids)
+        for relative_path in (
+            result.relative_path,
+            result.thumbnail_relative_path,
+        ):
+            if not relative_path or relative_path in in_use:
+                continue
+            try:
+                path = resolver.resolve_project_path(root, relative_path)
+                if path.is_file():
+                    path.unlink()
+                    removed.append(str(path))
+            except Exception as exc:
+                logger.warning(
+                    "候选图清理失败：%s",
+                    sanitize_text(str(exc)),
+                )
     return removed

@@ -60,7 +60,8 @@ class ResetAllDataTests(unittest.TestCase):
             reset_all_data.clear_mysql()
         self.assertNotIn("schema_migrations", reset_all_data.DATA_TABLES)
         for table in reset_all_data.DATA_TABLES:
-            self.assertIn(f"TRUNCATE TABLE `{table}`", executed)
+            self.assertIn(f"DELETE FROM `{table}`", executed)
+            self.assertIn(f"ALTER TABLE `{table}` AUTO_INCREMENT = 1", executed)
 
 
 if __name__ == "__main__":

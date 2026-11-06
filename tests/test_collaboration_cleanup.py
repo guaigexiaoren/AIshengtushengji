@@ -17,17 +17,21 @@ class FakeCleanupRepository:
         self.deleted: list[int] = []
         self.referenced_paths: set[str] = set()
 
-    def get_task(self, _task_id):
-        return self.task
+    def expired_candidate_results_for_tasks(self, _task_ids):
+        return [(self.task.id, self.result)]
 
-    def expired_candidate_results(self, _task_id):
-        return [self.result]
+    def task_project_roots(self, _task_ids):
+        return {self.task.id: self.task.project_relative_root}
 
     def delete_generation_results(self, result_ids):
         self.deleted.extend(result_ids)
+        return list(result_ids)
 
-    def result_path_reference_count(self, relative_path, _excluding_result_id):
-        return int(relative_path in self.referenced_paths)
+    def result_paths_in_use(self, relative_paths):
+        return {
+            path for path in relative_paths
+            if path in self.referenced_paths
+        }
 
 
 class CollaborationCleanupTests(unittest.TestCase):

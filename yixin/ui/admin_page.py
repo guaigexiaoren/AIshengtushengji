@@ -775,6 +775,7 @@ class AdminPage(QWidget):
         price_card = QGroupBox("模型单图成本（人民币）")
         price_layout = QVBoxLayout(price_card)
         self.price_inputs: dict[str, QDoubleSpinBox] = {}
+        self._prices_loaded = False
         for label, model_id in MODEL_OPTIONS:
             row = QHBoxLayout()
             row.addWidget(QLabel(label), 1)
@@ -785,9 +786,10 @@ class AdminPage(QWidget):
             self.price_inputs[model_id] = spin
             row.addWidget(spin)
             price_layout.addLayout(row)
-        save_prices = QPushButton("保存当前价格")
-        save_prices.clicked.connect(self._save_prices)
-        price_layout.addWidget(save_prices)
+        self.save_prices_button = QPushButton("保存当前价格")
+        self.save_prices_button.setEnabled(False)
+        self.save_prices_button.clicked.connect(self._save_prices)
+        price_layout.addWidget(self.save_prices_button)
         layout.addWidget(price_card)
 
         template_card = QGroupBox("共享提示词模板")
@@ -1313,12 +1315,26 @@ class AdminPage(QWidget):
     def _refresh_prices(self) -> None:
         try:
             prices = self.repository.list_model_prices()
-        except Exception:
-            prices = {}
+        except Exception as exc:
+            # 读取失败时保留界面上已有数值，并禁止保存，避免把价格写成 0。
+            self._prices_loaded = False
+            self.save_prices_button.setEnabled(False)
+            self.save_prices_button.setToolTip(f"价格读取失败：{exc}")
+            return
+        self._prices_loaded = True
+        self.save_prices_button.setEnabled(True)
+        self.save_prices_button.setToolTip("")
         for model_id, spin in self.price_inputs.items():
             spin.setValue(float(prices.get(model_id, 0)))
 
     def _save_prices(self) -> None:
+        if not self._prices_loaded:
+            QMessageBox.warning(
+                self,
+                "价格未加载",
+                "价格读取失败，请刷新页面后再保存。",
+            )
+            return
         try:
             for model_id, spin in self.price_inputs.items():
                 self.repository.set_model_price(
@@ -1575,33 +1591,6 @@ class AdminPage(QWidget):
                     QTableWidgetItem(value),
                 )
 
-    def _task_needs_admin_attention(
-        self,
-        task: ProjectTask,
-        cutoff: datetime,
-    ) -> bool:
-        if task.status == "returned":
-            return True
-        if task.status == "available" and task.created_at < cutoff:
-            return True
-        if (
-            task.status == "working"
-            and (task.updated_at or task.work_started_at or task.created_at)
-            < cutoff
-        ):
-            return True
-        try:
-            attempts = self.repository.list_attempts(task.id)
-        except Exception:
-            attempts = []
-        if not attempts:
-            return False
-        latest = attempts[0]
-        return bool(
-            latest.status == "failed"
-            and latest.created_at is not None
-            and latest.created_at >= cutoff
-        )
 
     def _current_admin_task(self) -> ProjectTask | None:
         row = self.admin_task_table.currentRow()

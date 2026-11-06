@@ -333,13 +333,16 @@ class UnifiedHistoryPage(QWidget):
             )
 
     def refresh(self) -> None:
-        if self.async_mode:
-            self._request_history_page()
-            return
-        shared_root = self.repository.get_shared_setting("share_root")
+        try:
+            shared_root = self.repository.get_shared_setting("share_root")
+        except Exception:
+            shared_root = None
         if shared_root:
             self.resolver = SharedPathResolver(shared_root)
             self.dual_preview.set_resolver(self.resolver)
+        if self.async_mode:
+            self._request_history_page()
+            return
         project_rows = []
         try:
             project_rows = self.repository.list_project_attempt_history(
@@ -394,9 +397,24 @@ class UnifiedHistoryPage(QWidget):
             sort_field=self._sort_field,
             sort_direction=self._sort_direction,
         )
+        # 本机 SQLite 只支持部分排序字段；不支持的字段需要取全量再统一排序，
+        # 否则两个数据源各取前 N 条会漏行或重复。
+        sqlite_sort_fields = {
+            "id",
+            "status",
+            "mode",
+            "model",
+            "created_at",
+            "updated_at",
+            "kind",
+            "result_count",
+        }
+        fetch_size = sort_page.page * sort_page.page_size
+        if self._sort_field not in sqlite_sort_fields:
+            fetch_size = 10000
         fetch_page = PageRequest(
             page=1,
-            page_size=sort_page.page * sort_page.page_size,
+            page_size=fetch_size,
             sort_field=self._sort_field,
             sort_direction=self._sort_direction,
         )
@@ -887,6 +905,10 @@ class UnifiedHistoryPage(QWidget):
 
     def _load_record(self, record: HistoryRecord) -> None:
         if self.async_mode:
+            # 详情返回前先清空上一条记录选中的素材并禁用按钮，
+            # 避免此时点击“保存本地”把上一条记录的图存成新记录的名字。
+            self.current_selected_asset = None
+            self._set_actions(False)
             self._active_detail_request = self.query_runner.submit(
                 lambda: self._load_record_data(record)
             )
@@ -1196,23 +1218,31 @@ class UnifiedHistoryPage(QWidget):
                 if not directory_text:
                     return
                 directory = Path(directory_text)
-            saved = exporter.save_result(
-                record.task_id,
-                int(result["id"]),
-                directory,
-            )
+            try:
+                saved = exporter.save_result(
+                    record.task_id,
+                    int(result["id"]),
+                    directory,
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "保存失败", str(exc))
+                return
             show_saved_toast(self, saved)
             return
         directory = self._project_save_directory()
         if directory is None:
             return
         result = asset.payload["result"]
-        saved = export_original_image(
-            asset.path,
-            directory,
-            task_code=record.secondary_code,
-            result_index=result.result_index,
-        )
+        try:
+            saved = export_original_image(
+                asset.path,
+                directory,
+                task_code=record.secondary_code,
+                result_index=result.result_index,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
         show_saved_toast(self, saved)
 
     def _project_save_directory(self) -> Path | None:

@@ -72,6 +72,3 @@ class SharedPathResolver:
             self.project_root(task.project_relative_root),
             path,
         )
-
-    def resolve_output(self, project_relative_root: str, relative_path: str) -> Path:
-        return self.resolve_project_path(project_relative_root, relative_path)

@@ -35,6 +35,7 @@ BEARER_PATTERN = re.compile(r"(?i)(Bearer\s+)[^\s,;\"']+")
 QUERY_SECRET_PATTERN = re.compile(
     r"(?i)([?&](?:key|api_key|token|access_token|signature|sig|expires)=)[^&#\s]+"
 )
+URL_PATTERN = re.compile(r"https?://[^\s\"'<>]+")
 
 _lock = threading.Lock()
 _sensitive_values: set[str] = set()
@@ -75,8 +76,8 @@ def sanitize_text(value: Any) -> str:
             text = text.replace(secret, "[已隐藏]")
     text = BEARER_PATTERN.sub(r"\1[已隐藏]", text)
     text = QUERY_SECRET_PATTERN.sub(r"\1[已隐藏]", text)
-    if text.startswith(("http://", "https://")):
-        text = _redact_url(text)
+    # 链接可能夹在错误信息中间，对所有 URL 都做签名参数脱敏。
+    text = URL_PATTERN.sub(lambda match: _redact_url(match.group(0)), text)
     return text
 
 

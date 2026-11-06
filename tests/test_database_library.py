@@ -377,13 +377,13 @@ class DatabaseLibraryTests(unittest.TestCase):
         self.assertIsNone(settings.input_folder(INPUT_BATCH_GARMENT))
         self.assertEqual(
             self.database.get_setting("input_last_folder_batch_garment", ""),
-            "",
+            str(garment_folder.resolve()),
         )
         manual_folder.rmdir()
         self.assertIsNone(settings.input_folder(INPUT_MANUAL_UPLOAD))
         self.assertEqual(
             self.database.get_setting("input_last_folder_manual_upload", ""),
-            "",
+            str(manual_folder.resolve()),
         )
 
     def test_version_one_database_migrates_without_losing_rows(self) -> None:

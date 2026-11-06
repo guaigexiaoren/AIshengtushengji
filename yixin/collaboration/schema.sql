@@ -316,7 +316,9 @@ CREATE TABLE IF NOT EXISTS generation_results (
         REFERENCES generation_attempts(id) ON DELETE CASCADE,
     UNIQUE KEY uk_generation_result_index (attempt_id, result_index),
     INDEX idx_generation_results_final (attempt_id, is_final),
-    INDEX idx_generation_results_expire (is_final, expire_at)
+    INDEX idx_generation_results_expire (is_final, expire_at),
+    INDEX idx_generation_results_result_path (relative_path),
+    INDEX idx_generation_results_thumb_path (thumbnail_relative_path)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS task_reviews (

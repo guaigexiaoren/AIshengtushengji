@@ -14,7 +14,11 @@ from ..storage import (
     image_metadata,
     sha256_bytes,
 )
-from .repository import MySQLCentralRepository, StateConflictError
+from .repository import (
+    GenerationSlotBusyError,
+    MySQLCentralRepository,
+    StateConflictError,
+)
 from .shared_paths import SharedPathResolver
 from .types import (
     AuthUser,
@@ -28,6 +32,7 @@ from .types import (
 class GenerationWorkerSignals(QObject):
     finished = Signal(int, int)
     failed = Signal(int, str, str)
+    deferred = Signal(int, int)
 
 
 class ProjectGenerationWorker:
@@ -72,9 +77,6 @@ class ProjectGenerationWorker:
         )
         self._thread.start()
 
-    def is_running(self) -> bool:
-        return bool(self._thread and self._thread.is_alive())
-
     def _run(self) -> None:
         attempt_id = 0
         written_results: list[tuple[Path, str]] = []
@@ -91,6 +93,9 @@ class ProjectGenerationWorker:
                         attempt_id,
                         self.actor,
                     )
+                except GenerationSlotBusyError:
+                    self.signals.deferred.emit(self.task.id, attempt_id)
+                    return
                 except StateConflictError:
                     status = self.repository.generation_attempt_status(
                         attempt_id

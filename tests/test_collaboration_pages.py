@@ -763,7 +763,7 @@ class CollaborationPageTests(unittest.TestCase):
                 break
             QTest.qWait(10)
         self.assertEqual(page.task_selector.count(), 2)
-        self.assertEqual(queries[0][1].page_size, 100)
+        self.assertEqual(queries[0][1].page_size, 10000)
         page.task_search_edit.setText("春季项目")
         for _ in range(100):
             self.app.processEvents()
@@ -1110,7 +1110,11 @@ class CollaborationPageTests(unittest.TestCase):
         date_folder = current_date_folder(
             self.root / "内部项目" / "春季项目"
         )
-        for code in ("123", "456", "重复货号"):
+        for code in (
+            "DV263q25445p80723",
+            "DV262q10001p80724",
+            "DV263q99999p80725",
+        ):
             product = date_folder.path / code
             (product / "衣服图").mkdir(parents=True)
             (product / "模特图").mkdir(parents=True)
@@ -1120,7 +1124,7 @@ class CollaborationPageTests(unittest.TestCase):
             Image.new("RGB", (20, 20), "blue").save(
                 product / "模特图" / "模特1.png"
             )
-        invalid = date_folder.path / "缺少模特"
+        invalid = date_folder.path / "DV264q25445p80724"
         (invalid / "衣服图").mkdir(parents=True)
         (invalid / "模特图").mkdir()
         Image.new("RGB", (20, 20), "red").save(
@@ -1128,7 +1132,7 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.repository.find_tasks_by_product = (
             lambda _actor, _date, code: [object()]
-            if code == "重复货号"
+            if code == "DV263q99999p8072"
             else []
         )
         page = TaskCreatePage(
@@ -1155,19 +1159,19 @@ class CollaborationPageTests(unittest.TestCase):
             for row in range(page.product_table.rowCount())
         }
         self.assertTrue(
-            states["123"].flags()
+            states["DV263q25445p8072"].flags()
             & Qt.ItemFlag.ItemIsUserCheckable
         )
         self.assertFalse(
-            states["重复货号"].flags()
+            states["DV263q99999p8072"].flags()
             & Qt.ItemFlag.ItemIsUserCheckable
         )
         self.assertFalse(
-            states["缺少模特"].flags()
+            states["DV264q25445p8072"].flags()
             & Qt.ItemFlag.ItemIsUserCheckable
         )
         self.assertEqual(header.check_state(), Qt.CheckState.Checked)
-        states["123"].setCheckState(Qt.CheckState.Unchecked)
+        states["DV263q25445p8072"].setCheckState(Qt.CheckState.Unchecked)
         self.assertEqual(
             header.check_state(),
             Qt.CheckState.PartiallyChecked,
@@ -1191,14 +1195,69 @@ class CollaborationPageTests(unittest.TestCase):
             header.check_state(),
             Qt.CheckState.Unchecked,
         )
-        self.assertEqual(page._selected_codes(), [])
+        self.assertEqual(page._selected_keys(), [])
+        page.deleteLater()
+
+    def test_duplicate_style_color_keeps_every_folder_row(self) -> None:
+        date_folder = current_date_folder(
+            self.root / "内部项目" / "春季项目"
+        )
+        for code in ("DV263q25445p80723", "DV263q25445p80724"):
+            product = date_folder.path / code
+            (product / "衣服图").mkdir(parents=True)
+            (product / "模特图").mkdir(parents=True)
+            Image.new("RGB", (20, 20), "red").save(
+                product / "衣服图" / "衣服1.png"
+            )
+            Image.new("RGB", (20, 20), "blue").save(
+                product / "模特图" / "模特1.png"
+            )
+        page = TaskCreatePage(
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        self.assertEqual(page.product_table.rowCount(), 2)
+        for row in range(2):
+            self.assertEqual(
+                page.product_table.item(row, 2).text(),
+                "DV263q25445p8072",
+            )
+            self.assertFalse(
+                page.product_table.item(row, 1).flags()
+                & Qt.ItemFlag.ItemIsUserCheckable
+            )
+            self.assertIn(
+                "多个目录对应同一货号",
+                page.product_table.item(row, 0).toolTip(),
+            )
+        page.deleteLater()
+
+    def test_external_project_skips_incomplete_folders(self) -> None:
+        self.repository.list_accessible_projects = (
+            lambda _actor: (("external", "客户A"),)
+        )
+        date_folder = current_date_folder(
+            self.root / "外部项目" / "客户A"
+        )
+        product = date_folder.path / "客户货号"
+        (product / "衣服图").mkdir(parents=True)
+        Image.new("RGB", (20, 20), "red").save(
+            product / "衣服图" / "衣服1.png"
+        )
+        page = TaskCreatePage(
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        self.assertEqual(page.product_table.rowCount(), 0)
         page.deleteLater()
 
     def test_task_create_drag_folder_and_main_task_quota(self) -> None:
         date_folder = current_date_folder(
             self.root / "内部项目" / "春季项目"
         )
-        product = date_folder.path / "123"
+        product = date_folder.path / "DV263q25445p80723"
         (product / "衣服图").mkdir(parents=True)
         (product / "模特图").mkdir(parents=True)
         Image.new("RGB", (20, 20), "red").save(
@@ -1510,35 +1569,6 @@ class CollaborationPageTests(unittest.TestCase):
         )
         dialog.deleteLater()
 
-    def test_admin_exception_filter_only_returns_abnormal_tasks(self) -> None:
-        page = AdminPage(self.repository, self.actor)
-        now = datetime.utcnow()
-        cutoff = now - timedelta(hours=24)
-        normal = replace(
-            make_task("awaiting_acceptance"),
-            created_at=now,
-            updated_at=now,
-        )
-        returned = replace(
-            make_task("returned"),
-            created_at=now,
-            updated_at=now,
-        )
-        stale_available = replace(
-            make_task("available"),
-            created_at=cutoff - timedelta(hours=1),
-            updated_at=cutoff - timedelta(hours=1),
-        )
-        self.assertFalse(
-            page._task_needs_admin_attention(normal, cutoff)
-        )
-        self.assertTrue(
-            page._task_needs_admin_attention(returned, cutoff)
-        )
-        self.assertTrue(
-            page._task_needs_admin_attention(stale_available, cutoff)
-        )
-        page.deleteLater()
 
     def test_account_dialog_enforces_role_menu_ceiling(self) -> None:
         operator = AuthUser(
@@ -1583,7 +1613,7 @@ class CollaborationPageTests(unittest.TestCase):
         date_folder = current_date_folder(
             self.root / "内部项目" / "春季项目"
         )
-        product = date_folder.path / "123"
+        product = date_folder.path / "DV262q10001p80724"
         garment = product / "衣服图"
         model = product / "模特图"
         garment.mkdir(parents=True)
@@ -1616,7 +1646,7 @@ class CollaborationPageTests(unittest.TestCase):
             page._create_selected()
         self.assertEqual(len(self.repository.created_drafts), 1)
         draft = self.repository.created_drafts[0]
-        self.assertEqual(draft.product_code, "123")
+        self.assertEqual(draft.product_code, "DV262q10001p8072")
         self.assertEqual(draft.project_code, "")
         self.assertEqual(len(draft.pairs), 6)
         page.deleteLater()
@@ -1875,7 +1905,7 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(page.task_table.rowCount(), 1)
         self.assertEqual(project_queries[0][2].page_size, 100)
         self.assertEqual(task_queries[0][3].page, 1)
-        self.assertEqual(task_queries[0][3].page_size, 100)
+        self.assertEqual(task_queries[0][3].page_size, 10000)
         self.assertIn("共 125 条", page.project_pagination.summary.text())
         self.assertFalse(hasattr(page, "task_pagination"))
         page.project_pagination.next_button.click()
