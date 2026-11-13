@@ -75,6 +75,8 @@ class ProductDraftState:
     manual_pairs: list[PairingInput] = field(default_factory=list)
     existing_tasks: list = field(default_factory=list)
     code_info: ProductCode | None = None
+    garment_dir: Path | None = None
+    model_dir: Path | None = None
 
 
 class DroppableImageList(QListWidget):
@@ -420,7 +422,9 @@ class TaskCreatePage(QWidget):
         project = self.project_combo.currentData()
         if not project:
             self.scan_summary.setText(
-                "尚未分配项目，请联系管理员在账号编辑中分配"
+                "共享盘根目录下没有可用项目，请检查“共享目录”设置"
+                if self.actor.role == ROLE_ADMIN
+                else "尚未分配项目，请联系管理员在账号编辑中分配"
             )
             self.product_table.setRowCount(0)
             self.states = {}
@@ -448,6 +452,23 @@ class TaskCreatePage(QWidget):
                 raw_path,
                 project_root,
             )
+        except ValueError:
+            # 目录本身可访问，只是不属于当前选中的项目。
+            self.account_directory = None
+            self.states = {}
+            self.current_state = None
+            self.product_table.setRowCount(0)
+            self.create_button.setEnabled(False)
+            QMessageBox.warning(
+                self,
+                "目录不属于当前项目",
+                f"所选目录：{raw_path}\n"
+                f"当前项目：{project_name}\n\n"
+                f"请选择「{project_name}」项目下的日期目录，"
+                "或先在“当前项目”切换到对应项目。",
+            )
+            return
+        try:
             account_directory.path.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
             self.account_directory = None
@@ -491,12 +512,31 @@ class TaskCreatePage(QWidget):
                 f"{PROJECT_SCOPE_LABELS[scope]} · {project_name}",
                 (scope, project_name),
             )
-        index = self.project_combo.findData(selected)
+        index = self._find_project_index(selected)
         if index < 0 and self.project_combo.count():
             index = 0
         if index >= 0:
             self.project_combo.setCurrentIndex(index)
         self.project_combo.blockSignals(False)
+
+    def _find_project_index(self, project) -> int:
+        """按 (scope, 项目名) 查找下拉项。
+
+        QComboBox.findData 比较元组时会失败，这里手动比较。
+        """
+        if not project:
+            return -1
+        scope, name = project[0], project[1]
+        for index in range(self.project_combo.count()):
+            data = self.project_combo.itemData(index)
+            if (
+                data is not None
+                and len(data) == 2
+                and data[0] == scope
+                and data[1] == name
+            ):
+                return index
+        return -1
 
     def _project_changed(self) -> None:
         project = self.project_combo.currentData()
@@ -518,9 +558,35 @@ class TaskCreatePage(QWidget):
             "选择账号日期目录",
             self.account_path.text(),
         )
-        if selected:
-            self.account_path.setText(selected)
-            self.refresh()
+        if not selected:
+            return
+        # 选择目录时自动切到该目录所属项目，避免管理员选到其他项目时报错。
+        self._sync_project_from_path(Path(selected))
+        self.account_path.setText(selected)
+        self.refresh()
+
+    def _sync_project_from_path(self, path: Path) -> None:
+        try:
+            relative = path.resolve().relative_to(
+                self.resolver.root.resolve()
+            )
+        except (OSError, ValueError):
+            return
+        parts = relative.parts
+        if len(parts) < 2:
+            return
+        scope_label, project_name = parts[0], parts[1]
+        for scope, name in self.accessible_projects:
+            if (
+                PROJECT_SCOPE_LABELS[scope] == scope_label
+                and name.casefold() == project_name.casefold()
+            ):
+                index = self._find_project_index((scope, name))
+                if index >= 0:
+                    self.project_combo.blockSignals(True)
+                    self.project_combo.setCurrentIndex(index)
+                    self.project_combo.blockSignals(False)
+                return
 
     def _scan_directory(self) -> None:
         if self.account_directory is None:
@@ -537,16 +603,11 @@ class TaskCreatePage(QWidget):
                     account_directory.path,
                     check_product_code=check_product_code,
                 )
-                existing = {
-                    product.path: (
-                        self.repository.find_tasks_by_product(
-                            self.actor.id,
-                            account_directory.source_date,
-                            product.product_code,
-                        )
-                    )
-                    for product in products
-                }
+                existing = self.repository.find_tasks_by_products(
+                    self.actor.id,
+                    account_directory.source_date,
+                    [product.product_code for product in products],
+                )
                 return products, existing
 
             self._active_scan_request = self.query_runner.submit(load)
@@ -559,21 +620,25 @@ class TaskCreatePage(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "扫描失败", str(exc))
             return
+        existing_by_code = self.repository.find_tasks_by_products(
+            self.actor.id,
+            self.account_directory.source_date,
+            [product.product_code for product in products],
+        )
         self.states = {}
         for product in products:
-            existing = self.repository.find_tasks_by_product(
-                self.actor.id,
-                self.account_directory.source_date,
-                product.product_code,
-            )
             self.states[product.path] = ProductDraftState(
                 product_code=product.product_code,
                 path=product.path,
                 garments=list(product.garments),
                 models=list(product.models),
                 errors=list(product.errors),
-                existing_tasks=existing,
+                existing_tasks=list(
+                    existing_by_code.get(product.product_code, [])
+                ),
                 code_info=product.code_info,
+                garment_dir=product.garment_dir,
+                model_dir=product.model_dir,
             )
         self._refresh_product_table()
         self._finish_scan_selection()
@@ -594,9 +659,11 @@ class TaskCreatePage(QWidget):
                 models=list(product.models),
                 errors=list(product.errors),
                 existing_tasks=list(
-                    existing.get(product.path, [])
+                    existing.get(product.product_code, [])
                 ),
                 code_info=product.code_info,
+                garment_dir=product.garment_dir,
+                model_dir=product.model_dir,
             )
         self._refresh_product_table()
         self._finish_scan_selection()
@@ -849,7 +916,10 @@ class TaskCreatePage(QWidget):
         state = self.current_state
         if state is None:
             return
-        role_folder = state.path / ("衣服图" if role == "garment" else "模特图")
+        if role == "garment":
+            role_folder = state.garment_dir or state.path / "衣服图"
+        else:
+            role_folder = state.model_dir or state.path / "模特图"
         role_folder.mkdir(parents=True, exist_ok=True)
         target = state.garments if role == "garment" else state.models
         known = {path.resolve() for path in target}

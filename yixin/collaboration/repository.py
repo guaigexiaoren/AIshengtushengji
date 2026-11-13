@@ -2626,12 +2626,22 @@ class MySQLCentralRepository:
                 row = self._project_row(cursor, project_id)
                 return _project_record(row) if row else None
 
-    def find_tasks_by_product(
+    def find_tasks_by_products(
         self,
         owner_id: int,
         source_date: date,
-        product_code: str,
-    ) -> list[ProjectRecord]:
+        product_codes: Sequence[str],
+    ) -> dict[str, list[ProjectRecord]]:
+        """一次查出该账号该日期的全部任务，再在内存里按货号归类。
+
+        兼容升级前保存的「基础货号 + 1 位尺码」旧记录。
+        """
+        codes = tuple(
+            dict.fromkeys(str(code) for code in product_codes if code)
+        )
+        grouped: dict[str, list[ProjectRecord]] = {code: [] for code in codes}
+        if not codes:
+            return grouped
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
@@ -2646,10 +2656,6 @@ class MySQLCentralRepository:
                     LEFT JOIN project_tasks t
                       ON t.project_id = p.id AND t.status <> 'expanded'
                     WHERE p.owner_id = %s AND p.source_date = %s
-                      AND (
-                        p.product_code = %s
-                        OR p.product_code LIKE %s
-                      )
                       AND p.status <> %s
                     GROUP BY p.id, owner.display_name
                     ORDER BY p.id DESC
@@ -2659,12 +2665,22 @@ class MySQLCentralRepository:
                         TASK_AWAITING_ACCEPTANCE,
                         owner_id,
                         source_date,
-                        product_code,
-                        f"{product_code}_",
                         PROJECT_CANCELLED,
                     ),
                 )
-                return [_project_record(row) for row in cursor.fetchall()]
+                records = [
+                    _project_record(row) for row in cursor.fetchall()
+                ]
+        for record in records:
+            stored = str(record.product_code or "")
+            for code in codes:
+                if stored == code or (
+                    stored.startswith(code)
+                    and len(stored) == len(code) + 1
+                ):
+                    grouped[code].append(record)
+                    break
+        return grouped
 
     def list_project_tasks(self, project_id: int) -> list[ProjectTask]:
         with self.connection() as connection:
@@ -3445,6 +3461,11 @@ class MySQLCentralRepository:
                     for row in garment_rows
                 }
                 fallback_garment_id = int(garment_rows[0]["garment_asset_id"])
+                # 子任务保留源任务的全部衣服图，保证提交记录/历史记录里的
+                # 参考图完整；当前配对实际用到的衣服由本机素材快照决定。
+                source_garment_ids = tuple(
+                    int(row["garment_asset_id"]) for row in garment_rows
+                )
                 cursor.execute(
                     """
                     SELECT task_no
@@ -3529,7 +3550,7 @@ class MySQLCentralRepository:
                     )
                     child_task_id = int(cursor.lastrowid)
                     for position, garment_asset_id in enumerate(
-                        selected_assets,
+                        source_garment_ids or selected_assets,
                         start=1,
                     ):
                         cursor.execute(
@@ -5545,6 +5566,71 @@ class MySQLCentralRepository:
             page.page,
             page.page_size,
         )
+
+    def replace_attempt_result(
+        self,
+        attempt_id: int,
+        result_id: int,
+        actor: AuthUser,
+        *,
+        relative_path: str,
+        thumbnail_relative_path: str,
+        content_hash: str,
+        mime: str,
+        width: int,
+        height: int,
+    ) -> None:
+        """把某张生成结果替换为手工上传的 PS 图（保留原结果行与终图状态）。"""
+        if actor.role not in (ROLE_AI, ROLE_ADMIN):
+            raise PermissionDeniedError("当前角色不能修改生成结果")
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT gr.id, ga.task_id, t.project_id
+                    FROM generation_results gr
+                    JOIN generation_attempts ga ON ga.id = gr.attempt_id
+                    JOIN project_tasks t ON t.id = ga.task_id
+                    WHERE gr.id = %s AND gr.attempt_id = %s
+                    FOR UPDATE
+                    """,
+                    (result_id, attempt_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise StateConflictError("生成结果不存在或不属于该轮次")
+                cursor.execute(
+                    """
+                    UPDATE generation_results
+                    SET relative_path = %s, thumbnail_relative_path = %s,
+                        content_hash = %s, mime = %s, width = %s,
+                        height = %s, source_type = 'manual_ps'
+                    WHERE id = %s
+                    """,
+                    (
+                        relative_path,
+                        thumbnail_relative_path,
+                        content_hash,
+                        mime,
+                        width,
+                        height,
+                        result_id,
+                    ),
+                )
+                self._event(
+                    cursor,
+                    int(row["project_id"]),
+                    int(row["task_id"]),
+                    actor.id,
+                    "result_replaced_manual_ps",
+                    "",
+                    "",
+                    {
+                        "attempt_id": attempt_id,
+                        "result_id": result_id,
+                        "relative_path": relative_path,
+                    },
+                )
 
     def list_attempt_results(self, attempt_id: int) -> list[GenerationResult]:
         with self.connection() as connection:

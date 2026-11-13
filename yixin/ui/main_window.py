@@ -400,6 +400,7 @@ class MainWindow(QMainWindow):
                             self.secret_store,
                             auto_load=not self.lazy_pages,
                             async_thumbnails=self.lazy_pages,
+                            repository=self.repository,
                         ),
                         "batch_dress_page",
                     ),
@@ -481,6 +482,7 @@ class MainWindow(QMainWindow):
             page.project_attempt_cancelled.connect(
                 self._on_project_attempt_cancelled
             )
+            page.results_changed.connect(self._on_results_changed)
 
     def _on_projects_claimed(self, _count: int) -> None:
         self._mark_pages_dirty("AI生图", "提交记录", "历史记录")
@@ -501,6 +503,9 @@ class MainWindow(QMainWindow):
         remove = getattr(page, "remove_cancelled_attempt", None)
         if callable(remove):
             remove(attempt_id)
+
+    def _on_results_changed(self) -> None:
+        self._mark_pages_dirty("提交记录", "AI生图", "历史记录")
 
     def _existing_page(self, label: str) -> QWidget | None:
         index = self._page_indices.get(label)

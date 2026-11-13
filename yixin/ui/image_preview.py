@@ -459,12 +459,15 @@ class ImagePreviewPane(QWidget):
 class DualImagePreview(QWidget):
     selection_changed = Signal(str, object, object)
     active_role_changed = Signal(str)
+    upload_requested = Signal()
 
     def __init__(
         self,
         resolver: SharedPathResolver | None = None,
         async_thumbnails: bool = False,
         parent: QWidget | None = None,
+        *,
+        allow_upload: bool = False,
     ) -> None:
         super().__init__(parent)
         self.active_role = "result"
@@ -487,7 +490,12 @@ class DualImagePreview(QWidget):
         self.actual_button = QPushButton("100%")
         self.scale_label = QLabel("100%")
         self.scale_label.setStyleSheet("color:#60708a;")
+        self.upload_button = QPushButton("上传PS图")
+        self.upload_button.clicked.connect(self.upload_requested.emit)
+        self.upload_button.setVisible(allow_upload)
         toolbar.addWidget(self.active_label)
+        if allow_upload:
+            toolbar.addWidget(self.upload_button)
         toolbar.addStretch(1)
         for button in (
             self.zoom_in_button,

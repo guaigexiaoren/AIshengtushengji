@@ -12,6 +12,7 @@ from ..storage import (
     MIME_TO_SUFFIX,
     atomic_write_bytes,
     image_metadata,
+    normalize_aspect_ratio,
     sha256_bytes,
 )
 from .repository import (
@@ -167,7 +168,10 @@ class ProjectGenerationWorker:
             output_directory.mkdir(parents=True, exist_ok=True)
             generated: list[GeneratedResultInput] = []
             for index, remote in enumerate(api_result.images):
-                data = self.client.resolve_image(remote)
+                data = normalize_aspect_ratio(
+                    self.client.resolve_image(remote),
+                    self.aspect_ratio,
+                )
                 mime, width, height = image_metadata(data)
                 suffix = MIME_TO_SUFFIX.get(mime, ".png")
                 content_hash = sha256_bytes(data)

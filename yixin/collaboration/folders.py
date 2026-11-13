@@ -13,8 +13,23 @@ from .types import ProjectAssetInput
 
 
 DATE_PATTERN = re.compile(
-    r"^(?:(?P<year>\d{4})\.)?(?P<month>\d{1,2})\.(?P<day>\d{1,2})$"
+    r"^(?:(?P<year>\d{4})[.\-])?(?P<month>\d{1,2})[.\-](?P<day>\d{1,2})$"
 )
+COMPACT_DATE_PATTERN = re.compile(
+    r"^(?P<year>\d{4})(?P<month>\d{2})(?P<day>\d{2})$"
+)
+
+GARMENT_DIR_NAMES = ("衣服图", "衣服", "garment")
+MODEL_DIR_NAMES = ("模特图", "模特", "model")
+SKIP_SCAN_DIR_NAMES = {
+    "备份",
+    "backup",
+    "副本",
+    "temp",
+    "tmp",
+    "临时",
+    "缓存",
+}
 
 
 @dataclass(frozen=True)
@@ -32,6 +47,8 @@ class ProductFolder:
     models: tuple[Path, ...]
     errors: tuple[str, ...]
     code_info: ProductCode | None = None
+    garment_dir: Path | None = None
+    model_dir: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -62,7 +79,8 @@ def resolve_account_directory(
 
 
 def parse_date_folder(label: str, *, today: date | None = None) -> date | None:
-    matched = DATE_PATTERN.fullmatch(label.strip())
+    text = label.strip()
+    matched = DATE_PATTERN.fullmatch(text) or COMPACT_DATE_PATTERN.fullmatch(text)
     if matched is None:
         return None
     current = today or date.today()
@@ -72,6 +90,26 @@ def parse_date_folder(label: str, *, today: date | None = None) -> date | None:
         return date(year, int(matched.group("month")), int(matched.group("day")))
     except ValueError:
         return None
+
+
+def find_role_directory(
+    product_dir: Path,
+    candidates: tuple[str, ...],
+) -> Path | None:
+    """按优先级找衣服图/模特图目录，英文名称不区分大小写。"""
+    for name in candidates:
+        candidate = product_dir / name
+        if candidate.is_dir():
+            return candidate
+    lowered = {name.casefold() for name in candidates}
+    try:
+        children = list(product_dir.iterdir())
+    except OSError:
+        return None
+    for child in children:
+        if child.is_dir() and child.name.casefold() in lowered:
+            return child
+    return None
 
 
 def current_date_folder(account_root: Path) -> DateFolder:
@@ -92,12 +130,8 @@ def scan_product_folders(
         (path for path in date_root.iterdir() if path.is_dir()),
         key=lambda path: natural_sort_key(path.name),
     ):
-        garment_dir = product_dir / "衣服图"
-        model_dir = product_dir / "模特图"
-        if not check_product_code and (
-            not garment_dir.is_dir() or not model_dir.is_dir()
-        ):
-            continue
+        garment_dir = find_role_directory(product_dir, GARMENT_DIR_NAMES)
+        model_dir = find_role_directory(product_dir, MODEL_DIR_NAMES)
         code_info = (
             parse_product_code(product_dir.name)
             if check_product_code
@@ -105,12 +139,12 @@ def scan_product_folders(
         )
         garment_paths, garment_errors = (
             _scan_images(garment_dir)
-            if garment_dir.is_dir()
+            if garment_dir is not None
             else ([], [])
         )
         model_paths, model_errors = (
             _scan_images(model_dir)
-            if model_dir.is_dir()
+            if model_dir is not None
             else ([], [])
         )
         errors = tuple(
@@ -118,23 +152,23 @@ def scan_product_folders(
                 *garment_errors,
                 *model_errors,
                 *(
-                    ["缺少衣服图目录"]
-                    if not garment_dir.is_dir()
+                    ["缺少衣服图目录（支持 衣服图/衣服/garment）"]
+                    if garment_dir is None
                     else []
                 ),
                 *(
-                    ["缺少模特图目录"]
-                    if not model_dir.is_dir()
+                    ["缺少模特图目录（支持 模特图/模特/model）"]
+                    if model_dir is None
                     else []
                 ),
                 *(
                     ["没有可用的衣服图"]
-                    if garment_dir.is_dir() and not garment_paths
+                    if garment_dir is not None and not garment_paths
                     else []
                 ),
                 *(
                     ["没有可用的模特图"]
-                    if model_dir.is_dir() and not model_paths
+                    if model_dir is not None and not model_paths
                     else []
                 ),
                 *(
@@ -164,6 +198,8 @@ def scan_product_folders(
                 models=tuple(model_paths),
                 errors=errors,
                 code_info=code_info,
+                garment_dir=garment_dir,
+                model_dir=model_dir,
             )
         )
     return _mark_duplicate_codes(products)
@@ -196,11 +232,18 @@ def _mark_duplicate_codes(
 def _scan_images(folder: Path) -> tuple[list[Path], list[str]]:
     images: list[Path] = []
     errors: list[str] = []
-    for root, _directories, filenames in os.walk(folder):
+    for root, directories, filenames in os.walk(folder):
+        # 跳过备份/临时目录和隐藏目录，避免把旧图重复算进来。
+        directories[:] = [
+            name
+            for name in directories
+            if not name.startswith(".")
+            and name.casefold() not in SKIP_SCAN_DIR_NAMES
+        ]
         for filename in filenames:
             path = Path(root) / filename
             if path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES:
-                images.append(path.resolve())
+                images.append(path)
     images.sort(key=lambda item: natural_sort_key(str(item)))
     return images, errors
 

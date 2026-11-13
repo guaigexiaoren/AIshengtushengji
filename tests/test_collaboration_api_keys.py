@@ -19,7 +19,20 @@ class ApiKeyAndFolderTests(unittest.TestCase):
     def test_date_folder_formats(self) -> None:
         self.assertIsNotNone(parse_date_folder("12.26"))
         self.assertIsNotNone(parse_date_folder("2026.12.26"))
+        self.assertEqual(
+            parse_date_folder("12-26", today=date(2026, 1, 1)),
+            date(2026, 12, 26),
+        )
+        self.assertEqual(
+            parse_date_folder("2026-12-26"),
+            date(2026, 12, 26),
+        )
+        self.assertEqual(
+            parse_date_folder("20261226"),
+            date(2026, 12, 26),
+        )
         self.assertIsNone(parse_date_folder("项目A"))
+        self.assertIsNone(parse_date_folder("20261340"))
 
     def test_custom_account_directory_uses_last_date_or_today(self) -> None:
         root = Path("/tmp/share")

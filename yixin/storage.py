@@ -97,6 +97,47 @@ def image_metadata(data: bytes) -> tuple[str, int, int]:
     return mime, width, height
 
 
+def normalize_aspect_ratio(data: bytes, aspect_ratio: str) -> bytes:
+    """把生成图片裁剪到请求的宽高比；auto 或比例已一致时原样返回。"""
+    ratio_text = (aspect_ratio or "").strip()
+    if not ratio_text or ratio_text == "auto" or ":" not in ratio_text:
+        return data
+    try:
+        width_text, height_text = ratio_text.split(":", 1)
+        target = float(width_text) / float(height_text)
+    except (ValueError, ZeroDivisionError):
+        return data
+    if target <= 0:
+        return data
+    try:
+        with Image.open(io.BytesIO(data)) as source:
+            image = ImageOps.exif_transpose(source)
+            image.load()
+            image_format = (source.format or "PNG").upper()
+            width, height = image.size
+            if width <= 0 or height <= 0:
+                return data
+            current = width / height
+            if abs(current - target) / target < 0.01:
+                return data
+            if current > target:
+                crop_width = max(1, round(height * target))
+                left = (width - crop_width) // 2
+                cropped = image.crop((left, 0, left + crop_width, height))
+            else:
+                crop_height = max(1, round(width / target))
+                top = (height - crop_height) // 2
+                cropped = image.crop((0, top, width, top + crop_height))
+            if image_format == "JPEG" and cropped.mode not in ("RGB", "L"):
+                cropped = cropped.convert("RGB")
+            buffer = io.BytesIO()
+            save_kwargs = {"quality": 95} if image_format == "JPEG" else {}
+            cropped.save(buffer, format=image_format, **save_kwargs)
+            return buffer.getvalue()
+    except Exception:
+        return data
+
+
 def data_url_for_file(path: Path, mime: str | None = None) -> str:
     data = path.read_bytes()
     if mime is None:

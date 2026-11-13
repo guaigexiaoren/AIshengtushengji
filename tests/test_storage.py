@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import tempfile
 import time
@@ -12,6 +13,8 @@ from yixin.storage import (
     FileStore,
     ImageValidationError,
     data_url_for_file,
+    image_metadata,
+    normalize_aspect_ratio,
     sha256_file,
 )
 from PIL import Image
@@ -27,6 +30,38 @@ class StorageTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def _image_bytes(
+        self,
+        size: tuple[int, int],
+        image_format: str = "PNG",
+    ) -> bytes:
+        image = Image.new("RGB", size, (200, 120, 60))
+        buffer = io.BytesIO()
+        image.save(buffer, format=image_format)
+        return buffer.getvalue()
+
+    def test_normalize_aspect_ratio_crops_center_to_target(self) -> None:
+        result = normalize_aspect_ratio(self._image_bytes((100, 100)), "3:4")
+        _mime, width, height = image_metadata(result)
+        self.assertEqual((width, height), (75, 100))
+
+    def test_normalize_aspect_ratio_keeps_matching_ratio(self) -> None:
+        original = self._image_bytes((300, 400))
+        self.assertEqual(normalize_aspect_ratio(original, "3:4"), original)
+
+    def test_normalize_aspect_ratio_skips_auto(self) -> None:
+        original = self._image_bytes((100, 100))
+        self.assertEqual(normalize_aspect_ratio(original, "auto"), original)
+
+    def test_normalize_aspect_ratio_handles_jpeg(self) -> None:
+        result = normalize_aspect_ratio(
+            self._image_bytes((200, 100), "JPEG"),
+            "3:4",
+        )
+        mime, width, height = image_metadata(result)
+        self.assertEqual(mime, "image/jpeg")
+        self.assertEqual((width, height), (75, 100))
 
     def test_reference_copy_and_hash_are_stable(self) -> None:
         source = make_image(Path(self.temp.name) / "source.png")

@@ -26,6 +26,7 @@ if HAS_PYSIDE:
     )
 
     from yixin.api import NanoBananaClient
+    from yixin.constants import BUILTIN_PROMPT_TEMPLATES
     from yixin.collaboration.folders import current_date_folder
     from yixin.collaboration.reports import aggregate_report
     from yixin.collaboration.reports import ReportTaskRow
@@ -105,7 +106,11 @@ class FakeCentralRepository:
         self.project_attempts = []
         self.review_requests = []
         self.submission_requests = []
+        self.replaced_results = []
         self.report_result = None
+
+    def replace_attempt_result(self, attempt_id, result_id, _actor, **kwargs):
+        self.replaced_results.append((attempt_id, result_id, kwargs))
 
     def create_project(self, _actor, draft):
         self.created_drafts.append(draft)
@@ -114,8 +119,8 @@ class FakeCentralRepository:
     def update_subtask_sources(self, task_id, actor, **kwargs):
         self.source_updates.append((task_id, actor, kwargs))
 
-    def find_tasks_by_product(self, *_args):
-        return []
+    def find_tasks_by_products(self, _owner_id, _source_date, product_codes):
+        return {code: [] for code in product_codes}
 
     def update_project(self, *_args):
         pass
@@ -535,6 +540,9 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(page.project_table.isColumnHidden(6))
         self.assertEqual(page.task_table.rowCount(), 2)
         self.assertFalse(page.result_panel.isHidden())
+        self.assertFalse(
+            page.dual_preview.upload_button.isVisibleTo(page)
+        )
         self.assertIs(
             page.result_panel,
             page.dual_preview.result_pane,
@@ -636,7 +644,7 @@ class CollaborationPageTests(unittest.TestCase):
 
     def test_ai_generation_page_loads_subtask_and_toggles_skip(self) -> None:
         write_task_images(self.root)
-        task = make_task("claimed")
+        task = replace(make_task("claimed"), prompt_text="")
         self.repository.list_ai_generation_tasks = (
             lambda _actor, **_kwargs: [task]
         )
@@ -672,6 +680,12 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(len(page.person_assets), 1)
         self.assertEqual(len(page.pairs), 1)
         self.assertTrue(page.count_spin.isHidden())
+        multi_prompt = next(
+            prompt
+            for name, prompt in BUILTIN_PROMPT_TEMPLATES
+            if "多图换装" in name
+        )
+        self.assertEqual(page.prompt_edit.toPlainText(), multi_prompt)
         original_hashes = tuple(
             image.content_hash for image in page.garment_assets
         )
@@ -722,6 +736,11 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertFalse(page.pairs[0].skipped)
         page.bottom_skip_button.click()
         self.assertTrue(page.pairs[0].skipped)
+        page.prompt_edit.setPlainText("自定义提示词")
+        page._task_changed()
+        self.assertEqual(page.prompt_edit.toPlainText(), "自定义提示词")
+        page._clear_generation_editor()
+        self.assertEqual(page.prompt_edit.toPlainText(), "自定义提示词")
         page.deleteLater()
 
     def test_ai_generation_page_async_searches_first_hundred_tasks(
@@ -1130,10 +1149,11 @@ class CollaborationPageTests(unittest.TestCase):
         Image.new("RGB", (20, 20), "red").save(
             invalid / "衣服图" / "衣服1.png"
         )
-        self.repository.find_tasks_by_product = (
-            lambda _actor, _date, code: [object()]
-            if code == "DV263q99999p8072"
-            else []
+        self.repository.find_tasks_by_products = (
+            lambda _actor, _date, codes: {
+                code: ([object()] if code == "DV263q99999p8072" else [])
+                for code in codes
+            }
         )
         page = TaskCreatePage(
             self.repository,
@@ -1250,7 +1270,156 @@ class CollaborationPageTests(unittest.TestCase):
             self.resolver,
             self.actor,
         )
-        self.assertEqual(page.product_table.rowCount(), 0)
+        # 外部项目不再静默跳过缺目录的文件夹，而是列出并提示。
+        self.assertEqual(page.product_table.rowCount(), 1)
+        self.assertEqual(
+            page.product_table.item(0, 0).text(),
+            "需处理",
+        )
+        self.assertIn(
+            "缺少模特图目录",
+            page.product_table.item(0, 0).toolTip(),
+        )
+        page.deleteLater()
+
+    def test_product_folder_accepts_directory_aliases(self) -> None:
+        date_folder = current_date_folder(
+            self.root / "内部项目" / "春季项目"
+        )
+        product = date_folder.path / "DV263q25445p80723"
+        (product / "衣服").mkdir(parents=True)
+        (product / "model").mkdir(parents=True)
+        Image.new("RGB", (20, 20), "red").save(
+            product / "衣服" / "衣服1.png"
+        )
+        Image.new("RGB", (20, 20), "blue").save(
+            product / "model" / "模特1.png"
+        )
+        page = TaskCreatePage(
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        self.assertEqual(page.product_table.rowCount(), 1)
+        self.assertEqual(
+            page.product_table.item(0, 2).text(),
+            "DV263q25445p8072",
+        )
+        self.assertTrue(
+            page.product_table.item(0, 1).flags()
+            & Qt.ItemFlag.ItemIsUserCheckable
+        )
+        self.assertEqual(page.product_table.item(0, 3).text(), "1")
+        self.assertEqual(page.product_table.item(0, 4).text(), "1")
+        page.deleteLater()
+
+    def test_backup_subfolder_images_are_ignored(self) -> None:
+        date_folder = current_date_folder(
+            self.root / "内部项目" / "春季项目"
+        )
+        product = date_folder.path / "DV263q25445p80723"
+        (product / "衣服图").mkdir(parents=True)
+        (product / "模特图").mkdir(parents=True)
+        (product / "衣服图" / "备份").mkdir()
+        Image.new("RGB", (20, 20), "red").save(
+            product / "衣服图" / "衣服1.png"
+        )
+        Image.new("RGB", (20, 20), "green").save(
+            product / "衣服图" / "备份" / "旧图.png"
+        )
+        Image.new("RGB", (20, 20), "blue").save(
+            product / "模特图" / "模特1.png"
+        )
+        page = TaskCreatePage(
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        self.assertEqual(page.product_table.rowCount(), 1)
+        self.assertEqual(page.product_table.item(0, 3).text(), "1")
+        page.deleteLater()
+
+    def test_product_code_with_suffix_is_submitted_as_base_code(
+        self,
+    ) -> None:
+        date_folder = current_date_folder(
+            self.root / "内部项目" / "春季项目"
+        )
+        product = date_folder.path / "DV263q25445p80723-备注"
+        (product / "衣服图").mkdir(parents=True)
+        (product / "模特图").mkdir(parents=True)
+        Image.new("RGB", (20, 20), "red").save(
+            product / "衣服图" / "衣服1.png"
+        )
+        Image.new("RGB", (20, 20), "blue").save(
+            product / "模特图" / "模特1.png"
+        )
+        page = TaskCreatePage(
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        self.assertEqual(
+            page.product_table.item(0, 2).text(),
+            "DV263q25445p8072",
+        )
+        page.product_table.selectRow(0)
+        page.product_table.item(0, 1).setCheckState(
+            page.product_table.item(0, 1).checkState()
+        )
+        with (
+            patch(
+                "yixin.ui.task_create_page.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch("yixin.ui.task_create_page.QMessageBox.information"),
+        ):
+            page._create_selected()
+        self.assertEqual(len(self.repository.created_drafts), 1)
+        self.assertEqual(
+            self.repository.created_drafts[0].product_code,
+            "DV263q25445p8072",
+        )
+        page.deleteLater()
+
+    def test_choose_directory_switches_to_selected_project(self) -> None:
+        self.repository.list_accessible_projects = (
+            lambda _actor: (
+                ("internal", "春季项目"),
+                ("internal", "夏季项目"),
+            )
+        )
+        summer = current_date_folder(
+            self.root / "内部项目" / "夏季项目"
+        )
+        summer.path.mkdir(parents=True)
+        with patch(
+            "yixin.ui.task_create_page.QMessageBox.warning"
+        ) as warning:
+            page = TaskCreatePage(
+                self.repository,
+                self.resolver,
+                self.actor,
+            )
+            self.assertEqual(
+                page.project_combo.currentData(),
+                ("internal", "春季项目"),
+            )
+            with patch(
+                "yixin.ui.task_create_page.QFileDialog.getExistingDirectory",
+                return_value=str(summer.path),
+            ):
+                page._choose_directory()
+        warning.assert_not_called()
+        self.assertEqual(
+            page.project_combo.currentData(),
+            ("internal", "夏季项目"),
+        )
+        self.assertEqual(
+            Path(page.account_path.text()),
+            summer.path.resolve(),
+        )
+        self.assertIsNotNone(page.account_directory)
         page.deleteLater()
 
     def test_task_create_drag_folder_and_main_task_quota(self) -> None:
@@ -2445,6 +2614,104 @@ class CollaborationPageTests(unittest.TestCase):
             page.project_filter.findData("春季项目") >= 0,
             True,
         )
+        page.deleteLater()
+
+    def test_history_uploads_ps_image_and_confirms(self) -> None:
+        write_task_images(self.root)
+        task = make_task("approved")
+        product_root = self.root / task.project_relative_root
+        result_path = product_root / "AI成品" / "history-result.png"
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (40, 50), "orange").save(result_path)
+        result = GenerationResult(
+            id=71,
+            attempt_id=81,
+            result_index=0,
+            relative_path=result_path.relative_to(product_root).as_posix(),
+            thumbnail_relative_path=result_path.relative_to(
+                product_root
+            ).as_posix(),
+            content_hash="e" * 64,
+            mime="image/png",
+            width=40,
+            height=50,
+            is_final=True,
+        )
+        row = {
+            "id": 81,
+            "task_id": task.id,
+            "assignee_id": task.assignee_id,
+            "attempt_no": 1,
+            "project_code": task.project_code,
+            "task_code": task.task_code,
+            "product_code": task.product_code,
+            "project_name": task.project_name,
+            "access_project_name": "春季项目",
+            "operator_name": "AI制作Amy",
+            "model": task.model,
+            "provider_name": "A6API",
+            "status": ATTEMPT_SUCCEEDED,
+            "prompt_text": "历史改图",
+            "aspect_ratio": "3:4",
+            "resolution": "2K",
+            "n": 1,
+            "created_at": datetime.now(),
+            "result_count": 1,
+        }
+        self.repository.tasks_by_id[task.id] = task
+        self.repository.attempt_results[81] = [result]
+        self.repository.list_project_attempt_history = (
+            lambda _actor, **_kwargs: [row]
+        )
+        self.repository.list_project_attempt_history_page = (
+            lambda _actor, _query, page: PageResult(
+                [row], 1, page.page, page.page_size
+            )
+        )
+        self.repository.list_access_project_names = (
+            lambda _actor: ["春季项目"]
+        )
+        paths = AppPaths(self.root / "history-upload-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        store = FileStore(paths)
+        page = UnifiedHistoryPage(
+            database,
+            LibraryService(database, store, paths),
+            TaskWorker(database, NanoBananaClient(lambda: "test-key"), store),
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        page.table.selectRow(0)
+        self.app.processEvents()
+        self.assertTrue(
+            page.dual_preview.upload_button.isVisibleTo(page)
+        )
+        self.assertFalse(page.confirm_button.isEnabled())
+        replacement = self.root / "ps-result.png"
+        Image.new("RGB", (60, 80), "green").save(replacement)
+        with patch(
+            "yixin.ui.unified_history_page.QFileDialog.getOpenFileName",
+            return_value=(str(replacement), ""),
+        ):
+            page._upload_ps_image()
+        self.assertTrue(page.confirm_button.isEnabled())
+        with patch(
+            "yixin.ui.unified_history_page.QMessageBox.information"
+        ):
+            page._confirm_ps_upload()
+        self.assertEqual(len(self.repository.replaced_results), 1)
+        attempt_id, result_id, kwargs = self.repository.replaced_results[0]
+        self.assertEqual((attempt_id, result_id), (81, 71))
+        saved = self.resolver.resolve_project_path(
+            task.project_relative_root,
+            kwargs["relative_path"],
+        )
+        self.assertTrue(saved.is_file())
+        self.assertEqual(kwargs["mime"], "image/png")
+        self.assertFalse(page.confirm_button.isEnabled())
         page.deleteLater()
 
     def test_image_zoom_view_supports_pan_and_zoom(self) -> None:

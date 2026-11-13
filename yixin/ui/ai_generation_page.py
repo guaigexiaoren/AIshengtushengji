@@ -80,6 +80,7 @@ class AIGenerationPage(BatchDressPage):
         self.project_progress: dict[int, tuple[int, int]] = {}
         self.force_direct_retry_task_id: int | None = None
         self._loading_source_state = False
+        self._prompt_cache: dict[int, str] = {}
         self.async_mode = async_mode
         self.query_runner = (
             get_query_runner() if async_mode else None
@@ -97,6 +98,7 @@ class AIGenerationPage(BatchDressPage):
             generate_button_text="加入队列",
             auto_load=False,
             async_thumbnails=async_mode,
+            repository=repository,
         )
         self.count_spin.setRange(1, 1)
         self.count_spin.setValue(1)
@@ -180,8 +182,33 @@ class AIGenerationPage(BatchDressPage):
         self.prompt_edit.setPlaceholderText(
             "请描述换装要求。参考图顺序固定为：衣服图在前，模特图最后。"
         )
+        self.prompt_edit.textChanged.connect(self._cache_current_prompt)
         layout.addWidget(self.prompt_edit)
         return card
+
+    def _default_prompt(self) -> str:
+        for name, prompt in BUILTIN_PROMPT_TEMPLATES:
+            if "多图换装" in name:
+                return prompt
+        return BUILTIN_PROMPT_TEMPLATES[1 if len(BUILTIN_PROMPT_TEMPLATES) > 1 else 0][1]
+
+    def _select_default_template(self) -> str | None:
+        """把模板下拉切到“多图换装”，返回该模板提示词（没有则 None）。"""
+        if not hasattr(self, "template_combo"):
+            return None
+        for index in range(self.template_combo.count()):
+            data = self.template_combo.itemData(index)
+            if data and "多图换装" in str(data.get("name") or ""):
+                self.template_combo.blockSignals(True)
+                self.template_combo.setCurrentIndex(index)
+                self.template_combo.blockSignals(False)
+                return str(data.get("prompt") or "") or None
+        return None
+
+    def _cache_current_prompt(self) -> None:
+        task = self.current_task
+        if task is not None:
+            self._prompt_cache[task.id] = self.prompt_edit.toPlainText()
 
     def _refresh_providers(self) -> None:
         try:
@@ -398,7 +425,6 @@ class AIGenerationPage(BatchDressPage):
         self._refresh_role("garment")
         self._refresh_role("person")
         self._refresh_pairs()
-        self.prompt_edit.clear()
         self.task_status_label.setText("没有可制作的子任务")
         self._update_asset_actions()
 
@@ -435,9 +461,14 @@ class AIGenerationPage(BatchDressPage):
             self._loading_source_state = False
         self._refresh_pairs()
         self._auto_match()
-        prompt = task.prompt_text.strip()
+        prompt = self._prompt_cache.get(task.id)
+        if prompt is None:
+            prompt = task.prompt_text.strip()
         if not prompt:
-            prompt = BUILTIN_PROMPT_TEMPLATES[0][1]
+            prompt = (
+                self._select_default_template()
+                or self._default_prompt()
+            )
         self.prompt_edit.setPlainText(prompt)
         if task.model in MODEL_LABELS:
             index = self.model_combo.findData(task.model)

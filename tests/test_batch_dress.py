@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests.qt_test_support import flush_qt_deletes
@@ -653,6 +654,63 @@ class BatchDressTests(unittest.TestCase):
         free_task = tasks[0]
         self.assertEqual(free_task["mode"], MODE_FREE_COMPOSE)
         self.assertTrue(free_task["prompt"].startswith("自由组合："))
+
+    def test_model_without_key_auto_switches_to_usable_model(self) -> None:
+        class Repo:
+            def list_provider_routes(self, model):
+                routes = {
+                    "gemini-3-pro-image": [
+                        SimpleNamespace(
+                            provider_id=1,
+                            protocol="openai_images",
+                            max_reference_images=14,
+                            images_per_request=1,
+                        )
+                    ],
+                    "gemini-3.1-flash-image": [
+                        SimpleNamespace(
+                            provider_id=2,
+                            protocol="openai_images",
+                            max_reference_images=14,
+                            images_per_request=1,
+                        )
+                    ],
+                }
+                return routes.get(model, [])
+
+            def list_api_providers(self, include_disabled=True):
+                return [
+                    SimpleNamespace(id=1, display_name="平台A"),
+                    SimpleNamespace(id=2, display_name="平台B"),
+                ]
+
+        class Keys:
+            def load(self, provider_id=None, strict=False):
+                return "sk-test" if provider_id == 2 else None
+
+        self.page.repository = Repo()
+        self.page.secret_store = Keys()
+        self.assertEqual(
+            self.page._resolve_usable_model("gemini-3-pro-image", 3, 1),
+            "gemini-3.1-flash-image",
+        )
+
+        self.page.secret_store = type(
+            "Keys",
+            (),
+            {
+                "load": staticmethod(
+                    lambda provider_id=None, strict=False: None
+                )
+            },
+        )()
+        self.assertIsNone(
+            self.page._resolve_usable_model("gemini-3-pro-image", 3, 1)
+        )
+        self.assertIn(
+            "缺少 Key 的平台：平台A、平台B",
+            self.page._key_coverage_message(),
+        )
 
     def test_free_compose_retry_restores_order_roles_and_user_prompt(self) -> None:
         first = self.store.save_reference(

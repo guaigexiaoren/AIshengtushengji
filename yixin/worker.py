@@ -12,7 +12,7 @@ from .constants import TASK_CANCELLED, TASK_FAILED, TASK_SUCCESS
 from .database import Database, StateTransitionError
 from .logging_utils import sanitize_text
 from .models import ApiError, ConfigurationError, ImageRequest
-from .storage import FileStore
+from .storage import FileStore, normalize_aspect_ratio
 
 
 class WorkerSignals(QObject):
@@ -114,7 +114,10 @@ class TaskWorker:
                 return
 
             for index, remote in enumerate(result.images):
-                data = self.client.resolve_image(remote)
+                data = normalize_aspect_ratio(
+                    self.client.resolve_image(remote),
+                    request.aspect_ratio,
+                )
                 stored = self.file_store.store_generated(task_id, data, index)
                 thumbnail = self.file_store.create_thumbnail(stored.path)
                 self.database.add_task_result(

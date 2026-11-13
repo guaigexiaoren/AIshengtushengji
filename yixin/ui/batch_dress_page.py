@@ -43,7 +43,9 @@ from ..constants import (
     MODE_DRESS_UP,
     MODE_FREE_COMPOSE,
     MAX_REFERENCE_IMAGES,
+    MODEL_OPTIONS,
     MODEL_SELECTION_OPTIONS,
+    PROTOCOL_OPENAI_CHAT_IMAGE,
     RESOLUTIONS,
 )
 from ..database import Database
@@ -812,6 +814,7 @@ class BatchDressPage(QWidget):
         generate_button_text: str = "生成全部配对并加入队列",
         auto_load: bool = True,
         async_thumbnails: bool = False,
+        repository=None,
     ) -> None:
         super().__init__(parent)
         self.database = database
@@ -819,6 +822,7 @@ class BatchDressPage(QWidget):
         self.library_service = library_service
         self.worker = worker
         self.secret_store = secret_store
+        self.repository = repository
         self.app_settings = AppSettings(database)
         self.garment_assets: list[StoredImage] = []
         self.person_assets: list[StoredImage] = []
@@ -1877,14 +1881,85 @@ class BatchDressPage(QWidget):
             self.pair_grid.sizeHint().height()
         )
 
+    def _model_has_usable_route(
+        self,
+        model: str,
+        reference_count: int,
+        n: int,
+    ) -> bool:
+        """模型是否存在「能处理当前素材数量、且本账号有 Key」的平台。"""
+        if self.repository is None:
+            return bool(self.secret_store.load())
+        try:
+            routes = self.repository.list_provider_routes(model)
+        except Exception:
+            return bool(self.secret_store.load())
+        if not routes:
+            # 没有配置任何平台路由时，交给执行层给出对应提示。
+            return bool(self.secret_store.load())
+        for route in routes:
+            if reference_count > int(route.max_reference_images or 0):
+                continue
+            if (
+                route.protocol != PROTOCOL_OPENAI_CHAT_IMAGE
+                and n > int(route.images_per_request or 1)
+            ):
+                continue
+            try:
+                if self.secret_store.load(provider_id=route.provider_id):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _resolve_usable_model(
+        self,
+        preferred: str,
+        reference_count: int,
+        n: int,
+    ) -> str | None:
+        """优先用原模型；没有可用 Key 时按内置顺序换一个能用的。"""
+        if self._model_has_usable_route(preferred, reference_count, n):
+            return preferred
+        for _label, model_id in MODEL_OPTIONS:
+            if model_id == preferred:
+                continue
+            if self._model_has_usable_route(model_id, reference_count, n):
+                return model_id
+        return None
+
+    def _key_coverage_message(self) -> str:
+        configured: list[str] = []
+        missing: list[str] = []
+        if self.repository is not None:
+            try:
+                providers = self.repository.list_api_providers(
+                    include_disabled=False
+                )
+            except Exception:
+                providers = []
+            for provider in providers:
+                try:
+                    has_key = bool(
+                        self.secret_store.load(provider_id=provider.id)
+                    )
+                except Exception:
+                    has_key = False
+                (configured if has_key else missing).append(
+                    provider.display_name
+                )
+        lines = ["当前模型在已启用平台中没有可用的 API Key。"]
+        if configured:
+            lines.append("已配置 Key 的平台：" + "、".join(configured))
+        if missing:
+            lines.append("缺少 Key 的平台：" + "、".join(missing))
+        lines.append(
+            "请在管理控制台为该账号补充对应平台的 Key，"
+            "或改用有 Key 的模型。"
+        )
+        return "\n".join(lines)
+
     def _enqueue_all(self) -> None:
-        if not self.secret_store.load():
-            QMessageBox.warning(
-                self,
-                "API Key 不可用",
-                "当前账号尚未配置 API Key，请联系管理员。",
-            )
-            return
         if not self.pairs:
             QMessageBox.information(self, "没有配对", "请至少建立一组服装与人物配对。")
             return
@@ -1927,6 +2002,27 @@ class BatchDressPage(QWidget):
                 task_model = decision.model
                 auto_strategy = decision.strategy
                 auto_reason = decision.reason
+            else:
+                task_model = selected_model
+            usable_model = self._resolve_usable_model(
+                task_model,
+                len(group.references),
+                count,
+            )
+            if usable_model is None:
+                QMessageBox.warning(
+                    self,
+                    "API Key 不可用",
+                    self._key_coverage_message(),
+                )
+                return
+            if usable_model != task_model:
+                task_model = usable_model
+                auto_reason = (
+                    f"{auto_reason}；原模型无可用 Key，已自动改用有 Key 的模型"
+                    if auto_reason
+                    else "原模型无可用 Key，已自动改用有 Key 的模型"
+                )
             requests.append(
                 ImageRequest(
                     model=task_model,

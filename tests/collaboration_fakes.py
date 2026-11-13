@@ -3,8 +3,8 @@ from yixin.collaboration.types import ROLE_AI, AuthUser
 
 
 class EmptyCentralRepository:
-    def find_tasks_by_product(self, *_args):
-        return []
+    def find_tasks_by_products(self, _owner_id, _source_date, product_codes):
+        return {code: [] for code in product_codes}
 
     def list_projects(self, **_kwargs):
         return []

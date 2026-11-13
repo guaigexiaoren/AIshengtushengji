@@ -37,12 +37,22 @@ class ProductCodeTests(unittest.TestCase):
         self.assertEqual(code.season, "1")
         self.assertEqual(code.base_code, "DV241a10001b1234")
 
+    def test_ignores_characters_appended_after_code(self) -> None:
+        for value in (
+            "DV263q25445p80723-备注",
+            "DV263q25445p8072_1",
+            "DV263q25445p80723副本",
+            "DV263q25445p80723 (改)",
+        ):
+            code = parse_product_code(value)
+            self.assertIsNotNone(code, value)
+            self.assertEqual(code.base_code, "DV263q25445p8072", value)
+
     def test_rejects_malformed_codes(self) -> None:
         for value in (
             "",
             "123",
             "DV263q25445p807",
-            "DV263q25445p80723x",
             "ABC263q1p80723",
             "DV5q25445p8072",
         ):
