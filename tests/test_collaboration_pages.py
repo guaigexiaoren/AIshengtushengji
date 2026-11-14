@@ -853,15 +853,32 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(page.provider_combo.count(), 2)
         self.assertIn("主任务 2/5", page.task_selector.itemText(1))
         self.assertIn("待制作", page.task_selector.itemText(1))
-        page.provider_combo.setCurrentIndex(1)
-        page._select_pair(page.pairs[0])
-        page.bottom_skip_button.click()
-        page._enqueue_all()
+        with (
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(QMessageBox, "warning"),
+            patch.object(QMessageBox, "information"),
+        ):
+            page._asset_list_for("garment").setCurrentRow(0)
+            page._remove_selected("garment")
+            page._auto_match()
+            self.assertEqual(len(page.garment_assets), 1)
+            page.provider_combo.setCurrentIndex(1)
+            page._select_pair(page.pairs[0])
+            page.bottom_skip_button.click()
+            page._enqueue_all()
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0][0], task.id)
         specs = captured[0][2]
         self.assertEqual(len(specs), 1)
-        self.assertEqual(len(specs[0].garment_hashes), 2)
+        self.assertEqual(len(specs[0].garment_hashes), 1)
+        self.assertEqual(
+            specs[0].person_hash,
+            page.person_assets[0].content_hash,
+        )
         self.assertTrue(specs[0].skipped)
         self.assertEqual(
             specs[0].requested_provider_code,

@@ -3461,11 +3461,20 @@ class MySQLCentralRepository:
                     for row in garment_rows
                 }
                 fallback_garment_id = int(garment_rows[0]["garment_asset_id"])
-                # 子任务保留源任务的全部衣服图，保证提交记录/历史记录里的
-                # 参考图完整；当前配对实际用到的衣服由本机素材快照决定。
-                source_garment_ids = tuple(
-                    int(row["garment_asset_id"]) for row in garment_rows
+                # 子任务记录当前配对实际使用的素材；AI 生图页删掉的图不会
+                # 再出现在历史记录里。
+                hash_to_model_asset: dict[str, int] = {}
+                cursor.execute(
+                    """
+                    SELECT id, content_hash FROM project_assets
+                    WHERE project_id = %s AND role = 'model'
+                    """,
+                    (int(source["project_id"]),),
                 )
+                for row in cursor.fetchall():
+                    hash_to_model_asset[str(row["content_hash"])] = int(
+                        row["id"]
+                    )
                 cursor.execute(
                     """
                     SELECT task_no
@@ -3532,7 +3541,10 @@ class MySQLCentralRepository:
                             int(source["project_id"]),
                             task_no,
                             selected_assets[0],
-                            int(source["model_asset_id"]),
+                            hash_to_model_asset.get(
+                                pair.person_hash,
+                                int(source["model_asset_id"]),
+                            ),
                             child_status,
                             child_assignee_id,
                             prompt,
@@ -3550,7 +3562,7 @@ class MySQLCentralRepository:
                     )
                     child_task_id = int(cursor.lastrowid)
                     for position, garment_asset_id in enumerate(
-                        source_garment_ids or selected_assets,
+                        selected_assets,
                         start=1,
                     ):
                         cursor.execute(

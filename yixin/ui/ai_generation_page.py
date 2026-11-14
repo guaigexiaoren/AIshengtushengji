@@ -747,6 +747,11 @@ class AIGenerationPage(BatchDressPage):
                         model_id
                     ),
                     garment_hashes=garment_hashes,
+                    person_hash=(
+                        group.person.content_hash
+                        if group.person is not None
+                        else ""
+                    ),
                     skipped=group.skipped,
                     requested_provider_code=provider_code,
                     requested_provider_name=provider_name,

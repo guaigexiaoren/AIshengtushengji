@@ -351,6 +351,7 @@ class GenerationPairSpec:
     n: int
     unit_price: Decimal
     garment_hashes: tuple[str, ...]
+    person_hash: str = ""
     skipped: bool = False
     requested_provider_code: str = ""
     requested_provider_name: str = ""
