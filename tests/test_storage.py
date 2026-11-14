@@ -63,6 +63,21 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(mime, "image/jpeg")
         self.assertEqual((width, height), (75, 100))
 
+    def test_cleanup_temp_keeps_pending_generation_results(self) -> None:
+        old = time.time() - 8 * 24 * 60 * 60
+        pending = (
+            self.paths.temp / "pending_results" / "1" / "image.png"
+        )
+        pending.parent.mkdir(parents=True)
+        pending.write_bytes(b"pending")
+        os.utime(pending, (old, old))
+        ordinary = self.paths.temp / "old-temp.png"
+        ordinary.write_bytes(b"temp")
+        os.utime(ordinary, (old, old))
+        self.store.cleanup_temp([], days=7)
+        self.assertTrue(pending.exists())
+        self.assertFalse(ordinary.exists())
+
     def test_reference_copy_and_hash_are_stable(self) -> None:
         source = make_image(Path(self.temp.name) / "source.png")
         first = self.store.save_reference(source)

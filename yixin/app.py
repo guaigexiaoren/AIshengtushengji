@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from .collaboration.cleanup import cleanup_expired_candidates
 from .collaboration.local_sources import cleanup_old_attempt_snapshots
+from .collaboration.pending_results import migrate_legacy_pending_results
 from .collaboration.api_keys import DatabaseApiKeyStore
 from .collaboration.repository import (
     MySQLCentralRepository,
@@ -72,6 +73,7 @@ def run() -> int:
     paths = AppPaths.default()
     try:
         paths.ensure()
+        migrate_legacy_pending_results(paths.temp)
         # 同一数据目录只允许一个实例，避免第二个实例把运行中的任务判为失败。
         instance_lock = QLockFile(str(paths.root / "app.lock"))
         if not instance_lock.tryLock(100):

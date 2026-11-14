@@ -26,8 +26,9 @@ if HAS_PYSIDE:
     )
 
     from yixin.api import NanoBananaClient
-    from yixin.constants import BUILTIN_PROMPT_TEMPLATES
+    from yixin.constants import BUILTIN_PROMPT_TEMPLATES, DEFAULT_MODEL
     from yixin.collaboration.folders import current_date_folder
+    from yixin.collaboration.pending_results import save_pending_manifest
     from yixin.collaboration.reports import aggregate_report
     from yixin.collaboration.reports import ReportTaskRow
     from yixin.collaboration.shared_paths import SharedPathResolver
@@ -107,10 +108,14 @@ class FakeCentralRepository:
         self.review_requests = []
         self.submission_requests = []
         self.replaced_results = []
+        self.confirmed_results = []
         self.report_result = None
 
     def replace_attempt_result(self, attempt_id, result_id, _actor, **kwargs):
         self.replaced_results.append((attempt_id, result_id, kwargs))
+
+    def confirm_pending_result(self, attempt_id, _actor, **kwargs):
+        self.confirmed_results.append((attempt_id, kwargs))
 
     def create_project(self, _actor, draft):
         self.created_drafts.append(draft)
@@ -2713,6 +2718,194 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(kwargs["mime"], "image/png")
         self.assertFalse(page.confirm_button.isEnabled())
         page.deleteLater()
+
+    def test_history_confirms_pending_generation_result(self) -> None:
+        write_task_images(self.root)
+        task = make_task("approved")
+        row = {
+            "id": 82,
+            "task_id": task.id,
+            "assignee_id": task.assignee_id,
+            "attempt_no": 1,
+            "project_code": task.project_code,
+            "task_code": task.task_code,
+            "product_code": task.product_code,
+            "project_name": task.project_name,
+            "access_project_name": "春季项目",
+            "operator_name": "AI制作Amy",
+            "model": task.model,
+            "provider_name": "A6API",
+            "status": ATTEMPT_SUCCEEDED,
+            "prompt_text": "待确认结果",
+            "aspect_ratio": "3:4",
+            "resolution": "2K",
+            "n": 1,
+            "created_at": datetime.now(),
+            "result_count": 0,
+        }
+        self.repository.tasks_by_id[task.id] = task
+        self.repository.attempt_results[82] = []
+        self.repository.list_project_attempt_history = (
+            lambda _actor, **_kwargs: [row]
+        )
+        self.repository.list_access_project_names = (
+            lambda _actor: ["春季项目"]
+        )
+        paths = AppPaths(self.root / "history-pending-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        store = FileStore(paths)
+        pending_dir = paths.temp / "pending_results" / "82"
+        pending_dir.mkdir(parents=True)
+        pending_image = pending_dir / "00_abcdef123456.png"
+        Image.new("RGB", (30, 40), "red").save(pending_image)
+        save_pending_manifest(
+            paths.temp,
+            attempt_id=82,
+            task_id=task.id,
+            project_relative_root=task.project_relative_root,
+            task_code=task.task_code,
+            attempt_no=1,
+            items=[
+                {
+                    "result_index": 0,
+                    "filename": pending_image.name,
+                    "content_hash": "f" * 64,
+                    "mime": "image/png",
+                    "width": 30,
+                    "height": 40,
+                }
+            ],
+        )
+        page = UnifiedHistoryPage(
+            database,
+            LibraryService(database, store, paths),
+            TaskWorker(database, NanoBananaClient(lambda: "test-key"), store),
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        page.table.selectRow(0)
+        self.app.processEvents()
+        pending_assets = [
+            asset
+            for asset in page.current_assets
+            if getattr(asset, "label", "") == "待确认"
+        ]
+        self.assertEqual(len(pending_assets), 1)
+        self.assertTrue(page.confirm_button.isEnabled())
+        self.assertFalse(page.save_local_button.isEnabled())
+        with patch(
+            "yixin.ui.unified_history_page.QMessageBox.information"
+        ):
+            page._confirm_ps_upload()
+        self.assertEqual(len(self.repository.confirmed_results), 1)
+        attempt_id, kwargs = self.repository.confirmed_results[0]
+        self.assertEqual(attempt_id, 82)
+        self.assertEqual(kwargs["result_index"], 0)
+        saved = self.resolver.resolve_project_path(
+            task.project_relative_root,
+            kwargs["relative_path"],
+        )
+        self.assertTrue(saved.is_file())
+        self.assertFalse(pending_image.exists())
+        page.deleteLater()
+
+    def test_ai_generation_inherits_settings_within_project(self) -> None:
+        write_task_images(self.root)
+        first = replace(
+            make_task("claimed"),
+            id=901,
+            task_code="T-901",
+            prompt_text="",
+        )
+        second = replace(
+            make_task("claimed"),
+            id=902,
+            task_code="T-902",
+            prompt_text="",
+        )
+        self.repository.list_ai_generation_tasks = (
+            lambda _actor, **_kwargs: [first, second]
+        )
+        self.repository.list_queued_attempts = lambda _actor_id: []
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        paths = AppPaths(self.root / "ai-inherit-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: "sk-test-123456")
+        worker = TaskWorker(database, client, file_store)
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            AuthUser(4, "ai_amy", "AI Amy", "ai"),
+            client,
+            key_store,
+            database,
+            file_store,
+            LibraryService(database, file_store, paths),
+            worker,
+            key_store,
+            auto_load=False,
+        )
+        page.refresh()
+        page.task_selector.setCurrentIndex(1)
+        page.prompt_edit.setPlainText("沿用设置")
+        page.aspect_combo.setCurrentIndex(
+            page.aspect_combo.findData("16:9")
+        )
+        page.task_selector.setCurrentIndex(2)
+        self.assertEqual(page.prompt_edit.toPlainText(), "沿用设置")
+        self.assertEqual(page.aspect_combo.currentData(), "16:9")
+
+        multi_prompt = next(
+            prompt
+            for name, prompt in BUILTIN_PROMPT_TEMPLATES
+            if "多图换装" in name
+        )
+        other_project = replace(
+            make_task("claimed"),
+            id=903,
+            task_code="T-903",
+            project_id=99,
+            prompt_text="",
+        )
+        self.repository.list_ai_generation_tasks = (
+            lambda _actor, **_kwargs: [other_project]
+        )
+        page.refresh()
+        page.task_selector.setCurrentIndex(1)
+        self.assertEqual(page.prompt_edit.toPlainText(), multi_prompt)
+        self.assertEqual(page.aspect_combo.currentData(), "3:4")
+        page.deleteLater()
+
+    def test_generation_worker_pending_dir_is_not_doubled(self) -> None:
+        from yixin.collaboration.worker import ProjectGenerationWorker
+
+        worker = ProjectGenerationWorker(
+            repository=None,
+            client=None,
+            resolver=self.resolver,
+            task=make_task("claimed"),
+            actor=self.actor,
+            prompt="提示词",
+            model=DEFAULT_MODEL,
+            aspect_ratio="3:4",
+            resolution="2K",
+            n=1,
+            pending_root=self.root / "temp",
+        )
+        self.assertEqual(
+            worker._pending_attempt_dir(7),
+            self.root / "temp" / "pending_results" / "7",
+        )
 
     def test_image_zoom_view_supports_pan_and_zoom(self) -> None:
         first_path = self.root / "compare-left.png"

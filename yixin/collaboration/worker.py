@@ -15,6 +15,11 @@ from ..storage import (
     normalize_aspect_ratio,
     sha256_bytes,
 )
+from .pending_results import (
+    clear_pending_results,
+    pending_results_root,
+    save_pending_manifest,
+)
 from .repository import (
     GenerationSlotBusyError,
     MySQLCentralRepository,
@@ -52,6 +57,7 @@ class ProjectGenerationWorker:
         n: int,
         local_references: tuple[StoredImage, ...] | None = None,
         reserved_attempt: GenerationAttempt | None = None,
+        pending_root: Path | None = None,
     ) -> None:
         self.repository = repository
         self.client = client
@@ -65,6 +71,7 @@ class ProjectGenerationWorker:
         self.n = n
         self.local_references = local_references
         self.reserved_attempt = reserved_attempt
+        self.pending_root = pending_root
         self.signals = GenerationWorkerSignals()
         self._thread: threading.Thread | None = None
 
@@ -77,6 +84,11 @@ class ProjectGenerationWorker:
             daemon=True,
         )
         self._thread.start()
+
+    def _pending_attempt_dir(self, attempt_id: int) -> Path:
+        return pending_results_root(self.pending_root) / str(
+            int(attempt_id)
+        )
 
     def _run(self) -> None:
         attempt_id = 0
@@ -161,6 +173,60 @@ class ProjectGenerationWorker:
                 ),
             )
             api_result = self.client.generate(request)
+            if self.pending_root is not None:
+                pending_dir = self._pending_attempt_dir(attempt_id)
+                pending_dir.mkdir(parents=True, exist_ok=True)
+                items: list[dict] = []
+                for index, remote in enumerate(api_result.images):
+                    data = normalize_aspect_ratio(
+                        self.client.resolve_image(remote),
+                        self.aspect_ratio,
+                    )
+                    mime, width, height = image_metadata(data)
+                    suffix = MIME_TO_SUFFIX.get(mime, ".png")
+                    content_hash = sha256_bytes(data)
+                    filename = (
+                        f"{index:02d}_{content_hash[:12]}{suffix}"
+                    )
+                    image_path = pending_dir / filename
+                    atomic_write_bytes(image_path, data)
+                    items.append(
+                        {
+                            "result_index": index,
+                            "filename": filename,
+                            "content_hash": content_hash,
+                            "mime": mime,
+                            "width": width,
+                            "height": height,
+                        }
+                    )
+                save_pending_manifest(
+                    self.pending_root,
+                    attempt_id=attempt_id,
+                    task_id=self.task.id,
+                    project_relative_root=(
+                        self.task.project_relative_root
+                    ),
+                    task_code=self.task.task_code,
+                    attempt_no=attempt.attempt_no,
+                    items=items,
+                )
+                self.repository.finish_pending_attempt(
+                    attempt_id,
+                    self.actor,
+                    result_count=len(items),
+                    request_id=api_result.request_id or "",
+                    remote_task_id=api_result.remote_task_id or "",
+                    raw_response=dict(api_result.raw_response),
+                    input_tokens=api_result.usage_input_tokens,
+                    output_tokens=api_result.usage_output_tokens,
+                    provider_id=api_result.provider_id,
+                    provider_code=api_result.provider_code,
+                    provider_name=api_result.provider_name,
+                    provider_model=api_result.provider_model,
+                )
+                self.signals.finished.emit(self.task.id, attempt_id)
+                return
             output_directory = self.resolver.output_directory(
                 self.task,
                 attempt.attempt_no,
@@ -213,6 +279,14 @@ class ProjectGenerationWorker:
             self.signals.finished.emit(self.task.id, attempt_id)
         except Exception as exc:
             message = sanitize_text(str(exc))
+            if self.pending_root is not None and attempt_id:
+                try:
+                    clear_pending_results(
+                        self.pending_root,
+                        attempt_id,
+                    )
+                except Exception:
+                    pass
             for image_path, relative_path in written_results:
                 try:
                     if (

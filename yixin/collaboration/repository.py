@@ -4862,6 +4862,245 @@ class MySQLCentralRepository:
                     },
                 )
 
+    def finish_pending_attempt(
+        self,
+        attempt_id: int,
+        actor: AuthUser,
+        *,
+        result_count: int,
+        request_id: str,
+        remote_task_id: str,
+        raw_response: dict[str, Any],
+        input_tokens: int | None,
+        output_tokens: int | None,
+        provider_id: int | None = None,
+        provider_code: str = "",
+        provider_name: str = "",
+        provider_model: str = "",
+    ) -> None:
+        """生成完成但结果暂存本机，任务进入待确认，等人工确认后再计入成品。"""
+        if result_count <= 0:
+            raise ValueError("生成结果不能为空")
+        now = utc_now()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                attempt = self._attempt_row_for_update(cursor, attempt_id)
+                if (
+                    int(attempt["operator_id"]) != actor.id
+                    and actor.role != ROLE_ADMIN
+                ):
+                    raise PermissionDeniedError("不能修改其他人的生成记录")
+                if attempt["status"] != ATTEMPT_RUNNING:
+                    raise StateConflictError("生成记录状态已经变化")
+                task = self._task_row_for_update(
+                    cursor,
+                    int(attempt["task_id"]),
+                )
+                if (
+                    task["status"] in (TASK_CANCELLED, TASK_APPROVED)
+                    or task["project_status"] == PROJECT_CANCELLED
+                ):
+                    raise StateConflictError(
+                        "项目或子任务已取消，本次结果不再登记"
+                    )
+                if task["status"] != TASK_WORKING:
+                    raise StateConflictError(
+                        "子任务已不处于制作中，本次结果不再登记"
+                    )
+                if int(attempt["source_revision"] or 1) != int(
+                    task["source_revision"] or 1
+                ):
+                    raise StateConflictError(
+                        "生成期间素材已变更，本次结果已失效"
+                    )
+                cursor.execute(
+                    """
+                    UPDATE generation_attempts
+                    SET status = %s, generated_image_count = %s,
+                        request_id = %s, remote_task_id = %s,
+                        raw_response_json = %s, input_tokens = %s,
+                        output_tokens = %s, provider_id = %s,
+                        provider_code = %s, provider_name = %s,
+                        provider_model = %s, finished_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        ATTEMPT_SUCCEEDED,
+                        result_count,
+                        request_id,
+                        remote_task_id,
+                        json.dumps(
+                            raw_response,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        input_tokens,
+                        output_tokens,
+                        provider_id,
+                        provider_code,
+                        provider_name,
+                        provider_model,
+                        now,
+                        attempt_id,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    UPDATE project_tasks
+                    SET status = %s, submitted_at = %s, updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        TASK_AWAITING_ACCEPTANCE,
+                        now,
+                        now,
+                        int(attempt["task_id"]),
+                    ),
+                )
+                self._update_project_status(
+                    cursor,
+                    int(attempt["project_id"]),
+                )
+                self._event(
+                    cursor,
+                    int(attempt["project_id"]),
+                    int(attempt["task_id"]),
+                    actor.id,
+                    "generation_pending_confirm",
+                    TASK_WORKING,
+                    TASK_AWAITING_ACCEPTANCE,
+                    {
+                        "attempt_id": attempt_id,
+                        "image_count": result_count,
+                    },
+                )
+
+    def confirm_pending_result(
+        self,
+        attempt_id: int,
+        actor: AuthUser,
+        *,
+        result_index: int,
+        relative_path: str,
+        thumbnail_relative_path: str,
+        content_hash: str,
+        mime: str,
+        width: int,
+        height: int,
+    ) -> None:
+        """把本机暂存的生成结果登记为最终图，并完成子任务。"""
+        now = utc_now()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                attempt = self._attempt_row_for_update(cursor, attempt_id)
+                if (
+                    int(attempt["operator_id"]) != actor.id
+                    and actor.role != ROLE_ADMIN
+                ):
+                    raise PermissionDeniedError("不能确认其他人的生成结果")
+                if attempt["status"] != ATTEMPT_SUCCEEDED:
+                    raise StateConflictError("生成记录尚未成功完成")
+                task = self._task_row_for_update(
+                    cursor,
+                    int(attempt["task_id"]),
+                )
+                if task["project_status"] == PROJECT_CANCELLED:
+                    raise StateConflictError("项目已取消，不能确认结果")
+                if task["status"] in (TASK_CANCELLED, TASK_APPROVED):
+                    raise StateConflictError("子任务已结束，不能确认结果")
+                cursor.execute(
+                    """
+                    SELECT id FROM generation_results
+                    WHERE attempt_id = %s AND result_index = %s
+                    LIMIT 1
+                    """,
+                    (attempt_id, int(result_index)),
+                )
+                if cursor.fetchone() is not None:
+                    raise StateConflictError("该结果已经确认过了")
+                cursor.execute(
+                    """
+                    UPDATE generation_results gr
+                    JOIN generation_attempts ga ON ga.id = gr.attempt_id
+                    SET gr.is_final = 0,
+                        gr.expire_at = CASE
+                            WHEN gr.expire_at IS NULL THEN
+                                DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 30 DAY)
+                            ELSE gr.expire_at
+                        END
+                    WHERE ga.task_id = %s
+                    """,
+                    (int(attempt["task_id"]),),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO generation_results(
+                        attempt_id, result_index, relative_path,
+                        thumbnail_relative_path, content_hash, mime,
+                        width, height, is_final, source_type,
+                        source_revision, created_at, expire_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, 1, 'generated',
+                        %s, %s, NULL
+                    )
+                    """,
+                    (
+                        attempt_id,
+                        int(result_index),
+                        relative_path,
+                        thumbnail_relative_path,
+                        content_hash,
+                        mime,
+                        int(width),
+                        int(height),
+                        int(attempt.get("source_revision") or 1),
+                        now,
+                    ),
+                )
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) AS count FROM generation_results
+                    WHERE attempt_id IN (
+                        SELECT id FROM generation_attempts WHERE task_id = %s
+                    ) AND is_final = 1
+                    """,
+                    (int(attempt["task_id"]),),
+                )
+                final_count = int(cursor.fetchone()["count"])
+                cursor.execute(
+                    """
+                    UPDATE project_tasks
+                    SET status = %s, final_quantity = %s,
+                        approved_at = %s, updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        TASK_APPROVED,
+                        final_count,
+                        now,
+                        now,
+                        int(attempt["task_id"]),
+                    ),
+                )
+                self._update_project_status(
+                    cursor,
+                    int(attempt["project_id"]),
+                )
+                self._event(
+                    cursor,
+                    int(attempt["project_id"]),
+                    int(attempt["task_id"]),
+                    actor.id,
+                    "generation_confirmed",
+                    TASK_AWAITING_ACCEPTANCE,
+                    TASK_APPROVED,
+                    {
+                        "attempt_id": attempt_id,
+                        "result_index": int(result_index),
+                        "relative_path": relative_path,
+                    },
+                )
+
     def fail_generation_attempt(
         self,
         attempt_id: int,

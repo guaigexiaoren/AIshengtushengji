@@ -81,6 +81,8 @@ class AIGenerationPage(BatchDressPage):
         self.force_direct_retry_task_id: int | None = None
         self._loading_source_state = False
         self._prompt_cache: dict[int, str] = {}
+        self._task_settings: dict[int, dict] = {}
+        self._project_settings: dict[int, dict] = {}
         self.async_mode = async_mode
         self.query_runner = (
             get_query_runner() if async_mode else None
@@ -209,6 +211,27 @@ class AIGenerationPage(BatchDressPage):
         task = self.current_task
         if task is not None:
             self._prompt_cache[task.id] = self.prompt_edit.toPlainText()
+
+    def _current_settings(self) -> dict:
+        return {
+            "prompt": self.prompt_edit.toPlainText(),
+            "model": self.model_combo.currentData(),
+            "aspect": self.aspect_combo.currentData(),
+            "resolution": self.resolution_combo.currentData(),
+            "provider": (
+                self.provider_combo.currentData()
+                if hasattr(self, "provider_combo")
+                else ""
+            ),
+        }
+
+    def _snapshot_current(self) -> None:
+        task = self.current_task
+        if task is None:
+            return
+        settings = self._current_settings()
+        self._task_settings[task.id] = settings
+        self._project_settings[task.project_id] = settings
 
     def _refresh_providers(self) -> None:
         try:
@@ -416,6 +439,7 @@ class AIGenerationPage(BatchDressPage):
             self._refresh_task_status_label()
 
     def _clear_generation_editor(self) -> None:
+        self._snapshot_current()
         self.current_task = None
         self.local_store = None
         self.restore_all_button.setEnabled(False)
@@ -429,6 +453,7 @@ class AIGenerationPage(BatchDressPage):
         self._update_asset_actions()
 
     def _task_changed(self, _index: int | None = None) -> None:
+        self._snapshot_current()
         self._persist_current_sources()
         task_id = self.task_selector.currentData()
         task = self._generation_tasks_by_id.get(task_id)
@@ -461,8 +486,15 @@ class AIGenerationPage(BatchDressPage):
             self._loading_source_state = False
         self._refresh_pairs()
         self._auto_match()
+        settings = (
+            self._task_settings.get(task.id)
+            or self._project_settings.get(task.project_id)
+            or {}
+        )
         prompt = self._prompt_cache.get(task.id)
         if prompt is None:
+            prompt = str(settings.get("prompt") or "")
+        if not prompt:
             prompt = task.prompt_text.strip()
         if not prompt:
             prompt = (
@@ -470,18 +502,28 @@ class AIGenerationPage(BatchDressPage):
                 or self._default_prompt()
             )
         self.prompt_edit.setPlainText(prompt)
-        if task.model in MODEL_LABELS:
-            index = self.model_combo.findData(task.model)
+        model_id = settings.get("model") or task.model
+        if model_id:
+            index = self.model_combo.findData(model_id)
             if index >= 0:
                 self.model_combo.setCurrentIndex(index)
-        aspect_index = self.aspect_combo.findData(task.aspect_ratio)
+        aspect_value = settings.get("aspect") or task.aspect_ratio
+        aspect_index = self.aspect_combo.findData(aspect_value)
         if aspect_index >= 0:
             self.aspect_combo.setCurrentIndex(aspect_index)
+        resolution_value = (
+            settings.get("resolution") or task.resolution or "auto"
+        )
         resolution_index = self.resolution_combo.findData(
-            task.resolution or "auto"
+            resolution_value
         )
         if resolution_index >= 0:
             self.resolution_combo.setCurrentIndex(resolution_index)
+        provider_code = settings.get("provider")
+        if provider_code:
+            provider_index = self.provider_combo.findData(provider_code)
+            if provider_index >= 0:
+                self.provider_combo.setCurrentIndex(provider_index)
         self.count_spin.setValue(max(1, int(task.n)))
         self.task_status_label.setText(
             f"主任务 "
@@ -902,6 +944,7 @@ class AIGenerationPage(BatchDressPage):
                 n=attempt.n,
                 local_references=local_references,
                 reserved_attempt=attempt,
+                pending_root=self.file_store.paths.temp,
             )
             worker.signals.finished.connect(
                 lambda _task_id, _attempt_id, item=worker: (

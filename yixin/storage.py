@@ -314,11 +314,15 @@ class FileStore:
         temp_root = self.paths.temp.resolve()
         if not temp_root.exists():
             return removed
+        # 待确认的生成结果只有本机一份，不能被临时文件清理误删。
+        pending_root = (temp_root / "pending_results").resolve()
 
         for path in sorted(temp_root.rglob("*"), key=lambda item: len(item.parts), reverse=True):
             try:
                 resolved = path.resolve()
             except OSError:
+                continue
+            if resolved == pending_root or pending_root in resolved.parents:
                 continue
             if resolved in protected:
                 continue
