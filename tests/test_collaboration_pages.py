@@ -1014,6 +1014,174 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(kwargs["requested_provider_code"], "a6api")
         page.deleteLater()
 
+    def test_ai_generation_retry_discards_unconfirmed_pending_result(
+        self,
+    ) -> None:
+        write_task_images(self.root)
+        task = replace(
+            make_task("awaiting_acceptance"),
+            id=32,
+            task_code="春季项目-123-001-006",
+            parent_task_id=11,
+        )
+        attempt = GenerationAttempt(
+            id=42,
+            task_id=task.id,
+            attempt_no=1,
+            operator_id=4,
+            model="gemini-3.1-flash-image",
+            prompt_text="不满意的结果",
+            aspect_ratio="3:4",
+            resolution="2K",
+            n=1,
+            status=ATTEMPT_SUCCEEDED,
+            source_revision=1,
+            unit_price=Decimal("1.00"),
+            generated_image_count=1,
+            created_at=datetime.now(),
+        )
+        self.repository.tasks_by_id[task.id] = task
+        self.repository.list_attempts = lambda _task_id: [attempt]
+        self.repository.list_ai_generation_tasks = (
+            lambda _actor, **_kwargs: []
+        )
+        self.repository.list_queued_attempts = lambda _actor_id: []
+        paths = AppPaths(self.root / "retry-pending-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        store = FileStore(paths)
+        client = NanoBananaClient(lambda: "test-key")
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        pending_file = paths.temp / "pending_results" / "42" / "result.png"
+        pending_file.parent.mkdir(parents=True)
+        pending_file.write_bytes(png_bytes((10, 20, 30), (20, 20)))
+        save_pending_manifest(
+            paths.temp,
+            attempt_id=attempt.id,
+            task_id=task.id,
+            project_relative_root=task.project_relative_root,
+            task_code=task.task_code,
+            attempt_no=1,
+            items=[
+                {
+                    "filename": pending_file.name,
+                    "result_index": 0,
+                    "content_hash": "abc",
+                    "mime": "image/png",
+                    "width": 20,
+                    "height": 20,
+                }
+            ],
+        )
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            AuthUser(4, "ai_amy", "AI Amy", "ai"),
+            client,
+            key_store,
+            database,
+            store,
+            LibraryService(database, store, paths),
+            TaskWorker(database, client, store),
+            key_store,
+            auto_load=False,
+        )
+        page.refresh()
+        page.prepare_history_retry(task.id, attempt.id)
+        with (
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ) as question,
+            patch.object(QMessageBox, "warning"),
+            patch.object(QMessageBox, "information"),
+        ):
+            page._enqueue_all()
+        self.assertTrue(question.called)
+        self.assertEqual(len(self.repository.generation_requests), 1)
+        _task_id, _actor, kwargs = self.repository.generation_requests[0]
+        self.assertTrue(kwargs["allow_reopen"])
+        self.assertFalse(pending_file.exists())
+        page.deleteLater()
+
+    def test_unified_history_references_follow_attempt_snapshot(self) -> None:
+        from yixin.collaboration.local_sources import LocalTaskSourceStore
+
+        write_task_images(self.root)
+        task = make_task("approved")
+        self.repository.tasks_by_id[task.id] = task
+        paths = AppPaths(self.root / "history-snapshot-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        store = FileStore(paths)
+        client = NanoBananaClient(lambda: "test-key")
+        page = UnifiedHistoryPage(
+            database,
+            LibraryService(database, store, paths),
+            TaskWorker(database, client, store),
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        record = page._project_record(
+            {
+                "id": 41,
+                "task_id": task.id,
+                "status": "succeeded",
+                "created_at": datetime.now(),
+                "project_code": task.project_code,
+                "task_code": task.task_code,
+                "product_code": task.product_code,
+                "project_name": task.project_name,
+                "access_project_name": "春季项目",
+                "operator_name": "AI制作Amy",
+                "model": "gemini-3.1-flash-image",
+                "provider_name": "A6API",
+                "prompt_text": "历史参考图",
+                "result_count": 1,
+            }
+        )
+        local_store = LocalTaskSourceStore(
+            paths.root / "local_sources",
+            self.actor.id,
+            task,
+            self.resolver,
+        )
+        extra_garment = self.root / "额外衣服.png"
+        Image.new("RGB", (20, 20), "yellow").save(extra_garment)
+        local_store.add_paths("garment", [extra_garment])
+        extra_model = self.root / "新模特.png"
+        Image.new("RGB", (20, 20), "purple").save(extra_model)
+        local_store.add_paths("model", [extra_model])
+        local_store.save_attempt_snapshot(record.attempt_id)
+
+        assets, model_reference_path, _meta = page._load_record_data(record)
+        references = [asset for asset in assets if asset.is_reference]
+        self.assertEqual(len(references), 4)
+        self.assertIn(
+            hashlib.sha256(extra_garment.read_bytes()).hexdigest(),
+            {
+                asset.payload.content_hash
+                for asset in references
+            },
+        )
+        self.assertEqual(
+            model_reference_path.resolve(),
+            references[-1].path.resolve(),
+        )
+        self.assertEqual(
+            hashlib.sha256(extra_model.read_bytes()).hexdigest(),
+            references[-1].payload.content_hash,
+        )
+        page.deleteLater()
+
     def test_login_has_no_database_settings(self) -> None:
         login = LoginDialog(self.repository)
         texts = [button.text() for button in login.findChildren(QPushButton)]

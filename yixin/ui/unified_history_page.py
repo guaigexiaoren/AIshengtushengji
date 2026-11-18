@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..collaboration.local_sources import LocalTaskSourceStore
 from ..collaboration.repository import MySQLCentralRepository
 from ..collaboration.pending_results import (
     PendingResult,
@@ -942,34 +943,53 @@ class UnifiedHistoryPage(QWidget):
             task = self.repository.get_task(record.task_id)
             if task is None:
                 return [], None, "任务不存在"
-            references = [
-                StoredImage(
-                    path=self.resolver.resolve_project_path(
-                        task.project_relative_root,
-                        asset.relative_path,
-                    ),
-                    content_hash=asset.content_hash,
-                    mime=asset.mime,
-                    width=asset.width,
-                    height=asset.height,
-                    original_name=asset.original_name,
+            # 优先使用本轮实际发送的素材快照，保证和 AI 生图页看到的一致
+            # （包括在生图页新加、裁剪或替换过的本机图片）。
+            snapshot = None
+            try:
+                snapshot = LocalTaskSourceStore.read_attempt_snapshot(
+                    self.library_service.file_store.paths.root
+                    / "local_sources",
+                    self.actor.id,
+                    task,
+                    int(record.attempt_id),
                 )
-                for asset in task.garment_assets
-            ]
-            model_reference_path = self.resolver.resolve_project_path(
-                task.project_relative_root,
-                task.model_path,
-            )
-            references.append(
-                StoredImage(
-                    path=model_reference_path,
-                    content_hash=task.model_hash,
-                    mime="image/png",
-                    width=0,
-                    height=0,
-                    original_name=task.model_name,
+            except Exception:
+                snapshot = None
+            if snapshot:
+                references = list(snapshot)
+                model_reference_path = (
+                    snapshot[-1].path if len(snapshot) > 1 else None
                 )
-            )
+            else:
+                references = [
+                    StoredImage(
+                        path=self.resolver.resolve_project_path(
+                            task.project_relative_root,
+                            asset.relative_path,
+                        ),
+                        content_hash=asset.content_hash,
+                        mime=asset.mime,
+                        width=asset.width,
+                        height=asset.height,
+                        original_name=asset.original_name,
+                    )
+                    for asset in task.garment_assets
+                ]
+                model_reference_path = self.resolver.resolve_project_path(
+                    task.project_relative_root,
+                    task.model_path,
+                )
+                references.append(
+                    StoredImage(
+                        path=model_reference_path,
+                        content_hash=task.model_hash,
+                        mime="image/png",
+                        width=0,
+                        height=0,
+                        original_name=task.model_name,
+                    )
+                )
             results = []
             for result in self.repository.list_attempt_results(
                 int(record.attempt_id)

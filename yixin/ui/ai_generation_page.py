@@ -19,9 +19,17 @@ from PySide6.QtWidgets import (
 
 from ..api import NanoBananaClient
 from ..collaboration.local_sources import LocalTaskSourceStore
+from ..collaboration.pending_results import (
+    clear_pending_results,
+    load_pending_results,
+)
 from ..collaboration.repository import MySQLCentralRepository
 from ..collaboration.shared_paths import SharedPathResolver
 from ..collaboration.types import (
+    ATTEMPT_SUCCEEDED,
+    TASK_AWAITING_ACCEPTANCE,
+    TASK_APPROVED,
+    TASK_SKIPPED,
     TASK_STATUS_LABELS,
     AuthUser,
     GenerationAttempt,
@@ -634,6 +642,8 @@ class AIGenerationPage(BatchDressPage):
         except Exception as exc:
             QMessageBox.warning(self, "加入队列失败", str(exc))
             return
+        if count == 0:
+            return
         self.pairs.clear()
         self._refresh_pairs()
         self.tasks_enqueued.emit(count)
@@ -836,6 +846,30 @@ class AIGenerationPage(BatchDressPage):
             self.repository.mark_task_skipped(task.id, self.actor)
             return 1
         group = active_pairs[0]
+        pending_attempts = [
+            item.id
+            for item in self.repository.list_attempts(task.id)
+            if item.status == ATTEMPT_SUCCEEDED
+            and load_pending_results(
+                self.file_store.paths.temp,
+                item.id,
+            )
+        ]
+        if pending_attempts:
+            answer = QMessageBox.question(
+                self,
+                "丢弃待确认结果",
+                "该子任务还有未确认的生成结果。\n"
+                "重试会丢弃这些结果，确定继续吗？",
+                QMessageBox.StandardButton.Yes
+                | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                self.feedback_label.setText(
+                    "已取消重试，待确认结果未受影响。"
+                )
+                return 0
         selected_model = self.model_combo.currentData()
         model_id = selected_model
         if selected_model == AUTO_MODEL_ID:
@@ -862,8 +896,11 @@ class AIGenerationPage(BatchDressPage):
                 if self.provider_combo.currentData()
                 else ""
             ),
-            allow_reopen=task.status in ("approved", "skipped"),
+            allow_reopen=task.status
+            in (TASK_APPROVED, TASK_SKIPPED, TASK_AWAITING_ACCEPTANCE),
         )
+        for attempt_id in pending_attempts:
+            clear_pending_results(self.file_store.paths.temp, attempt_id)
         store = self.local_store
         if store is None:
             store = LocalTaskSourceStore(

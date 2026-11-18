@@ -4279,22 +4279,50 @@ class MySQLCentralRepository:
                         keep_claimed_at=True,
                     )
                     task["status"] = TASK_CLAIMED
+                previous_status = task["status"]
                 reopen = (
-                    task["status"] in (TASK_APPROVED, TASK_SKIPPED)
+                    previous_status
+                    in (
+                        TASK_APPROVED,
+                        TASK_SKIPPED,
+                        TASK_AWAITING_ACCEPTANCE,
+                    )
                     and allow_reopen
                 )
                 if (
-                    task["status"] in (
-                        TASK_AWAITING_ACCEPTANCE,
-                        TASK_CANCELLED,
-                    )
+                    previous_status == TASK_CANCELLED
                     or (
-                        task["status"] in (TASK_APPROVED, TASK_SKIPPED)
+                        previous_status
+                        in (
+                            TASK_APPROVED,
+                            TASK_SKIPPED,
+                            TASK_AWAITING_ACCEPTANCE,
+                        )
                         and not allow_reopen
                     )
                 ):
                     raise StateConflictError("当前任务状态不能加入生成队列")
                 if reopen:
+                    if previous_status == TASK_AWAITING_ACCEPTANCE:
+                        # 重试时放弃尚未确认的结果，避免旧轮次之后被误确认。
+                        cursor.execute(
+                            """
+                            UPDATE generation_attempts ga
+                            SET ga.status = %s, ga.finished_at = %s
+                            WHERE ga.task_id = %s
+                              AND ga.status = %s
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM generation_results gr
+                                  WHERE gr.attempt_id = ga.id
+                              )
+                            """,
+                            (
+                                ATTEMPT_CANCELLED,
+                                now,
+                                task_id,
+                                ATTEMPT_SUCCEEDED,
+                            ),
+                        )
                     cursor.execute(
                         """
                         UPDATE project_tasks
