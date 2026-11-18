@@ -614,7 +614,7 @@ class MainWindow(QMainWindow):
 
     def _on_batch_enqueued(self, count: int) -> None:
         self.statusBar().showMessage(
-            f"批量换装已加入 {count} 个排队任务 · 数据目录：{self.paths.root}",
+            f"已加入 {count} 个排队任务 · 数据目录：{self.paths.root}",
             8000,
         )
         self._mark_pages_dirty(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Sequence
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
@@ -27,10 +28,15 @@ from ..collaboration.repository import MySQLCentralRepository
 from ..collaboration.shared_paths import SharedPathResolver
 from ..collaboration.types import (
     ATTEMPT_SUCCEEDED,
+    ROLE_ADMIN,
     TASK_AWAITING_ACCEPTANCE,
     TASK_APPROVED,
+    TASK_AVAILABLE,
+    TASK_CLAIMED,
+    TASK_RETURNED,
     TASK_SKIPPED,
     TASK_STATUS_LABELS,
+    TASK_WORKING,
     AuthUser,
     GenerationAttempt,
     GenerationPairSpec,
@@ -50,7 +56,11 @@ from ..security import SecretStore
 from ..settings import AUTO_STRATEGY_QUALITY
 from ..storage import FileStore
 from ..worker import TaskWorker
-from .batch_dress_page import BatchDressPage, DressTaskGroup
+from .batch_dress_page import (
+    BatchDressPage,
+    DressTaskGroup,
+    auto_match_groups,
+)
 from .async_queries import get_query_runner
 from .components import PageHeader
 
@@ -114,6 +124,20 @@ class AIGenerationPage(BatchDressPage):
         self.count_spin.setValue(1)
         self.count_spin.hide()
         self.count_label.hide()
+        self.project_batch_button = QPushButton("整单提交")
+        self.project_batch_button.setMinimumHeight(42)
+        self.project_batch_button.setToolTip(
+            "以当前提示词和参数提交同主任务下所有待制作子任务"
+        )
+        self.project_batch_button.setEnabled(False)
+        self.project_batch_button.clicked.connect(
+            self._enqueue_project_all
+        )
+        action_bar = self.generate_button.parentWidget().layout
+        action_bar.insertWidget(
+            action_bar.indexOf(self.generate_button),
+            self.project_batch_button,
+        )
         self.task_selector.currentIndexChanged.connect(
             self._task_changed
         )
@@ -221,14 +245,20 @@ class AIGenerationPage(BatchDressPage):
             self._prompt_cache[task.id] = self.prompt_edit.toPlainText()
 
     def _current_settings(self) -> dict:
+        provider_code = (
+            self.provider_combo.currentData()
+            if hasattr(self, "provider_combo")
+            else ""
+        )
         return {
             "prompt": self.prompt_edit.toPlainText(),
             "model": self.model_combo.currentData(),
             "aspect": self.aspect_combo.currentData(),
             "resolution": self.resolution_combo.currentData(),
-            "provider": (
-                self.provider_combo.currentData()
-                if hasattr(self, "provider_combo")
+            "provider": provider_code,
+            "provider_name": (
+                self.provider_combo.currentText()
+                if provider_code
                 else ""
             ),
         }
@@ -343,6 +373,7 @@ class AIGenerationPage(BatchDressPage):
                 current_id
             )
             self._refresh_task_status_label()
+            self._update_project_batch_state()
 
     def _request_generation_tasks(self) -> None:
         page = PageRequest(page=1, page_size=10000)
@@ -445,6 +476,7 @@ class AIGenerationPage(BatchDressPage):
                 current_id
             )
             self._refresh_task_status_label()
+            self._update_project_batch_state()
 
     def _clear_generation_editor(self) -> None:
         self._snapshot_current()
@@ -459,6 +491,20 @@ class AIGenerationPage(BatchDressPage):
         self._refresh_pairs()
         self.task_status_label.setText("没有可制作的子任务")
         self._update_asset_actions()
+        self._update_project_batch_state()
+
+    def _update_project_batch_state(self) -> None:
+        button = getattr(self, "project_batch_button", None)
+        if button is None:
+            return
+        task = self.current_task
+        button.setEnabled(
+            task is not None
+            and task.parent_task_id is None
+            and self.force_direct_retry_task_id != task.id
+            and self.task_selector.isEnabled()
+            and len(self._project_source_tasks(task.project_id)) >= 2
+        )
 
     def _task_changed(self, _index: int | None = None) -> None:
         self._snapshot_current()
@@ -540,6 +586,7 @@ class AIGenerationPage(BatchDressPage):
             f" · {TASK_STATUS_LABELS.get(task.status, task.status)}"
         )
         self._update_asset_actions()
+        self._update_project_batch_state()
 
     def _refresh_task_status_label(self) -> None:
         task = self.current_task
@@ -622,15 +669,8 @@ class AIGenerationPage(BatchDressPage):
                 "请先填写换装提示词。",
             )
             return
-        if active_pairs:
-            try:
-                if not self.key_store.load():
-                    raise ValueError(
-                        "当前账号尚未配置 API Key，请联系管理员"
-                    )
-            except Exception as exc:
-                QMessageBox.warning(self, "API Key 不可用", str(exc))
-                return
+        if active_pairs and not self._check_api_key_ready():
+            return
         try:
             if (
                 task.parent_task_id is None
@@ -654,6 +694,147 @@ class AIGenerationPage(BatchDressPage):
         self._resume_queued_jobs()
         self._pump_queue()
         self.force_direct_retry_task_id = None
+
+    def _check_api_key_ready(self) -> bool:
+        try:
+            if not self.key_store.load():
+                raise ValueError(
+                    "当前账号尚未配置 API Key，请联系管理员"
+                )
+        except Exception as exc:
+            QMessageBox.warning(self, "API Key 不可用", str(exc))
+            return False
+        return True
+
+    def _project_source_tasks(self, project_id: int) -> list[ProjectTask]:
+        allowed = {TASK_CLAIMED, TASK_WORKING, TASK_RETURNED}
+        if self.actor.role == ROLE_ADMIN:
+            allowed.add(TASK_AVAILABLE)
+        tasks: list[ProjectTask] = []
+        seen: set[int] = set()
+        for item in self.generation_tasks:
+            if item.id in seen:
+                continue
+            seen.add(item.id)
+            if (
+                item.project_id == project_id
+                and item.parent_task_id is None
+                and item.status in allowed
+            ):
+                tasks.append(item)
+        return tasks
+
+    def _load_task_groups(
+        self,
+        task: ProjectTask,
+    ) -> list[DressTaskGroup]:
+        try:
+            store = LocalTaskSourceStore(
+                self.file_store.paths.root / "local_sources",
+                self.actor.id,
+                task,
+                self.resolver,
+            )
+            state = store.state
+        except Exception:
+            return []
+        if not state.garments or state.model is None:
+            return []
+        return auto_match_groups(state.garments, state.model)
+
+    def _enqueue_project_all(self) -> None:
+        task = self.current_task
+        if (
+            task is None
+            or task.parent_task_id is not None
+            or self.force_direct_retry_task_id == task.id
+        ):
+            QMessageBox.information(
+                self,
+                "未选择子任务",
+                "请先在顶部选择主任务下的子任务。",
+            )
+            return
+        prompt = self.prompt_edit.toPlainText().strip()
+        if not prompt:
+            QMessageBox.information(
+                self,
+                "缺少提示词",
+                "请先填写换装提示词。",
+            )
+            return
+        if not self._check_api_key_ready():
+            return
+        targets = self._project_source_tasks(task.project_id)
+        if len(targets) < 2:
+            QMessageBox.information(
+                self,
+                "没有可提交的子任务",
+                "当前主任务下至少需要两个待制作的子任务。",
+            )
+            return
+        settings = self._current_settings()
+        plans: list[tuple[ProjectTask, list[DressTaskGroup]]] = []
+        errors: list[str] = []
+        for item in targets:
+            groups = (
+                list(self.pairs)
+                if item.id == task.id and self.pairs
+                else self._load_task_groups(item)
+            )
+            if not groups:
+                errors.append(f"{item.task_code}：没有可用素材")
+                continue
+            plans.append((item, groups))
+        if not plans:
+            QMessageBox.warning(self, "无法提交", "\n".join(errors))
+            return
+        pair_total = sum(len(groups) for _, groups in plans)
+        answer = QMessageBox.question(
+            self,
+            "确认整单提交",
+            f"将提交 {len(plans)} 个子任务，共 {pair_total} 个配对。\n"
+            "当前子任务沿用页面上的配对；其他子任务按各自素材自动匹配。\n"
+            "任务会按账号并发上限依次执行，可能产生费用。\n"
+            "确定加入队列吗？",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.project_batch_button.setEnabled(False)
+        completed = 0
+        total = 0
+        try:
+            for item, groups in plans:
+                try:
+                    total += self._split_source_task(
+                        item,
+                        prompt,
+                        groups,
+                        settings,
+                    )
+                    completed += 1
+                except Exception as exc:
+                    errors.append(f"{item.task_code}：{exc}")
+            if total:
+                self.tasks_enqueued.emit(total)
+            self.feedback_label.setText(
+                f"整单提交：成功 {completed} 个子任务、{total} 个配对"
+                + (f"，失败 {len(errors)} 个。" if errors else "。")
+            )
+        finally:
+            self._refresh_generation_tasks()
+            self._resume_queued_jobs()
+            self._pump_queue()
+            self._update_project_batch_state()
+        if errors:
+            QMessageBox.warning(
+                self,
+                "部分子任务未提交",
+                "\n".join(errors),
+            )
 
     def prepare_history_retry(
         self,
@@ -716,23 +897,24 @@ class AIGenerationPage(BatchDressPage):
         self,
         task: ProjectTask,
         prompt: str,
+        groups: Sequence[DressTaskGroup] | None = None,
+        settings: dict | None = None,
     ) -> int:
+        settings = settings or self._current_settings()
         strategy = self.app_settings.auto_strategy()
         specs: list[GenerationPairSpec] = []
-        groups: list[DressTaskGroup] = []
-        provider_code = str(self.provider_combo.currentData() or "")
-        provider_name = (
-            self.provider_combo.currentText()
-            if provider_code
-            else ""
-        )
-        for group in self.pairs:
+        group_list = list(groups) if groups is not None else list(self.pairs)
+        selected_model = settings.get("model")
+        aspect_ratio = settings.get("aspect")
+        resolution = settings.get("resolution")
+        provider_code = str(settings.get("provider") or "")
+        provider_name = str(settings.get("provider_name") or "")
+        for group in group_list:
             group_prompt = (
                 "无需制作"
                 if group.skipped
                 else self._prompt_for_group(prompt, group)
             )
-            selected_model = self.model_combo.currentData()
             model_id = selected_model
             if selected_model == AUTO_MODEL_ID:
                 model_id = choose_model(
@@ -750,8 +932,8 @@ class AIGenerationPage(BatchDressPage):
                 GenerationPairSpec(
                     prompt_text=group_prompt,
                     model=model_id,
-                    aspect_ratio=self.aspect_combo.currentData(),
-                    resolution=self.resolution_combo.currentData(),
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
                     n=1,
                     unit_price=self.repository.current_model_price(
                         model_id
@@ -767,7 +949,6 @@ class AIGenerationPage(BatchDressPage):
                     requested_provider_name=provider_name,
                 )
             )
-            groups.append(group)
         unsupported_models = []
         if provider_code:
             for spec in specs:
@@ -792,7 +973,7 @@ class AIGenerationPage(BatchDressPage):
             pairs=specs,
         )
         snapshot_failures: list[str] = []
-        for result, group in zip(results, groups):
+        for result, group in zip(results, group_list):
             if result.skipped or result.attempt_id is None:
                 continue
             child = self.repository.get_task(result.task_id)

@@ -146,6 +146,26 @@ class DressTaskGroup:
 DressPair = DressTaskGroup
 
 
+def auto_match_groups(
+    garments: Sequence[StoredImage],
+    person: StoredImage,
+) -> list[DressTaskGroup]:
+    """按参考图上限把衣服分组，每组配同一个人物。"""
+    garment_chunk_size = MAX_REFERENCE_IMAGES - 1
+    groups: list[DressTaskGroup] = []
+    for start in range(0, len(garments), garment_chunk_size):
+        chunk = tuple(garments[start : start + garment_chunk_size])
+        groups.append(
+            DressTaskGroup(
+                references=(*chunk, person),
+                roles=("garment",) * len(chunk) + ("person",),
+                kind="auto",
+                auto_prompt=True,
+            )
+        )
+    return groups
+
+
 class BatchAssetList(QListWidget):
     files_dropped = Signal(object)
     garment_dropped = Signal(str, int)
@@ -1702,26 +1722,15 @@ class BatchDressPage(QWidget):
             if answer != QMessageBox.StandardButton.Yes:
                 return
 
-        garment_chunk_size = MAX_REFERENCE_IMAGES - 1
         groups: list[DressTaskGroup] = []
         for person in self.person_assets:
-            for start in range(0, len(self.garment_assets), garment_chunk_size):
-                garments = tuple(
-                    self.garment_assets[start : start + garment_chunk_size]
-                )
-                groups.append(
-                    DressTaskGroup(
-                        references=(*garments, person),
-                        roles=("garment",) * len(garments) + ("person",),
-                        kind="auto",
-                        auto_prompt=True,
-                    )
-                )
+            groups.extend(auto_match_groups(self.garment_assets, person))
         if not groups:
             return
         self.pairs = groups
         self._reset_pair_selection()
         self._refresh_pairs()
+        garment_chunk_size = MAX_REFERENCE_IMAGES - 1
         split_count = (len(self.garment_assets) + garment_chunk_size - 1) // garment_chunk_size
         split_hint = f"，每位人物拆为 {split_count} 组" if split_count > 1 else ""
         self.feedback_label.setText(

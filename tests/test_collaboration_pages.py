@@ -46,6 +46,7 @@ if HAS_PYSIDE:
         ProjectAssetInput,
         ProjectRecord,
         ProjectTask,
+        SplitGenerationItem,
     )
     from yixin.constants import (
         PROTOCOL_OPENAI_CHAT_IMAGE,
@@ -851,6 +852,7 @@ class CollaborationPageTests(unittest.TestCase):
         )
         page.refresh()
         self.assertEqual(page.provider_combo.count(), 2)
+        self.assertFalse(page.project_batch_button.isEnabled())
         self.assertIn("主任务 2/5", page.task_selector.itemText(1))
         self.assertIn("待制作", page.task_selector.itemText(1))
         with (
@@ -1108,6 +1110,207 @@ class CollaborationPageTests(unittest.TestCase):
         _task_id, _actor, kwargs = self.repository.generation_requests[0]
         self.assertTrue(kwargs["allow_reopen"])
         self.assertFalse(pending_file.exists())
+        page.deleteLater()
+
+    def test_ai_generation_submits_all_project_source_tasks(self) -> None:
+        write_task_images(self.root)
+        model2 = (
+            self.root
+            / "内部项目"
+            / "春季项目"
+            / "1.2"
+            / "123"
+            / "模特图"
+            / "模特2.png"
+        )
+        Image.new("RGB", (20, 20), "orange").save(model2)
+        task1 = make_task("claimed")
+        task2 = replace(
+            task1,
+            id=12,
+            task_code="春季项目-123-001-002",
+            model_asset_id=2,
+            model_path="模特图/模特2.png",
+            model_name="模特2.png",
+            model_hash=hashlib.sha256(model2.read_bytes()).hexdigest(),
+        )
+        other_project = replace(
+            task1,
+            id=13,
+            project_id=9,
+            task_code="其他项目-001",
+        )
+        child = replace(
+            task1,
+            id=14,
+            task_code="春季项目-123-001-007",
+            parent_task_id=task1.id,
+        )
+        self.repository.list_ai_generation_tasks = (
+            lambda _actor, **_kwargs: [
+                task1,
+                task2,
+                other_project,
+                child,
+            ]
+        )
+        self.repository.list_queued_attempts = lambda _actor_id: []
+        captured: list[tuple] = []
+
+        def split(task_id, actor, *, pairs):
+            captured.append((task_id, actor.id, tuple(pairs)))
+            return (
+                SplitGenerationItem(
+                    task_id=task_id,
+                    task_code="child",
+                    attempt_id=None,
+                    skipped=True,
+                ),
+            )
+
+        self.repository.split_and_queue_generations = split
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        paths = AppPaths(self.root / "project-batch-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: "sk-test-123456")
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            AuthUser(4, "ai_amy", "AI Amy", "ai"),
+            client,
+            key_store,
+            database,
+            file_store,
+            LibraryService(database, file_store, paths),
+            TaskWorker(database, client, file_store),
+            key_store,
+            auto_load=False,
+        )
+        emitted: list[int] = []
+        page.tasks_enqueued.connect(emitted.append)
+        page.refresh()
+        self.assertTrue(page.project_batch_button.isEnabled())
+        with (
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(QMessageBox, "warning"),
+            patch.object(QMessageBox, "information"),
+        ):
+            page._enqueue_project_all()
+        self.assertEqual(
+            [item[0] for item in captured],
+            [task1.id, task2.id],
+        )
+        self.assertEqual(
+            len({item[2][0].prompt_text for item in captured}),
+            1,
+        )
+        self.assertEqual(
+            captured[0][2][0].person_hash,
+            task1.model_hash,
+        )
+        self.assertEqual(
+            captured[1][2][0].person_hash,
+            task2.model_hash,
+        )
+        self.assertEqual(emitted, [2])
+        page.deleteLater()
+
+    def test_ai_generation_project_batch_isolates_failures(self) -> None:
+        write_task_images(self.root)
+        model2 = (
+            self.root
+            / "内部项目"
+            / "春季项目"
+            / "1.2"
+            / "123"
+            / "模特图"
+            / "模特2.png"
+        )
+        Image.new("RGB", (20, 20), "orange").save(model2)
+        task1 = make_task("claimed")
+        task2 = replace(
+            task1,
+            id=12,
+            task_code="春季项目-123-001-002",
+            model_asset_id=2,
+            model_path="模特图/模特2.png",
+            model_name="模特2.png",
+            model_hash=hashlib.sha256(model2.read_bytes()).hexdigest(),
+        )
+        self.repository.list_ai_generation_tasks = (
+            lambda _actor, **_kwargs: [task1, task2]
+        )
+        self.repository.list_queued_attempts = lambda _actor_id: []
+
+        def split(task_id, actor, *, pairs):
+            del actor, pairs
+            if task_id == task2.id:
+                raise RuntimeError("模拟素材缺失")
+            return (
+                SplitGenerationItem(
+                    task_id=task_id,
+                    task_code="child",
+                    attempt_id=None,
+                    skipped=True,
+                ),
+            )
+
+        self.repository.split_and_queue_generations = split
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        paths = AppPaths(self.root / "project-batch-failure-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: "sk-test-123456")
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            AuthUser(4, "ai_amy", "AI Amy", "ai"),
+            client,
+            key_store,
+            database,
+            file_store,
+            LibraryService(database, file_store, paths),
+            TaskWorker(database, client, file_store),
+            key_store,
+            auto_load=False,
+        )
+        emitted: list[int] = []
+        page.tasks_enqueued.connect(emitted.append)
+        page.refresh()
+        with (
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ) as question,
+            patch.object(QMessageBox, "warning") as warning,
+            patch.object(QMessageBox, "information"),
+        ):
+            page._enqueue_project_all()
+        self.assertTrue(question.called)
+        self.assertEqual(emitted, [1])
+        self.assertTrue(warning.called)
+        self.assertIn(
+            task2.task_code,
+            str(warning.call_args),
+        )
         page.deleteLater()
 
     def test_unified_history_references_follow_attempt_snapshot(self) -> None:
