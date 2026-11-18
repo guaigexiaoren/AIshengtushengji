@@ -708,7 +708,13 @@ class TaskCreatePage(QWidget):
             row = self.product_table.rowCount()
             self.product_table.insertRow(row)
             check = QTableWidgetItem()
-            can_select = not state.errors and not state.existing_tasks
+            can_select = not state.errors and (
+                not state.existing_tasks
+                or all(
+                    int(getattr(project, "task_count", 1) or 0) == 0
+                    for project in state.existing_tasks
+                )
+            )
             check.setFlags(
                 Qt.ItemFlag.ItemIsEnabled
                 | (
@@ -1107,7 +1113,7 @@ class TaskCreatePage(QWidget):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        validated: list[tuple[ProductDraftState, object]] = []
+        validated: list[tuple[ProductDraftState, tuple]] = []
         for key in keys:
             state = self.states[key]
             if state.errors:
@@ -1118,12 +1124,12 @@ class TaskCreatePage(QWidget):
                     f"{state.product_code}：{'；'.join(state.errors)}",
                 )
                 return
-            if not state.garments or not state.models:
+            if not state.garments:
                 self.product_table.selectRow(self._row_for_key(key))
                 QMessageBox.warning(
                     self,
                     "缺少素材",
-                    f"{state.product_code}：衣服图和模特图不能为空",
+                    f"{state.product_code}：衣服图不能为空",
                 )
                 return
             if len(state.garments) > 13:
@@ -1134,22 +1140,25 @@ class TaskCreatePage(QWidget):
                     f"{state.product_code}：单个模特任务最多 13 张衣服图",
                 )
                 return
-            result = self._current_pairs(state)
-            if result is None or result.errors:
-                self.product_table.selectRow(self._row_for_key(key))
-                QMessageBox.warning(
-                    self,
-                    "配对失败",
-                    f"{state.product_code}："
-                    + "；".join(
-                        result.errors if result else ["配对失败"]
-                    ),
-                )
-                return
-            validated.append((state, result))
+            pairs: tuple = ()
+            if state.models:
+                result = self._current_pairs(state)
+                if result is None or result.errors:
+                    self.product_table.selectRow(self._row_for_key(key))
+                    QMessageBox.warning(
+                        self,
+                        "配对失败",
+                        f"{state.product_code}："
+                        + "；".join(
+                            result.errors if result else ["配对失败"]
+                        ),
+                    )
+                    return
+                pairs = result.pairs
+            validated.append((state, pairs))
         created = 0
         try:
-            for state, result in validated:
+            for state, pairs in validated:
                 assets = project_assets(
                     state.path,
                     state.garments,
@@ -1165,7 +1174,7 @@ class TaskCreatePage(QWidget):
                     ),
                     pairing_mode=self.pairing_mode,
                     assets=assets,
-                    pairs=result.pairs,
+                    pairs=pairs,
                     note=self.note_edit.text().strip(),
                     source_date=account_directory.source_date,
                     product_code=state.product_code,

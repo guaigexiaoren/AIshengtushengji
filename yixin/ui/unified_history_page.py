@@ -8,7 +8,6 @@ from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
-    QFileDialog,
     QFrame,
     QHeaderView,
     QLabel,
@@ -53,14 +52,8 @@ from ..constants import (
 )
 from ..database import Database
 from ..library import LibraryService
-from ..local_export import export_original_image
-from ..settings import (
-    AUTO_STRATEGY_LABELS,
-    LOCAL_SAVE_FIXED,
-    LOCAL_SAVE_REFERENCE,
-    AppSettings,
-)
-from ..storage import MIME_TO_SUFFIX, StoredImage, atomic_copy_file, image_metadata, sha256_bytes
+from ..settings import AUTO_STRATEGY_LABELS
+from ..storage import MIME_TO_SUFFIX, StoredImage, atomic_copy_file
 from ..time_utils import format_task_elapsed, utc_naive_to_local
 from ..worker import TaskWorker
 from ..paging import HistoryQuery, PageRequest, TaskQuery
@@ -69,7 +62,7 @@ from .components import FilterBar, PageActionBar, PageHeader
 from .date_filter import OptionalDateEdit
 from .image_preview import DualImagePreview
 from .pagination_bar import PaginationBar
-from .save_helpers import show_saved_path, show_saved_toast
+from .save_helpers import show_saved_path
 from .widgets import TaskImageAsset, build_task_assets
 
 
@@ -152,7 +145,6 @@ class UnifiedHistoryPage(QWidget):
         self.resolver = resolver
         self.actor = actor
         self.async_mode = async_mode
-        self.app_settings = AppSettings(database)
         self.query_runner = (
             get_query_runner() if self.async_mode else None
         )
@@ -171,7 +163,6 @@ class UnifiedHistoryPage(QWidget):
         self.current_record: HistoryRecord | None = None
         self.current_assets: list = []
         self.current_selected_asset = None
-        self._pending_ps_upload: dict | None = None
         self._build()
         if self.query_runner is not None:
             self.query_runner.succeeded.connect(self._query_succeeded)
@@ -285,12 +276,10 @@ class UnifiedHistoryPage(QWidget):
         self.dual_preview = DualImagePreview(
             self.resolver,
             async_thumbnails=self.async_mode,
-            allow_upload=True,
         )
         self.dual_preview.selection_changed.connect(
             self._preview_selected
         )
-        self.dual_preview.upload_requested.connect(self._upload_ps_image)
         self.result_gallery = self.dual_preview.result_pane
         self.reference_gallery = self.dual_preview.reference_pane
         self.reference_strip = self.reference_gallery.list_widget
@@ -299,13 +288,6 @@ class UnifiedHistoryPage(QWidget):
         self.cancel_button = QPushButton("取消任务")
         self.retry_button = QPushButton("重试任务")
         self.confirm_button = QPushButton("确认")
-        self.save_local_button = QPushButton("保存本地")
-        self.save_local_button.setStyleSheet(
-            "QPushButton { background:#2e64c4;color:white;"
-            "border:1px solid #2455aa;border-radius:5px;"
-            "padding:6px 12px;font-weight:600; }"
-            "QPushButton:disabled { background:#aebad0;color:#eef2f8; }"
-        )
         self.save_library_button = QPushButton("保存作品库")
         splitter.addWidget(right)
         splitter.setSizes([900, 600])
@@ -315,7 +297,6 @@ class UnifiedHistoryPage(QWidget):
         action_bar.layout.addWidget(self.retry_button)
         action_bar.layout.addStretch(1)
         action_bar.layout.addWidget(self.confirm_button)
-        action_bar.layout.addWidget(self.save_local_button)
         action_bar.layout.addWidget(self.save_library_button)
         self.page_action_bar = action_bar
         outer.addWidget(action_bar)
@@ -330,8 +311,7 @@ class UnifiedHistoryPage(QWidget):
         self.table.itemSelectionChanged.connect(self._selection_changed)
         self.cancel_button.clicked.connect(self._cancel_current)
         self.retry_button.clicked.connect(self._retry_current)
-        self.confirm_button.clicked.connect(self._confirm_ps_upload)
-        self.save_local_button.clicked.connect(self._save_local)
+        self.confirm_button.clicked.connect(self._confirm_selected_result)
         self.save_library_button.clicked.connect(self._save_library)
         self._set_actions(False)
         if self.async_mode:
@@ -917,10 +897,8 @@ class UnifiedHistoryPage(QWidget):
             self.table.selectRow(row)
 
     def _load_record(self, record: HistoryRecord) -> None:
-        self._clear_pending_ps()
         if self.async_mode:
-            # 详情返回前先清空上一条记录选中的素材并禁用按钮，
-            # 避免此时点击“保存本地”把上一条记录的图存成新记录的名字。
+            # 详情返回前先清空上一条记录选中的素材并禁用按钮。
             self.current_selected_asset = None
             self._set_actions(False)
             self._active_detail_request = self.query_runner.submit(
@@ -1155,36 +1133,14 @@ class UnifiedHistoryPage(QWidget):
 
     def _preview_selected(self, _role: str, payload, _path) -> None:
         self.current_selected_asset = payload
-        can_save = bool(
-            payload is not None
-            and getattr(payload, "is_result", False)
-            and self._selected_pending_result() is None
+        self.save_library_button.setEnabled(
+            bool(
+                payload is not None
+                and getattr(payload, "is_result", False)
+                and self._selected_pending_result() is None
+            )
         )
-        self.save_local_button.setEnabled(can_save)
-        self.save_library_button.setEnabled(can_save)
-        self.dual_preview.upload_button.setEnabled(
-            self.current_record is not None
-            and self.current_record.kind == "project"
-            and self._selected_pending_result() is None
-        )
-        pending = self._pending_ps_upload
-        if pending is not None and self._current_result_id() != int(
-            pending["result_id"]
-        ):
-            self._clear_pending_ps()
         self._update_confirm_state()
-
-    def _current_result_id(self) -> int | None:
-        asset = self.current_selected_asset
-        if asset is None or not getattr(asset, "is_result", False):
-            return None
-        payload = getattr(asset, "payload", None)
-        result = payload.get("result") if isinstance(payload, dict) else None
-        return int(result.id) if result is not None else None
-
-    def _clear_pending_ps(self) -> None:
-        self._pending_ps_upload = None
-        self.confirm_button.setEnabled(False)
 
     def _pending_temp_root(self) -> Path:
         return self.database.path.parent / "temp"
@@ -1200,122 +1156,14 @@ class UnifiedHistoryPage(QWidget):
         return result if isinstance(result, PendingResult) else None
 
     def _update_confirm_state(self) -> None:
-        pending = self._pending_ps_upload
-        ps_ready = (
-            pending is not None
-            and self._current_result_id() == int(pending["result_id"])
-        )
         self.confirm_button.setEnabled(
-            ps_ready or self._selected_pending_result() is not None
+            self._selected_pending_result() is not None
         )
 
-    def _upload_ps_image(self) -> None:
-        record = self.current_record
-        if record is None or record.kind != "project":
-            QMessageBox.information(
-                self,
-                "不支持替换",
-                "只有项目任务的结果图可以上传 PS 图。",
-            )
-            return
-        result_id = self._current_result_id()
-        if result_id is None:
-            QMessageBox.information(
-                self,
-                "请选择结果图",
-                "请先在结果图区域选中要替换的图片。",
-            )
-            return
-        selected, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择要替换的 PS 图",
-            "",
-            "图片 (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)",
-        )
-        if not selected:
-            return
-        path = Path(selected)
-        try:
-            data = path.read_bytes()
-            image_metadata(data)
-        except Exception as exc:
-            QMessageBox.warning(self, "图片不可用", str(exc))
-            return
-        payload = getattr(self.current_selected_asset, "payload", None)
-        result = payload.get("result") if isinstance(payload, dict) else None
-        if result is None:
-            return
-        self._pending_ps_upload = {
-            "path": path,
-            "result_id": result_id,
-            "result_index": int(result.result_index),
-            "attempt_id": int(record.attempt_id),
-            "attempt_no": int(record.raw.get("attempt_no") or 1),
-            "task_id": int(record.task_id),
-        }
-        self.preview.set_image(path)
-        self._update_confirm_state()
-
-    def _confirm_ps_upload(self) -> None:
-        pending_result = self._selected_pending_result()
-        if self._pending_ps_upload is None and pending_result is not None:
-            self._confirm_pending_result(pending_result)
-            return
-        pending = self._pending_ps_upload
-        record = self.current_record
-        if pending is None or record is None:
-            return
-        try:
-            task = self.repository.get_task(int(pending["task_id"]))
-            if task is None:
-                raise ValueError("任务不存在")
-            source = Path(pending["path"])
-            data = source.read_bytes()
-            mime, width, height = image_metadata(data)
-            content_hash = sha256_bytes(data)
-            suffix = MIME_TO_SUFFIX.get(mime, ".png")
-            attempt_no = int(pending["attempt_no"])
-            result_index = int(pending["result_index"])
-            directory = self.resolver.output_directory(task, attempt_no)
-            directory.mkdir(parents=True, exist_ok=True)
-            destination = directory / (
-                f"_r{attempt_no:03d}_{result_index + 1:02d}_"
-                f"{content_hash[:12]}{suffix}"
-            )
-            sequence = 2
-            while destination.exists():
-                destination = directory / (
-                    f"_r{attempt_no:03d}_{result_index + 1:02d}_"
-                    f"{content_hash[:12]}_{sequence}{suffix}"
-                )
-                sequence += 1
-            atomic_copy_file(source, destination)
-            relative_path = self.resolver.relative_to_project(
-                self.resolver.project_root(task.project_relative_root),
-                destination,
-            )
-            self.repository.replace_attempt_result(
-                int(pending["attempt_id"]),
-                int(pending["result_id"]),
-                self.actor,
-                relative_path=relative_path,
-                thumbnail_relative_path=relative_path,
-                content_hash=content_hash,
-                mime=mime,
-                width=width,
-                height=height,
-            )
-        except Exception as exc:
-            QMessageBox.warning(self, "上传失败", str(exc))
-            return
-        self._clear_pending_ps()
-        self.results_changed.emit()
-        QMessageBox.information(
-            self,
-            "已替换",
-            "结果图已替换为上传的 PS 图。",
-        )
-        self._load_record(record)
+    def _confirm_selected_result(self) -> None:
+        item = self._selected_pending_result()
+        if item is not None:
+            self._confirm_pending_result(item)
 
     def _confirm_pending_result(self, item: PendingResult) -> None:
         record = self.current_record
@@ -1406,25 +1254,18 @@ class UnifiedHistoryPage(QWidget):
             and getattr(self.current_selected_asset, "is_result", False)
             and self._selected_pending_result() is None
         )
-        self.save_local_button.setEnabled(selected_result)
         self.save_library_button.setEnabled(selected_result)
-        self.dual_preview.upload_button.setEnabled(
-            record.kind == "project"
-            and self._selected_pending_result() is None
-        )
         self._update_confirm_state()
 
     def _set_actions(self, enabled: bool) -> None:
         for button in (
             self.cancel_button,
             self.retry_button,
-            self.save_local_button,
             self.save_library_button,
         ):
             button.setEnabled(enabled)
         if not enabled:
             self.confirm_button.setEnabled(False)
-            self.dual_preview.upload_button.setEnabled(False)
 
     def _cancel_current(self) -> None:
         record = self.current_record
@@ -1467,89 +1308,6 @@ class UnifiedHistoryPage(QWidget):
             record.task_id,
             int(record.attempt_id),
         )
-
-    def _save_local(self) -> None:
-        record = self.current_record
-        asset = self.current_selected_asset
-        if record is None or asset is None or not asset.is_result:
-            return
-        if record.kind == "ordinary":
-            from ..local_export import LocalImageExporter
-
-            exporter = LocalImageExporter(
-                self.database,
-                self.app_settings,
-            )
-            result = asset.payload
-            directory = exporter.preferred_directory(record.task_id)
-            if directory is None:
-                directory_text = QFileDialog.getExistingDirectory(
-                    self,
-                    "选择保存目录",
-                    str(self.app_settings.last_folder() or Path.home()),
-                )
-                if not directory_text:
-                    return
-                directory = Path(directory_text)
-            try:
-                saved = exporter.save_result(
-                    record.task_id,
-                    int(result["id"]),
-                    directory,
-                )
-            except Exception as exc:
-                QMessageBox.warning(self, "保存失败", str(exc))
-                return
-            show_saved_toast(self, saved)
-            return
-        directory = self._project_save_directory()
-        if directory is None:
-            return
-        result = asset.payload["result"]
-        try:
-            saved = export_original_image(
-                asset.path,
-                directory,
-                task_code=record.secondary_code,
-                result_index=result.result_index,
-            )
-        except Exception as exc:
-            QMessageBox.warning(self, "保存失败", str(exc))
-            return
-        show_saved_toast(self, saved)
-
-    def _project_save_directory(self) -> Path | None:
-        mode = self.app_settings.local_save_mode()
-        if mode == LOCAL_SAVE_FIXED:
-            folder = self.app_settings.fixed_folder()
-            if folder and folder.is_dir():
-                return folder
-        if mode == LOCAL_SAVE_REFERENCE:
-            reference = next(
-                (
-                    asset
-                    for asset in self.current_assets
-                    if asset.is_reference
-                ),
-                None,
-            )
-            if reference is not None:
-                folder = Path(reference.path).parent.parent / "AI图"
-                folder.mkdir(parents=True, exist_ok=True)
-                return folder
-        last = self.app_settings.last_folder()
-        if last and last.is_dir():
-            return last
-        directory = QFileDialog.getExistingDirectory(
-            self,
-            "选择保存目录",
-            str(Path.home()),
-        )
-        if not directory:
-            return None
-        folder = Path(directory)
-        self.app_settings.set_last_folder(folder)
-        return folder
 
     def _save_library(self) -> None:
         record = self.current_record

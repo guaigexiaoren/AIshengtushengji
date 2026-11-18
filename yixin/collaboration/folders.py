@@ -157,18 +157,8 @@ def scan_product_folders(
                     else []
                 ),
                 *(
-                    ["缺少模特图目录（支持 模特图/模特/model）"]
-                    if model_dir is None
-                    else []
-                ),
-                *(
                     ["没有可用的衣服图"]
                     if garment_dir is not None and not garment_paths
-                    else []
-                ),
-                *(
-                    ["没有可用的模特图"]
-                    if model_dir is not None and not model_paths
                     else []
                 ),
                 *(

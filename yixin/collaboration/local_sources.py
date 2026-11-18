@@ -48,6 +48,107 @@ class LocalSourceState:
         return self.garments + ((self.model,) if self.model is not None else ())
 
 
+class ProjectGarmentStore:
+    """保存同一主任务共用的一套衣服素材，供各子任务复用。"""
+
+    def __init__(
+        self,
+        root: Path,
+        actor_id: int,
+        project_id: int,
+    ) -> None:
+        self.task_root = (
+            Path(root).expanduser().resolve()
+            / str(actor_id)
+            / "projects"
+            / str(project_id)
+        )
+        self.manifest_path = self.task_root / "garments.json"
+        self.image_folder = self.task_root / "garments"
+
+    def load(
+        self,
+        source_revision: int,
+    ) -> tuple[StoredImage, ...] | None:
+        if not self.manifest_path.is_file():
+            return None
+        try:
+            data = json.loads(self.manifest_path.read_text("utf-8"))
+            if int(data.get("source_revision", 0)) != int(
+                source_revision
+            ):
+                return None
+            garments = tuple(
+                self._deserialize_image(item)
+                for item in data.get("garments", [])
+            )
+        except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
+            return None
+        if not all(image.path.is_file() for image in garments):
+            return None
+        return garments
+
+    def save(
+        self,
+        garments: Iterable[StoredImage],
+        source_revision: int,
+    ) -> None:
+        self.image_folder.mkdir(parents=True, exist_ok=True)
+        payload = []
+        for image in garments:
+            data = image.path.read_bytes()
+            content_hash = sha256_bytes(data)
+            suffix = image.path.suffix.lower() or ".png"
+            destination = self.image_folder / (
+                f"{content_hash[:20]}{suffix}"
+            )
+            if not destination.exists():
+                atomic_copy_file(image.path, destination)
+            payload.append(
+                {
+                    "path": destination.relative_to(
+                        self.task_root
+                    ).as_posix(),
+                    "content_hash": content_hash,
+                    "mime": image.mime,
+                    "width": image.width,
+                    "height": image.height,
+                    "original_name": image.original_name,
+                    "source_path": (
+                        str(image.source_path)
+                        if image.source_path is not None
+                        else ""
+                    ),
+                }
+            )
+        atomic_write_bytes(
+            self.manifest_path,
+            json.dumps(
+                {
+                    "source_revision": int(source_revision),
+                    "garments": payload,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+            ).encode("utf-8"),
+        )
+
+    def _deserialize_image(self, data: dict) -> StoredImage:
+        path = (self.task_root / str(data["path"])).resolve()
+        path.relative_to(self.task_root)
+        source_text = str(data.get("source_path") or "")
+        return StoredImage(
+            path=path,
+            content_hash=str(data["content_hash"]),
+            mime=str(data["mime"]),
+            width=int(data["width"]),
+            height=int(data["height"]),
+            original_name=str(data["original_name"]),
+            source_path=Path(source_text) if source_text else None,
+        )
+
+
 class LocalTaskSourceStore:
     def __init__(
         self,

@@ -467,6 +467,7 @@ class MainWindow(QMainWindow):
             page.projects_claimed.connect(self._on_projects_claimed)
         elif label == "AI生图":
             page.tasks_enqueued.connect(self._on_batch_enqueued)
+            page.tasks_skipped.connect(self._on_tasks_skipped)
         elif label == "普通创作":
             page.settings_requested.connect(self.open_settings)
             page.templates_changed.connect(self._on_templates_changed)
@@ -615,6 +616,18 @@ class MainWindow(QMainWindow):
     def _on_batch_enqueued(self, count: int) -> None:
         self.statusBar().showMessage(
             f"已加入 {count} 个排队任务 · 数据目录：{self.paths.root}",
+            8000,
+        )
+        self._mark_pages_dirty(
+            "提交记录",
+            "AI生图",
+            "历史记录",
+            "作品库",
+        )
+
+    def _on_tasks_skipped(self, count: int) -> None:
+        self.statusBar().showMessage(
+            f"已跳过 {count} 个子任务 · 数据目录：{self.paths.root}",
             8000,
         )
         self._mark_pages_dirty(

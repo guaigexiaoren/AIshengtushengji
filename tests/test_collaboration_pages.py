@@ -103,6 +103,8 @@ class FakeCentralRepository:
         self.tasks_by_id = {}
         self.user_updates = []
         self.skip_requests = []
+        self.skip_task_requests = []
+        self.skip_project_requests = []
         self.project_urgent_updates = []
         self.queued_attempts = []
         self.project_attempts = []
@@ -186,8 +188,12 @@ class FakeCentralRepository:
     def split_and_queue_generations(self, _task_id, _actor, **_kwargs):
         return []
 
-    def mark_task_skipped(self, _task_id, _actor):
-        return None
+    def mark_task_skipped(self, task_id, actor):
+        self.skip_task_requests.append((task_id, actor))
+
+    def skip_project_tasks(self, project_id, actor):
+        self.skip_project_requests.append((project_id, actor))
+        return 1
 
     def list_attempts(self, _task_id):
         return []
@@ -719,34 +725,79 @@ class CollaborationPageTests(unittest.TestCase):
             for button in page.findChildren(QPushButton)
             if button.text() == "不做图" and button.isVisibleTo(page)
         ]
-        self.assertEqual(len(skip_buttons), 2)
+        self.assertEqual(skip_buttons, [])
+        self.assertTrue(page.skip_task_button.isVisibleTo(page))
+        self.assertTrue(page.skip_project_button.isVisibleTo(page))
+        self.assertTrue(page.skip_task_button.isEnabled())
+        self.assertTrue(page.skip_project_button.isEnabled())
         button_texts = {
             button.text() for button in page.findChildren(QPushButton)
         }
         self.assertNotIn("上传PS成品", button_texts)
         self.assertNotIn("提交验收", button_texts)
         self.assertNotIn("验收通过", button_texts)
-        card_skip = next(
-            button
-            for button in skip_buttons
-            if button is not page.bottom_skip_button
-        )
-        card_skip.click()
-        self.assertTrue(page.pairs[0].skipped)
-        self.assertEqual(
-            page.selected_pair_key,
-            page.pairs[0].key,
-        )
-        self.assertEqual(page.bottom_skip_button.text(), "恢复制作")
-        page.bottom_skip_button.click()
-        self.assertFalse(page.pairs[0].skipped)
-        page.bottom_skip_button.click()
-        self.assertTrue(page.pairs[0].skipped)
         page.prompt_edit.setPlainText("自定义提示词")
         page._task_changed()
         self.assertEqual(page.prompt_edit.toPlainText(), "自定义提示词")
         page._clear_generation_editor()
         self.assertEqual(page.prompt_edit.toPlainText(), "自定义提示词")
+        page.deleteLater()
+
+    def test_ai_generation_skips_current_task_and_whole_project(self) -> None:
+        write_task_images(self.root)
+        task = make_task("claimed")
+        self.repository.list_ai_generation_tasks = (
+            lambda _actor, **_kwargs: [task]
+        )
+        self.repository.list_queued_attempts = lambda _actor_id: []
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        paths = AppPaths(self.root / "ai-skip-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: "sk-test-123456")
+        actor = AuthUser(4, "ai_amy", "AI Amy", "ai")
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            actor,
+            client,
+            key_store,
+            database,
+            file_store,
+            LibraryService(database, file_store, paths),
+            TaskWorker(database, client, file_store),
+            key_store,
+            auto_load=False,
+        )
+        emitted: list[int] = []
+        page.tasks_skipped.connect(emitted.append)
+        page.refresh()
+        with (
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(QMessageBox, "warning"),
+            patch.object(QMessageBox, "information"),
+        ):
+            page.skip_task_button.click()
+            page.skip_project_button.click()
+        self.assertEqual(
+            self.repository.skip_task_requests,
+            [(task.id, actor)],
+        )
+        self.assertEqual(
+            self.repository.skip_project_requests,
+            [(task.project_id, actor)],
+        )
+        self.assertEqual(emitted, [1, 1])
         page.deleteLater()
 
     def test_ai_generation_page_async_searches_first_hundred_tasks(
@@ -869,8 +920,6 @@ class CollaborationPageTests(unittest.TestCase):
             page._auto_match()
             self.assertEqual(len(page.garment_assets), 1)
             page.provider_combo.setCurrentIndex(1)
-            page._select_pair(page.pairs[0])
-            page.bottom_skip_button.click()
             page._enqueue_all()
         self.assertEqual(len(captured), 1)
         self.assertEqual(captured[0][0], task.id)
@@ -881,7 +930,7 @@ class CollaborationPageTests(unittest.TestCase):
             specs[0].person_hash,
             page.person_assets[0].content_hash,
         )
-        self.assertTrue(specs[0].skipped)
+        self.assertFalse(specs[0].skipped)
         self.assertEqual(
             specs[0].requested_provider_code,
             "a6api",
@@ -1206,11 +1255,28 @@ class CollaborationPageTests(unittest.TestCase):
             patch.object(QMessageBox, "warning"),
             patch.object(QMessageBox, "information"),
         ):
+            page._asset_list_for("garment").setCurrentRow(0)
+            page._remove_selected("garment")
+            page._auto_match()
+            page.task_selector.setCurrentIndex(2)
+            self.assertEqual(len(page.garment_assets), 1)
+            self.assertEqual(
+                page.person_assets[0].content_hash,
+                task2.model_hash,
+            )
+            page.task_selector.setCurrentIndex(1)
+            self.assertEqual(len(page.garment_assets), 1)
+            shared_hashes = tuple(
+                image.content_hash for image in page.garment_assets
+            )
             page._enqueue_project_all()
         self.assertEqual(
             [item[0] for item in captured],
             [task1.id, task2.id],
         )
+        self.assertTrue(shared_hashes)
+        for _task_id, _actor_id, pairs in captured:
+            self.assertEqual(pairs[0].garment_hashes, shared_hashes)
         self.assertEqual(
             len({item[2][0].prompt_text for item in captured}),
             1,
@@ -1579,7 +1645,7 @@ class CollaborationPageTests(unittest.TestCase):
             states["DV263q99999p8072"].flags()
             & Qt.ItemFlag.ItemIsUserCheckable
         )
-        self.assertFalse(
+        self.assertTrue(
             states["DV264q25445p8072"].flags()
             & Qt.ItemFlag.ItemIsUserCheckable
         )
@@ -1646,7 +1712,7 @@ class CollaborationPageTests(unittest.TestCase):
             )
         page.deleteLater()
 
-    def test_external_project_skips_incomplete_folders(self) -> None:
+    def test_external_project_allows_missing_model_folder(self) -> None:
         self.repository.list_accessible_projects = (
             lambda _actor: (("external", "客户A"),)
         )
@@ -1663,15 +1729,15 @@ class CollaborationPageTests(unittest.TestCase):
             self.resolver,
             self.actor,
         )
-        # 外部项目不再静默跳过缺目录的文件夹，而是列出并提示。
+        # 没有模特图目录时仍允许提交，只是不会生成子任务。
         self.assertEqual(page.product_table.rowCount(), 1)
         self.assertEqual(
             page.product_table.item(0, 0).text(),
-            "需处理",
+            "可创建",
         )
-        self.assertIn(
-            "缺少模特图目录",
-            page.product_table.item(0, 0).toolTip(),
+        self.assertTrue(
+            page.product_table.item(0, 1).flags()
+            & Qt.ItemFlag.ItemIsUserCheckable
         )
         page.deleteLater()
 
@@ -1773,6 +1839,44 @@ class CollaborationPageTests(unittest.TestCase):
             self.repository.created_drafts[0].product_code,
             "DV263q25445p8072",
         )
+        page.deleteLater()
+
+    def test_submits_product_without_model_images(self) -> None:
+        date_folder = current_date_folder(
+            self.root / "内部项目" / "春季项目"
+        )
+        product = date_folder.path / "DV263q25445p80723"
+        (product / "衣服图").mkdir(parents=True)
+        (product / "模特图").mkdir(parents=True)
+        Image.new("RGB", (20, 20), "red").save(
+            product / "衣服图" / "衣服1.png"
+        )
+        page = TaskCreatePage(
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        self.assertEqual(page.product_table.item(0, 0).text(), "可创建")
+        page.product_table.selectRow(0)
+        page.product_table.item(0, 1).setCheckState(
+            page.product_table.item(0, 1).checkState()
+        )
+        with (
+            patch(
+                "yixin.ui.task_create_page.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch("yixin.ui.task_create_page.QMessageBox.information"),
+            patch("yixin.ui.task_create_page.QMessageBox.warning"),
+        ):
+            page._create_selected()
+        self.assertEqual(len(self.repository.created_drafts), 1)
+        draft = self.repository.created_drafts[0]
+        self.assertEqual(
+            [asset.role for asset in draft.assets],
+            ["garment"],
+        )
+        self.assertEqual(draft.pairs, ())
         page.deleteLater()
 
     def test_choose_directory_switches_to_selected_project(self) -> None:
@@ -2806,15 +2910,12 @@ class CollaborationPageTests(unittest.TestCase):
             page.preview.current_path,
             result_path.resolve(),
         )
-        self.assertTrue(page.save_local_button.isEnabled())
         reference_strip = page.dual_preview.reference_pane.list_widget
         reference_strip.itemClicked.emit(reference_strip.item(2))
         self.app.processEvents()
-        self.assertFalse(page.save_local_button.isEnabled())
         result_strip = page.dual_preview.result_pane.list_widget
         result_strip.itemClicked.emit(result_strip.item(0))
         self.app.processEvents()
-        self.assertTrue(page.save_local_button.isEnabled())
         emitted: list[tuple[int, int]] = []
         page.project_retry_requested.connect(
             lambda task_id, attempt_id: emitted.append(
@@ -3009,104 +3110,6 @@ class CollaborationPageTests(unittest.TestCase):
         )
         page.deleteLater()
 
-    def test_history_uploads_ps_image_and_confirms(self) -> None:
-        write_task_images(self.root)
-        task = make_task("approved")
-        product_root = self.root / task.project_relative_root
-        result_path = product_root / "AI成品" / "history-result.png"
-        result_path.parent.mkdir(parents=True, exist_ok=True)
-        Image.new("RGB", (40, 50), "orange").save(result_path)
-        result = GenerationResult(
-            id=71,
-            attempt_id=81,
-            result_index=0,
-            relative_path=result_path.relative_to(product_root).as_posix(),
-            thumbnail_relative_path=result_path.relative_to(
-                product_root
-            ).as_posix(),
-            content_hash="e" * 64,
-            mime="image/png",
-            width=40,
-            height=50,
-            is_final=True,
-        )
-        row = {
-            "id": 81,
-            "task_id": task.id,
-            "assignee_id": task.assignee_id,
-            "attempt_no": 1,
-            "project_code": task.project_code,
-            "task_code": task.task_code,
-            "product_code": task.product_code,
-            "project_name": task.project_name,
-            "access_project_name": "春季项目",
-            "operator_name": "AI制作Amy",
-            "model": task.model,
-            "provider_name": "A6API",
-            "status": ATTEMPT_SUCCEEDED,
-            "prompt_text": "历史改图",
-            "aspect_ratio": "3:4",
-            "resolution": "2K",
-            "n": 1,
-            "created_at": datetime.now(),
-            "result_count": 1,
-        }
-        self.repository.tasks_by_id[task.id] = task
-        self.repository.attempt_results[81] = [result]
-        self.repository.list_project_attempt_history = (
-            lambda _actor, **_kwargs: [row]
-        )
-        self.repository.list_project_attempt_history_page = (
-            lambda _actor, _query, page: PageResult(
-                [row], 1, page.page, page.page_size
-            )
-        )
-        self.repository.list_access_project_names = (
-            lambda _actor: ["春季项目"]
-        )
-        paths = AppPaths(self.root / "history-upload-data")
-        paths.ensure()
-        database = Database(paths.database)
-        database.initialize()
-        store = FileStore(paths)
-        page = UnifiedHistoryPage(
-            database,
-            LibraryService(database, store, paths),
-            TaskWorker(database, NanoBananaClient(lambda: "test-key"), store),
-            self.repository,
-            self.resolver,
-            self.actor,
-        )
-        page.table.selectRow(0)
-        self.app.processEvents()
-        self.assertTrue(
-            page.dual_preview.upload_button.isVisibleTo(page)
-        )
-        self.assertFalse(page.confirm_button.isEnabled())
-        replacement = self.root / "ps-result.png"
-        Image.new("RGB", (60, 80), "green").save(replacement)
-        with patch(
-            "yixin.ui.unified_history_page.QFileDialog.getOpenFileName",
-            return_value=(str(replacement), ""),
-        ):
-            page._upload_ps_image()
-        self.assertTrue(page.confirm_button.isEnabled())
-        with patch(
-            "yixin.ui.unified_history_page.QMessageBox.information"
-        ):
-            page._confirm_ps_upload()
-        self.assertEqual(len(self.repository.replaced_results), 1)
-        attempt_id, result_id, kwargs = self.repository.replaced_results[0]
-        self.assertEqual((attempt_id, result_id), (81, 71))
-        saved = self.resolver.resolve_project_path(
-            task.project_relative_root,
-            kwargs["relative_path"],
-        )
-        self.assertTrue(saved.is_file())
-        self.assertEqual(kwargs["mime"], "image/png")
-        self.assertFalse(page.confirm_button.isEnabled())
-        page.deleteLater()
-
     def test_history_confirms_pending_generation_result(self) -> None:
         write_task_images(self.root)
         task = make_task("approved")
@@ -3183,11 +3186,10 @@ class CollaborationPageTests(unittest.TestCase):
         ]
         self.assertEqual(len(pending_assets), 1)
         self.assertTrue(page.confirm_button.isEnabled())
-        self.assertFalse(page.save_local_button.isEnabled())
         with patch(
             "yixin.ui.unified_history_page.QMessageBox.information"
         ):
-            page._confirm_ps_upload()
+            page._confirm_selected_result()
         self.assertEqual(len(self.repository.confirmed_results), 1)
         attempt_id, kwargs = self.repository.confirmed_results[0]
         self.assertEqual(attempt_id, 82)

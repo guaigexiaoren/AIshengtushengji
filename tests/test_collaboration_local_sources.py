@@ -7,7 +7,10 @@ from pathlib import Path
 
 from PIL import Image
 
-from yixin.collaboration.local_sources import LocalTaskSourceStore
+from yixin.collaboration.local_sources import (
+    LocalTaskSourceStore,
+    ProjectGarmentStore,
+)
 from yixin.collaboration.shared_paths import SharedPathResolver
 from yixin.collaboration.repository import StateConflictError
 from yixin.collaboration.types import (
@@ -83,6 +86,33 @@ def make_task(root: Path) -> ProjectTask:
 
 
 class LocalTaskSourceTests(unittest.TestCase):
+    def test_project_garments_persist_across_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = make_task(root / "share")
+            resolver = SharedPathResolver(root / "share")
+            local = LocalTaskSourceStore(root / "local", 7, task, resolver)
+            extra = root / "新增衣服.png"
+            Image.new("RGB", (30, 30), "green").save(extra)
+            local.add_paths("garment", [extra])
+
+            store = ProjectGarmentStore(root / "local", 7, task.project_id)
+            store.save(local.state.garments, task.source_revision)
+            self.assertIsNone(
+                ProjectGarmentStore(
+                    root / "local", 7, task.project_id
+                ).load(task.source_revision + 1)
+            )
+            reloaded = ProjectGarmentStore(
+                root / "local", 7, task.project_id
+            ).load(task.source_revision)
+            self.assertIsNotNone(reloaded)
+            self.assertEqual(
+                [image.content_hash for image in reloaded],
+                [image.content_hash for image in local.state.garments],
+            )
+            self.assertTrue(reloaded[0].source_path.is_file())
+
     def test_local_sources_persist_and_attempt_snapshot_survives(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -3084,6 +3084,82 @@ class MySQLCentralRepository:
                     {},
                 )
 
+    def skip_project_tasks(
+        self,
+        project_id: int,
+        actor: AuthUser,
+    ) -> int:
+        """把主任务下所有尚未开始的子任务标记为无需制作。"""
+        if actor.role not in (ROLE_AI, ROLE_ADMIN):
+            raise PermissionDeniedError("当前角色不能跳过制作任务")
+        now = utc_now()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                self._project_row_for_update(cursor, project_id)
+                cursor.execute(
+                    """
+                    SELECT id, status, assignee_id
+                    FROM project_tasks
+                    WHERE project_id = %s
+                    ORDER BY task_no
+                    FOR UPDATE
+                    """,
+                    (project_id,),
+                )
+                candidates = [
+                    task
+                    for task in cursor.fetchall()
+                    if task["status"]
+                    in (
+                        TASK_AVAILABLE,
+                        TASK_CLAIMED,
+                        TASK_RETURNED,
+                    )
+                    and (
+                        actor.role == ROLE_ADMIN
+                        or int(task["assignee_id"] or 0) == actor.id
+                    )
+                ]
+                if not candidates:
+                    raise StateConflictError("没有需要结束的子任务")
+                for task in candidates:
+                    cursor.execute(
+                        """
+                        UPDATE generation_attempts
+                        SET status = %s, error_code = 'cancelled',
+                            error_message = '子任务已标记无需制作',
+                            finished_at = %s
+                        WHERE task_id = %s AND status = %s
+                        """,
+                        (
+                            ATTEMPT_CANCELLED,
+                            now,
+                            int(task["id"]),
+                            ATTEMPT_QUEUED,
+                        ),
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE project_tasks
+                        SET status = %s, final_quantity = 0,
+                            approved_at = %s, updated_at = %s
+                        WHERE id = %s
+                        """,
+                        (TASK_SKIPPED, now, now, int(task["id"])),
+                    )
+                    self._event(
+                        cursor,
+                        project_id,
+                        int(task["id"]),
+                        actor.id,
+                        "task_skipped",
+                        task["status"],
+                        TASK_SKIPPED,
+                        {},
+                    )
+                self._update_project_status(cursor, project_id)
+                return len(candidates)
+
     def cancel_queued_generation_attempt(
         self,
         attempt_id: int,
@@ -6651,13 +6727,18 @@ class MySQLCentralRepository:
         if not draft.project_relative_root.strip():
             raise ValueError("任务共享目录不能为空")
         if not draft.assets:
-            raise ValueError("项目至少需要服装图和模特图")
-        if not draft.pairs:
-            raise ValueError("项目至少需要一个制作任务")
+            raise ValueError("项目至少需要服装图")
         garment_count = sum(asset.role == "garment" for asset in draft.assets)
         model_count = sum(asset.role == "model" for asset in draft.assets)
-        if not garment_count or not model_count:
-            raise ValueError("项目必须同时包含服装图和模特图")
+        if not garment_count:
+            raise ValueError("项目必须包含服装图")
+        if model_count == 0:
+            # 没有模特图时允许先提交项目（不生成子任务）。
+            if draft.pairs:
+                raise ValueError("没有模特图时不能包含制作任务")
+            return
+        if not draft.pairs:
+            raise ValueError("项目至少需要一个制作任务")
         seen: set[PairingInput] = set()
         garments_by_model: dict[int, set[int]] = {}
         for pair in draft.pairs:

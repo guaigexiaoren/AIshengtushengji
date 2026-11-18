@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Sequence
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
@@ -19,7 +19,10 @@ from PySide6.QtWidgets import (
 )
 
 from ..api import NanoBananaClient
-from ..collaboration.local_sources import LocalTaskSourceStore
+from ..collaboration.local_sources import (
+    LocalTaskSourceStore,
+    ProjectGarmentStore,
+)
 from ..collaboration.pending_results import (
     clear_pending_results,
     load_pending_results,
@@ -54,7 +57,7 @@ from ..model_router import choose_model
 from ..paging import PageRequest, TaskQuery
 from ..security import SecretStore
 from ..settings import AUTO_STRATEGY_QUALITY
-from ..storage import FileStore
+from ..storage import FileStore, StoredImage
 from ..worker import TaskWorker
 from .batch_dress_page import (
     BatchDressPage,
@@ -66,6 +69,8 @@ from .components import PageHeader
 
 
 class AIGenerationPage(BatchDressPage):
+    tasks_skipped = Signal(int)
+
     def __init__(
         self,
         repository: MySQLCentralRepository,
@@ -101,6 +106,7 @@ class AIGenerationPage(BatchDressPage):
         self._prompt_cache: dict[int, str] = {}
         self._task_settings: dict[int, dict] = {}
         self._project_settings: dict[int, dict] = {}
+        self._project_garment_stores: dict[int, ProjectGarmentStore] = {}
         self.async_mode = async_mode
         self.query_runner = (
             get_query_runner() if async_mode else None
@@ -113,8 +119,8 @@ class AIGenerationPage(BatchDressPage):
             worker,
             secret_store,
             parent,
-            allow_pair_skip=True,
-            allow_bottom_skip=True,
+            allow_pair_skip=False,
+            allow_bottom_skip=False,
             generate_button_text="加入队列",
             auto_load=False,
             async_thumbnails=async_mode,
@@ -133,11 +139,20 @@ class AIGenerationPage(BatchDressPage):
         self.project_batch_button.clicked.connect(
             self._enqueue_project_all
         )
-        action_bar = self.generate_button.parentWidget().layout
-        action_bar.insertWidget(
-            action_bar.indexOf(self.generate_button),
-            self.project_batch_button,
+        self.skip_task_button = QPushButton("当前子任务不做图")
+        self.skip_task_button.setMinimumHeight(42)
+        self.skip_task_button.setEnabled(False)
+        self.skip_task_button.clicked.connect(self._skip_current_task)
+        self.skip_project_button = QPushButton("本主任务不做图")
+        self.skip_project_button.setMinimumHeight(42)
+        self.skip_project_button.setEnabled(False)
+        self.skip_project_button.clicked.connect(
+            self._skip_project_tasks
         )
+        action_bar = self.generate_button.parentWidget().layout
+        insert_at = action_bar.indexOf(self.project_batch_button)
+        action_bar.insertWidget(insert_at, self.skip_task_button)
+        action_bar.insertWidget(insert_at + 1, self.skip_project_button)
         self.task_selector.currentIndexChanged.connect(
             self._task_changed
         )
@@ -505,6 +520,18 @@ class AIGenerationPage(BatchDressPage):
             and self.task_selector.isEnabled()
             and len(self._project_source_tasks(task.project_id)) >= 2
         )
+        self._update_skip_buttons()
+
+    def _update_skip_buttons(self) -> None:
+        if not hasattr(self, "skip_task_button"):
+            return
+        task = self.current_task
+        self.skip_task_button.setEnabled(
+            task is not None
+            and int(task.assignee_id or 0) == self.actor.id
+            and task.status != TASK_AWAITING_ACCEPTANCE
+        )
+        self.skip_project_button.setEnabled(task is not None)
 
     def _task_changed(self, _index: int | None = None) -> None:
         self._snapshot_current()
@@ -528,7 +555,15 @@ class AIGenerationPage(BatchDressPage):
             self._clear_generation_editor()
             return
         self.restore_all_button.setEnabled(True)
-        self.garment_assets = list(state.garments)
+        shared_garments = self._project_garments(
+            task.project_id,
+            task.source_revision,
+        )
+        self.garment_assets = (
+            list(shared_garments)
+            if shared_garments is not None
+            else list(state.garments)
+        )
         self.person_assets = [state.model] if state.model else []
         self.selected_garment = None
         self.pairs = []
@@ -599,6 +634,32 @@ class AIGenerationPage(BatchDressPage):
             f"{TASK_STATUS_LABELS.get(task.status, task.status)}"
         )
 
+    def _project_garment_store(
+        self,
+        project_id: int,
+    ) -> ProjectGarmentStore:
+        store = self._project_garment_stores.get(project_id)
+        if store is None:
+            store = ProjectGarmentStore(
+                self.file_store.paths.root / "local_sources",
+                self.actor.id,
+                project_id,
+            )
+            self._project_garment_stores[project_id] = store
+        return store
+
+    def _project_garments(
+        self,
+        project_id: int,
+        source_revision: int,
+    ) -> tuple[StoredImage, ...] | None:
+        try:
+            return self._project_garment_store(project_id).load(
+                source_revision
+            )
+        except Exception:
+            return None
+
     def _persist_current_sources(self) -> None:
         if (
             self.current_task is None
@@ -609,6 +670,12 @@ class AIGenerationPage(BatchDressPage):
             self.local_store.replace_all(
                 tuple(self.garment_assets),
                 self.person_assets[0] if len(self.person_assets) == 1 else None,
+            )
+            self._project_garment_store(
+                self.current_task.project_id
+            ).save(
+                tuple(self.garment_assets),
+                self.current_task.source_revision,
             )
         except Exception as exc:
             QMessageBox.warning(
@@ -642,6 +709,17 @@ class AIGenerationPage(BatchDressPage):
             self._loading_source_state = False
         self._refresh_pairs()
         self._auto_match()
+        task = self.current_task
+        if task is not None:
+            try:
+                self._project_garment_store(task.project_id).save(
+                    tuple(self.garment_assets),
+                    task.source_revision,
+                )
+            except Exception as exc:
+                QMessageBox.warning(
+                    self, "保存本机素材失败", str(exc)
+                )
         self.feedback_label.setText("已恢复全部初始共享盘素材。")
 
     def _enqueue_all(self) -> None:
@@ -727,6 +805,7 @@ class AIGenerationPage(BatchDressPage):
     def _load_task_groups(
         self,
         task: ProjectTask,
+        garments: Sequence[StoredImage] | None = None,
     ) -> list[DressTaskGroup]:
         try:
             store = LocalTaskSourceStore(
@@ -738,9 +817,12 @@ class AIGenerationPage(BatchDressPage):
             state = store.state
         except Exception:
             return []
-        if not state.garments or state.model is None:
+        selected_garments = (
+            tuple(garments) if garments is not None else state.garments
+        )
+        if not selected_garments or state.model is None:
             return []
-        return auto_match_groups(state.garments, state.model)
+        return auto_match_groups(selected_garments, state.model)
 
     def _enqueue_project_all(self) -> None:
         task = self.current_task
@@ -780,7 +862,10 @@ class AIGenerationPage(BatchDressPage):
             groups = (
                 list(self.pairs)
                 if item.id == task.id and self.pairs
-                else self._load_task_groups(item)
+                else self._load_task_groups(
+                    item,
+                    tuple(self.garment_assets),
+                )
             )
             if not groups:
                 errors.append(f"{item.task_code}：没有可用素材")
@@ -835,6 +920,92 @@ class AIGenerationPage(BatchDressPage):
                 "部分子任务未提交",
                 "\n".join(errors),
             )
+
+    def _reset_queue_after_skip(self) -> None:
+        self.waiting_jobs.clear()
+        self._resume_queued_jobs()
+        self._pump_queue()
+
+    def _skip_current_task(self) -> None:
+        task = self.current_task
+        if task is None:
+            QMessageBox.information(
+                self,
+                "未选择子任务",
+                "请先在顶部选择需要制作的子任务。",
+            )
+            return
+        if task.status == TASK_AWAITING_ACCEPTANCE:
+            QMessageBox.information(
+                self,
+                "不能跳过",
+                "该子任务还有待确认结果，请先确认或重试。",
+            )
+            return
+        if int(task.assignee_id or 0) != self.actor.id:
+            QMessageBox.warning(
+                self,
+                "不能跳过",
+                "该子任务不属于当前账号。",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "当前子任务不做图",
+            f"子任务 {task.task_code} 将标记为“无需制作”，不再生成。\n"
+            "确定继续吗？",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.repository.mark_task_skipped(task.id, self.actor)
+        except Exception as exc:
+            QMessageBox.warning(self, "跳过失败", str(exc))
+            return
+        self.feedback_label.setText(
+            f"子任务 {task.task_code} 已标记无需制作。"
+        )
+        self.tasks_skipped.emit(1)
+        self._refresh_generation_tasks()
+        self._reset_queue_after_skip()
+
+    def _skip_project_tasks(self) -> None:
+        task = self.current_task
+        if task is None:
+            QMessageBox.information(
+                self,
+                "未选择子任务",
+                "请先在顶部选择主任务下的子任务。",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "本主任务不做图",
+            "本主任务下所有尚未开始、尚未完成的子任务将标记为"
+            "“无需制作”，生成中的任务不受影响。\n确定继续吗？",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            count = self.repository.skip_project_tasks(
+                task.project_id,
+                self.actor,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "跳过失败", str(exc))
+            return
+        self.feedback_label.setText(
+            f"本主任务已标记 {count} 个子任务无需制作。"
+        )
+        self.tasks_skipped.emit(count)
+        self._refresh_generation_tasks()
+        self._reset_queue_after_skip()
 
     def prepare_history_retry(
         self,
@@ -923,6 +1094,18 @@ class AIGenerationPage(BatchDressPage):
                     reference_count=len(group.references),
                     strategy=strategy,
                 ).model
+            if not group.skipped:
+                usable_model = self._resolve_usable_model(
+                    model_id,
+                    len(group.references),
+                    1,
+                )
+                if usable_model is None:
+                    raise ValueError(
+                        "当前模型在已启用平台中没有可用的 API Key，"
+                        "请改用其他模型"
+                    )
+                model_id = usable_model
             garment_hashes = tuple(
                 image.content_hash
                 for role, image in zip(group.roles, group.references)
@@ -1060,6 +1243,17 @@ class AIGenerationPage(BatchDressPage):
                 reference_count=len(group.references),
                 strategy=AUTO_STRATEGY_QUALITY,
             ).model
+        usable_model = self._resolve_usable_model(
+            model_id,
+            len(group.references),
+            1,
+        )
+        if usable_model is None:
+            raise ValueError(
+                "当前模型在已启用平台中没有可用的 API Key，"
+                "请改用其他模型"
+            )
+        model_id = usable_model
         attempt = self.repository.queue_generation_attempt(
             task.id,
             self.actor,

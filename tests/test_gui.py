@@ -476,11 +476,9 @@ class GuiFlowTests(unittest.TestCase):
         self.assertEqual(result_labels, ["结果 1", "结果 2"])
         reference_item = history.reference_strip.item(0)
         history.reference_strip.itemClicked.emit(reference_item)
-        self.assertFalse(history.save_local_button.isEnabled())
         self.assertFalse(history.save_library_button.isEnabled())
         result_strip = history.result_gallery.list_widget
         result_strip.itemClicked.emit(result_strip.item(0))
-        self.assertTrue(history.save_local_button.isEnabled())
         self.assertTrue(history.save_library_button.isEnabled())
 
     def test_reference_drop_filters_supported_local_images(self) -> None:
