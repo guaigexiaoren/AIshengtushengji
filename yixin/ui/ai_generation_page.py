@@ -397,6 +397,7 @@ class AIGenerationPage(BatchDressPage):
         )
         self.task_status_label.setText("正在加载子任务…")
         self.task_selector.setEnabled(False)
+        self._update_project_batch_state()
 
         def load():
             result = self.repository.list_ai_generation_tasks_page(
@@ -437,6 +438,7 @@ class AIGenerationPage(BatchDressPage):
             return
         self.task_selector.setEnabled(True)
         self.task_status_label.setText("子任务加载失败")
+        self._update_project_batch_state()
         QMessageBox.warning(self, "读取AI生图任务失败", message)
 
     def _render_generation_tasks(

@@ -675,16 +675,18 @@ class Database:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    def active_temp_paths(self) -> set[Path]:
+    def protected_temp_paths(self) -> set[Path]:
+        """历史记录仍要使用的素材与结果文件，不能被临时清理误删。"""
         with self.connection() as connection:
             rows = connection.execute(
                 """
-                SELECT a.path
-                FROM task_assets a
-                JOIN tasks t ON t.id = a.task_id
-                WHERE t.status IN (?, ?)
-                """,
-                (TASK_QUEUED, TASK_RUNNING),
+                SELECT path FROM task_assets
+                UNION
+                SELECT path FROM task_results
+                UNION
+                SELECT thumbnail_path FROM task_results
+                WHERE thumbnail_path IS NOT NULL
+                """
             ).fetchall()
             return {Path(row["path"]) for row in rows}
 

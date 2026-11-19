@@ -8,6 +8,7 @@ from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QFileDialog,
     QFrame,
     QHeaderView,
     QLabel,
@@ -52,7 +53,13 @@ from ..constants import (
 )
 from ..database import Database
 from ..library import LibraryService
-from ..settings import AUTO_STRATEGY_LABELS
+from ..local_export import export_original_image
+from ..settings import (
+    AUTO_STRATEGY_LABELS,
+    LOCAL_SAVE_FIXED,
+    LOCAL_SAVE_REFERENCE,
+    AppSettings,
+)
 from ..storage import MIME_TO_SUFFIX, StoredImage, atomic_copy_file
 from ..time_utils import format_task_elapsed, utc_naive_to_local
 from ..worker import TaskWorker
@@ -62,7 +69,7 @@ from .components import FilterBar, PageActionBar, PageHeader
 from .date_filter import OptionalDateEdit
 from .image_preview import DualImagePreview
 from .pagination_bar import PaginationBar
-from .save_helpers import show_saved_path
+from .save_helpers import show_saved_path, show_saved_toast
 from .widgets import TaskImageAsset, build_task_assets
 
 
@@ -145,6 +152,7 @@ class UnifiedHistoryPage(QWidget):
         self.resolver = resolver
         self.actor = actor
         self.async_mode = async_mode
+        self.app_settings = AppSettings(database)
         self.query_runner = (
             get_query_runner() if self.async_mode else None
         )
@@ -1156,14 +1164,21 @@ class UnifiedHistoryPage(QWidget):
         return result if isinstance(result, PendingResult) else None
 
     def _update_confirm_state(self) -> None:
+        asset = self.current_selected_asset
         self.confirm_button.setEnabled(
             self._selected_pending_result() is not None
+            or bool(
+                asset is not None
+                and getattr(asset, "is_result", False)
+            )
         )
 
     def _confirm_selected_result(self) -> None:
         item = self._selected_pending_result()
         if item is not None:
             self._confirm_pending_result(item)
+            return
+        self._save_selected_result()
 
     def _confirm_pending_result(self, item: PendingResult) -> None:
         record = self.current_record
@@ -1308,6 +1323,92 @@ class UnifiedHistoryPage(QWidget):
             record.task_id,
             int(record.attempt_id),
         )
+
+    def _save_selected_result(self) -> None:
+        record = self.current_record
+        asset = self.current_selected_asset
+        if record is None or asset is None or not asset.is_result:
+            return
+        if record.kind == "ordinary":
+            from ..local_export import LocalImageExporter
+
+            exporter = LocalImageExporter(
+                self.database,
+                self.app_settings,
+            )
+            result = asset.payload
+            directory = exporter.preferred_directory(record.task_id)
+            if directory is None:
+                directory_text = QFileDialog.getExistingDirectory(
+                    self,
+                    "选择保存目录",
+                    str(self.app_settings.last_folder() or Path.home()),
+                )
+                if not directory_text:
+                    return
+                directory = Path(directory_text)
+            try:
+                saved = exporter.save_result(
+                    record.task_id,
+                    int(result["id"]),
+                    directory,
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "保存失败", str(exc))
+                return
+            show_saved_toast(self, saved)
+            return
+        directory = self._project_save_directory()
+        if directory is None:
+            return
+        result = asset.payload["result"]
+        try:
+            saved = export_original_image(
+                asset.path,
+                directory,
+                task_code=record.secondary_code,
+                result_index=result.result_index,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
+        show_saved_toast(self, saved)
+
+    def _project_save_directory(self) -> Path | None:
+        mode = self.app_settings.local_save_mode()
+        if mode == LOCAL_SAVE_FIXED:
+            folder = self.app_settings.fixed_folder()
+            if folder and folder.is_dir():
+                return folder
+        if mode == LOCAL_SAVE_REFERENCE:
+            record = self.current_record
+            task = (
+                self.repository.get_task(record.task_id)
+                if record is not None and record.kind == "project"
+                else None
+            )
+            if task is not None:
+                folder = (
+                    self.resolver.project_root(
+                        task.project_relative_root
+                    )
+                    / "AI图"
+                )
+                folder.mkdir(parents=True, exist_ok=True)
+                return folder
+        last = self.app_settings.last_folder()
+        if last and last.is_dir():
+            return last
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "选择保存目录",
+            str(Path.home()),
+        )
+        if not directory:
+            return None
+        folder = Path(directory)
+        self.app_settings.set_last_folder(folder)
+        return folder
 
     def _save_library(self) -> None:
         record = self.current_record

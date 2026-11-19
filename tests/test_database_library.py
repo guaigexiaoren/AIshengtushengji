@@ -48,6 +48,30 @@ class DatabaseLibraryTests(unittest.TestCase):
         source = make_image(Path(self.temp.name) / "ref.png", (15, 50, 90))
         return self.store.save_reference(source)
 
+    def test_protected_temp_paths_include_completed_task_files(self) -> None:
+        reference = self._reference()
+        task_id = self.database.create_tasks(
+            [self._request(references=(reference,))]
+        )[0]
+        self.database.claim_next_queued()
+        image = self.store.store_generated(task_id, png_bytes(), 0)
+        thumbnail = self.store.create_thumbnail(image.path)
+        self.database.add_task_result(
+            task_id,
+            0,
+            image,
+            thumbnail_path=thumbnail,
+            remote_url=None,
+        )
+        self.database.transition_task(task_id, TASK_SUCCESS)
+        protected = {
+            path.resolve()
+            for path in self.database.protected_temp_paths()
+        }
+        self.assertIn(reference.path.resolve(), protected)
+        self.assertIn(image.path.resolve(), protected)
+        self.assertIn(thumbnail.resolve(), protected)
+
     def _request(self, *, prompt: str = "测试提示词", references=()) -> ImageRequest:
         return ImageRequest(
             model="gemini-3-pro-image",

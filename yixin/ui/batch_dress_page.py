@@ -192,7 +192,7 @@ class BatchAssetList(QListWidget):
         self.setAcceptDrops(True)
         self.setDragEnabled(False)
         self.setDragDropMode(QListWidget.DragDropMode.DropOnly)
-        self.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.setWordWrap(True)
         self._drag_start: QPoint | None = None
         self._drag_row: int | None = None
@@ -214,16 +214,19 @@ class BatchAssetList(QListWidget):
         self.installEventFilter(self)
 
     def refresh_assets(self, assets: Sequence[StoredImage]) -> None:
-        selected_hash = None
-        current = self.currentItem()
-        if current:
-            selected = current.data(Qt.ItemDataRole.UserRole)
-            if isinstance(selected, StoredImage):
-                selected_hash = selected.content_hash
+        selected_hashes = {
+            item.data(Qt.ItemDataRole.UserRole).content_hash
+            for item in self.selectedItems()
+            if isinstance(
+                item.data(Qt.ItemDataRole.UserRole),
+                StoredImage,
+            )
+        }
 
         self.blockSignals(True)
         self.clear()
         self._thumbnail_contexts.clear()
+        first_restored = None
         for index, image in enumerate(assets):
             item = QListWidgetItem(
                 f"{ROLE_LABELS[self.role]} {index + 1}\n{image.original_name}"
@@ -244,8 +247,12 @@ class BatchAssetList(QListWidget):
                 pixmap = load_scaled_pixmap(image.path, self.iconSize())
                 if not pixmap.isNull():
                     item.setIcon(QIcon(pixmap))
-            if selected_hash and image.content_hash == selected_hash:
-                self.setCurrentItem(item)
+            if image.content_hash in selected_hashes:
+                item.setSelected(True)
+                if first_restored is None:
+                    first_restored = item
+        if first_restored is not None:
+            self.setCurrentItem(first_restored)
         self.blockSignals(False)
 
     def _thumbnail_ready(
@@ -1536,19 +1543,45 @@ class BatchDressPage(QWidget):
 
     def _remove_selected(self, role: str) -> None:
         asset_list = self._asset_list_for(role)
-        row = asset_list.currentRow()
         assets = self._assets_for(role)
-        if not 0 <= row < len(assets):
+        rows = sorted(
+            {
+                index.row()
+                for index in asset_list.selectedIndexes()
+                if 0 <= index.row() < len(assets)
+            },
+            reverse=True,
+        )
+        if not rows:
+            row = asset_list.currentRow()
+            if 0 <= row < len(assets):
+                rows = [row]
+        if not rows:
             return
-        image = assets[row]
-        related = self._pairs_for_image(role, image)
-        if related and not self._confirm_pair_removal(
-            f"该{ROLE_LABELS[role]}图已参与 {len(related)} 个配对，"
-            "移除后将同时删除这些配对。"
-        ):
+        images = [assets[row] for row in rows]
+        related_count = len(
+            {
+                pair.key
+                for image in images
+                for pair in self._pairs_for_image(role, image)
+            }
+        )
+        if len(images) > 1:
+            detail = (
+                f"所选 {len(images)} 张{ROLE_LABELS[role]}图中，"
+                f"共参与 {related_count} 个配对，移除后将同时删除这些配对。"
+            )
+        else:
+            detail = (
+                f"该{ROLE_LABELS[role]}图已参与 {related_count} 个配对，"
+                "移除后将同时删除这些配对。"
+            )
+        if related_count and not self._confirm_pair_removal(detail):
             return
-        assets.pop(row)
-        self._remove_related_pairs(role, image)
+        for row in rows:
+            assets.pop(row)
+        for image in images:
+            self._remove_related_pairs(role, image)
         self._refresh_role(role)
         self._refresh_pairs()
 
@@ -1978,20 +2011,6 @@ class BatchDressPage(QWidget):
             return
 
         count = self.count_spin.value()
-        maximum = len(self.pairs) * count
-        answer = QMessageBox.question(
-            self,
-            "确认批量生成",
-            f"将创建 {len(self.pairs)} 个排队任务，每对最多生成 {count} 张，"
-            f"本批最多 {maximum} 张图片。\n"
-            "任务会串行执行并可能产生费用，失败后不会自动重试。\n"
-            "确定加入队列吗？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-
         requests = []
         selected_model = self.model_combo.currentData()
         strategy = self.app_settings.auto_strategy()
@@ -2045,6 +2064,19 @@ class BatchDressPage(QWidget):
                     auto_reason=auto_reason,
                 )
             )
+        maximum = len(requests) * count
+        answer = QMessageBox.question(
+            self,
+            "确认批量生成",
+            f"将创建 {len(requests)} 个排队任务，每对最多生成 {count} 张，"
+            f"本批最多 {maximum} 张图片。\n"
+            "任务会串行执行并可能产生费用，失败后不会自动重试。\n"
+            "确定加入队列吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
         try:
             task_ids = self.database.create_tasks(requests)
         except Exception as exc:

@@ -46,6 +46,48 @@ class StartupCancelled(Exception):
     pass
 
 
+def _acquire_instance_paths(
+    paths: AppPaths,
+) -> tuple[AppPaths, QLockFile] | None:
+    """取当前数据目录锁；已锁定时询问是否用独立数据目录多开。"""
+    lock = QLockFile(str(paths.root / "app.lock"))
+    if lock.tryLock(100):
+        return paths, lock
+    box = QMessageBox(
+        QMessageBox.Icon.Question,
+        "程序已在运行",
+        "本机已有一个窗口在运行。\n"
+        "是否再开一个窗口？\n\n"
+        "新窗口使用独立的本机数据目录，可同时登录不同账号；"
+        "普通创作、作品库和本机设置相互独立。",
+    )
+    new_button = box.addButton(
+        "再开一个窗口",
+        QMessageBox.ButtonRole.AcceptRole,
+    )
+    box.addButton("退出", QMessageBox.ButtonRole.RejectRole)
+    box.exec()
+    if box.clickedButton() is not new_button:
+        return None
+    for sequence in range(2, 20):
+        candidate = AppPaths(
+            paths.root.parent / f"{paths.root.name}-{sequence}"
+        )
+        try:
+            candidate.ensure()
+        except Exception:
+            continue
+        candidate_lock = QLockFile(str(candidate.root / "app.lock"))
+        if candidate_lock.tryLock(100):
+            return candidate, candidate_lock
+    QMessageBox.warning(
+        None,
+        "无法多开",
+        "没有可用的独立数据目录，请先关闭其他窗口后重试。",
+    )
+    return None
+
+
 def run() -> int:
     if os.name == "nt":
         try:
@@ -73,16 +115,12 @@ def run() -> int:
     paths = AppPaths.default()
     try:
         paths.ensure()
-        migrate_legacy_pending_results(paths.temp)
-        # 同一数据目录只允许一个实例，避免第二个实例把运行中的任务判为失败。
-        instance_lock = QLockFile(str(paths.root / "app.lock"))
-        if not instance_lock.tryLock(100):
-            QMessageBox.warning(
-                None,
-                "程序已在运行",
-                "本机的亦欣 AI 生图工作台已经启动，请勿重复打开。",
-            )
+        # 同一数据目录只允许一个实例；多开时改用独立数据目录。
+        acquired = _acquire_instance_paths(paths)
+        if acquired is None:
             return 0
+        paths, instance_lock = acquired
+        migrate_legacy_pending_results(paths.temp)
         # 先完成旧数据备份/迁移，再删除旧版密钥文件，避免备份里缺文件。
         prepare_legacy_data(paths)
         paths.api_key_file.unlink(missing_ok=True)
@@ -138,7 +176,7 @@ def run() -> int:
     def cleanup_temp() -> None:
         try:
             file_store.cleanup_temp(
-                database.active_temp_paths(),
+                database.protected_temp_paths(),
                 days=TEMP_RETENTION_DAYS,
             )
         except Exception:

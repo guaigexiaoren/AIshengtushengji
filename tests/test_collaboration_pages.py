@@ -800,6 +800,57 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(emitted, [1, 1])
         page.deleteLater()
 
+    def test_ai_generation_removes_multiple_selected_assets(self) -> None:
+        write_task_images(self.root)
+        task = make_task("claimed")
+        self.repository.list_ai_generation_tasks = (
+            lambda _actor, **_kwargs: [task]
+        )
+        self.repository.list_queued_attempts = lambda _actor_id: []
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        paths = AppPaths(self.root / "ai-multi-remove-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: "sk-test-123456")
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            AuthUser(4, "ai_amy", "AI Amy", "ai"),
+            client,
+            key_store,
+            database,
+            file_store,
+            LibraryService(database, file_store, paths),
+            TaskWorker(database, client, file_store),
+            key_store,
+            auto_load=False,
+        )
+        page.refresh()
+        asset_list = page._asset_list_for("garment")
+        self.assertEqual(asset_list.count(), 2)
+        asset_list.clearSelection()
+        asset_list.item(0).setSelected(True)
+        asset_list.item(1).setSelected(True)
+        with (
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(QMessageBox, "warning"),
+            patch.object(QMessageBox, "information"),
+        ):
+            page._remove_selected("garment")
+        self.assertEqual(page.garment_assets, [])
+        self.assertEqual(page.pairs, [])
+        page.deleteLater()
+
     def test_ai_generation_page_async_searches_first_hundred_tasks(
         self,
     ) -> None:
@@ -3200,6 +3251,80 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.assertTrue(saved.is_file())
         self.assertFalse(pending_image.exists())
+        page.deleteLater()
+
+    def test_history_confirm_saves_ordinary_result_to_folder(self) -> None:
+        from yixin.settings import LOCAL_SAVE_FIXED
+        from yixin.ui.widgets import TaskImageAsset
+
+        paths = AppPaths(self.root / "history-save-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        store = FileStore(paths)
+        database.create_tasks(
+            [
+                ImageRequest(
+                    model="gemini-3.1-flash-image",
+                    prompt="批量换装结果",
+                    n=1,
+                    aspect_ratio="3:4",
+                    resolution="2K",
+                    mode="text",
+                )
+            ]
+        )
+        claimed = database.claim_next_queued()
+        task_id = int(claimed["id"])
+        image = store.store_generated(
+            task_id,
+            png_bytes((10, 60, 90), (20, 20)),
+            0,
+        )
+        thumbnail = store.create_thumbnail(image.path)
+        result_id = database.add_task_result(
+            task_id,
+            0,
+            image,
+            thumbnail_path=thumbnail,
+            remote_url=None,
+        )
+        database.transition_task(task_id, TASK_SUCCESS)
+        page = UnifiedHistoryPage(
+            database,
+            LibraryService(database, store, paths),
+            TaskWorker(
+                database,
+                NanoBananaClient(lambda: "test-key"),
+                store,
+            ),
+            self.repository,
+            self.resolver,
+            self.actor,
+            auto_load=False,
+        )
+        task = database.get_task(task_id)
+        page.current_record = page._ordinary_record(task)
+        page.current_selected_asset = TaskImageAsset(
+            role="result",
+            position=0,
+            label="结果 1",
+            path=image.path,
+            thumbnail_path=thumbnail,
+            payload={"id": result_id, "path": image.path},
+        )
+        page._update_confirm_state()
+        self.assertTrue(page.confirm_button.isEnabled())
+        target = self.root / "saved-results"
+        target.mkdir()
+        page.app_settings.set_local_save_mode(LOCAL_SAVE_FIXED)
+        page.app_settings.set_fixed_folder(target)
+        with patch(
+            "yixin.ui.unified_history_page.show_saved_toast"
+        ) as toast:
+            page._confirm_selected_result()
+        self.assertTrue(toast.called)
+        self.assertEqual(len(list(target.iterdir())), 1)
         page.deleteLater()
 
     def test_ai_generation_inherits_settings_within_project(self) -> None:

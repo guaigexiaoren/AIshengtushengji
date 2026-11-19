@@ -1339,6 +1339,25 @@ class BatchDressTests(unittest.TestCase):
         self.assertEqual(task["auto_strategy"], "quality")
         self.assertIn("参考图编辑", task["auto_reason"])
 
+    def test_api_key_is_checked_before_generation_confirmation(self) -> None:
+        garment = self._image("无Key服装.png", (20, 50, 80))
+        person = self._image("无Key人物.png", (100, 50, 20))
+        self._add_pair(garment, person)
+        self.page.prompt_edit.setPlainText("检查 Key 后再确认")
+        self.secret_store.clear()
+        with (
+            patch(
+                "yixin.ui.batch_dress_page.QMessageBox.question"
+            ) as question,
+            patch(
+                "yixin.ui.batch_dress_page.QMessageBox.warning"
+            ) as warning,
+        ):
+            self.page._enqueue_all()
+        self.assertFalse(question.called)
+        self.assertTrue(warning.called)
+        self.assertEqual(self.database.list_tasks(), [])
+
     def test_cancelled_confirmation_and_empty_prompt_create_nothing(self) -> None:
         garment = self._image("确认服装.png", (20, 50, 80))
         person = self._image("确认人物.png", (100, 50, 20))
