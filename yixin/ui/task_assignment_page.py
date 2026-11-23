@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtCore import QItemSelectionModel, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -21,19 +21,8 @@ from PySide6.QtWidgets import (
 from ..collaboration.repository import MySQLCentralRepository
 from ..collaboration.shared_paths import SharedPathResolver
 from ..collaboration.types import (
-    TASK_APPROVED,
-    TASK_AVAILABLE,
-    TASK_AWAITING_ACCEPTANCE,
-    TASK_CANCELLED,
-    TASK_CLAIMED,
-    TASK_EXPANDED,
-    TASK_RETURNED,
-    TASK_SKIPPED,
-    TASK_WORKING,
-    TASK_STATUS_LABELS,
     AuthUser,
     ProjectRecord,
-    ProjectTask,
 )
 from ..time_utils import utc_naive_to_local
 from ..paging import PageRequest, PageResult, TaskQuery
@@ -66,21 +55,15 @@ class TaskAssignmentPage(QWidget):
             get_query_runner() if self.async_mode else None
         )
         self._project_page = PageRequest()
-        self._task_page = PageRequest()
         self._project_sort_field = "created_at"
         self._project_sort_direction = "desc"
-        self._task_sort_field = "created_at"
-        self._task_sort_direction = "desc"
         self._active_project_request = -1
-        self._active_task_request = -1
         self._keyword_timer = QTimer(self)
         self._keyword_timer.setSingleShot(True)
         self._keyword_timer.setInterval(350)
         self._keyword_timer.timeout.connect(self._keyword_timeout)
         self.projects: list[ProjectRecord] = []
-        self.tasks: list[ProjectTask] = []
         self._projects_by_id: dict[int, ProjectRecord] = {}
-        self._tasks_by_id: dict[int, ProjectTask] = {}
         self._build()
         if self.query_runner is not None:
             self.query_runner.succeeded.connect(self._query_succeeded)
@@ -308,7 +291,6 @@ class TaskAssignmentPage(QWidget):
         self.project_filter.blockSignals(False)
 
     def _request_projects(self) -> None:
-        self._active_task_request = -1
         query = self._task_query()
         page = PageRequest(
             page=self._project_page.page,
@@ -326,67 +308,16 @@ class TaskAssignmentPage(QWidget):
             )
         )
 
-    def _request_tasks(
-        self,
-        project_id: int,
-        *,
-        preserve_selection: bool = True,
-    ) -> None:
-        current_item = self.task_table.item(
-            self.task_table.currentRow(),
-            0,
-        )
-        self._pending_task_selection = (
-            int(current_item.data(Qt.ItemDataRole.UserRole))
-            if preserve_selection and current_item is not None
-            else None
-        )
-        self.tasks = []
-        self._tasks_by_id = {}
-        self.task_table.blockSignals(True)
-        self.task_table.setRowCount(0)
-        self.task_table.blockSignals(False)
-        self.source_strip.clear()
-        page = PageRequest(
-            page=1,
-            page_size=10000,
-            sort_field=self._task_sort_field,
-            sort_direction=self._task_sort_direction,
-        )
-        statuses = (
-            TASK_AVAILABLE,
-            TASK_CLAIMED,
-            TASK_WORKING,
-            TASK_AWAITING_ACCEPTANCE,
-            TASK_RETURNED,
-            TASK_APPROVED,
-            TASK_SKIPPED,
-            TASK_CANCELLED,
-            TASK_EXPANDED,
-        )
-        self._active_task_request = self.query_runner.submit(
-            lambda: self.repository.list_board_tasks_for_project_page(
-                project_id,
-                self.actor,
-                statuses,
-                TaskQuery(),
-                page,
-            )
-        )
-
     def _query_succeeded(self, request_id: int, result) -> None:
         if not self.async_mode:
             return
         if request_id == self._active_project_request:
             self._render_projects(result)
-        elif request_id == self._active_task_request:
-            self._render_tasks(result)
 
     def _query_failed(self, request_id: int, message: str) -> None:
-        if not self.async_mode or request_id not in (
-            self._active_project_request,
-            self._active_task_request,
-        ):
+        if not self.async_mode:
+            return
+        if request_id != self._active_project_request:
             return
         # 失败时只恢复按钮状态并提示，不再自动重发查询，避免弹窗套娃。
         selected_ids = self._selected_project_ids()
@@ -443,8 +374,25 @@ class TaskAssignmentPage(QWidget):
                 if column == 0:
                     item.setData(Qt.ItemDataRole.UserRole, project.id)
                 self.project_table.setItem(row, column, item)
-            if project.id in selected_ids:
-                self.project_table.selectRow(row)
+        # 等所有行插入完成后再恢复多选：表格开启排序时，
+        # 插入过程中选择的行会被后续插入重排清掉。
+        selection = self.project_table.selectionModel()
+        for row in range(self.project_table.rowCount()):
+            item = self.project_table.item(row, 0)
+            if item is None:
+                continue
+            if int(item.data(Qt.ItemDataRole.UserRole)) not in selected_ids:
+                continue
+            index = self.project_table.model().index(row, 0)
+            selection.select(
+                index,
+                QItemSelectionModel.SelectionFlag.Select
+                | QItemSelectionModel.SelectionFlag.Rows,
+            )
+            selection.setCurrentIndex(
+                index,
+                QItemSelectionModel.SelectionFlag.NoUpdate,
+            )
         self.project_table.blockSignals(False)
         self.project_pagination.set_result(
             result.total,
@@ -461,69 +409,6 @@ class TaskAssignmentPage(QWidget):
             self.garment_preview.clear()
             self.model_preview.clear()
         self._selection_changed()
-
-    def _render_tasks(
-        self,
-        result: PageResult[ProjectTask],
-    ) -> None:
-        if result.total and result.page > result.total_pages:
-            project = self._current_project()
-            if project is not None:
-                self._task_page = PageRequest(
-                    page=result.total_pages,
-                    page_size=100,
-                    sort_field=self._task_sort_field,
-                    sort_direction=self._task_sort_direction,
-                )
-                self._request_tasks(project.id)
-            return
-        self.tasks = list(result.items)
-        self._tasks_by_id = {task.id: task for task in self.tasks}
-        self._task_page = PageRequest(
-            page=result.page,
-            page_size=result.page_size,
-            sort_field=self._task_sort_field,
-            sort_direction=self._task_sort_direction,
-        )
-        self.task_table.blockSignals(True)
-        self.task_table.setRowCount(0)
-        for task in self.tasks:
-            row = self.task_table.rowCount()
-            self.task_table.insertRow(row)
-            values = (
-                task.task_code,
-                str(len(task.garment_assets)),
-                TASK_STATUS_LABELS.get(task.status, task.status),
-                task.assignee_name or "未分配",
-                utc_naive_to_local(task.created_at).strftime(
-                    "%Y-%m-%d %H:%M"
-                ),
-            )
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, task.id)
-                self.task_table.setItem(row, column, item)
-        self.task_table.blockSignals(False)
-        if self.tasks:
-            target_row = next(
-                (
-                    row
-                    for row, task in enumerate(self.tasks)
-                    if task.id == getattr(
-                        self,
-                        "_pending_task_selection",
-                        None,
-                    )
-                ),
-                0,
-            )
-            self.task_table.blockSignals(True)
-            self.task_table.selectRow(target_row)
-            self.task_table.blockSignals(False)
-            self._task_selected()
-        else:
-            self.source_strip.clear()
 
     def _filter_changed(self, *_args) -> None:
         self._project_page = PageRequest(
@@ -614,42 +499,6 @@ class TaskAssignmentPage(QWidget):
             sort_direction=self._project_sort_direction,
         )
         self._request_projects()
-
-    def _task_sort_requested(self, column: int) -> None:
-        fields = {
-            0: "task_code",
-            1: "garment_count",
-            2: "status",
-            3: "assignee_name",
-            4: "created_at",
-        }
-        field = fields.get(column)
-        if field is None:
-            return
-        if field == self._task_sort_field:
-            self._task_sort_direction = (
-                "asc"
-                if self._task_sort_direction == "desc"
-                else "desc"
-            )
-        else:
-            self._task_sort_field = field
-            self._task_sort_direction = "asc"
-        self.task_table.horizontalHeader().setSortIndicator(
-            column,
-            Qt.SortOrder.AscendingOrder
-            if self._task_sort_direction == "asc"
-            else Qt.SortOrder.DescendingOrder,
-        )
-        project = self._current_project()
-        if project is not None:
-            self._task_page = PageRequest(
-                page=1,
-                page_size=100,
-                sort_field=self._task_sort_field,
-                sort_direction=self._task_sort_direction,
-            )
-            self._request_tasks(project.id)
 
     def _selected_project_ids(self) -> list[int]:
         selection = self.project_table.selectionModel()

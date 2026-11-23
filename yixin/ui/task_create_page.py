@@ -301,7 +301,7 @@ class TaskCreatePage(QWidget):
         self.scan_summary = QLabel()
         scan_actions.addWidget(self.scan_summary)
         scan_layout.addLayout(scan_actions)
-        self.product_table = QTableWidget(0, 8)
+        self.product_table = QTableWidget(0, 7)
         self.product_table.setHorizontalHeader(
             CheckableHeaderView(
                 Qt.Orientation.Horizontal,
@@ -317,7 +317,6 @@ class TaskCreatePage(QWidget):
                 "货号",
                 "衣服图",
                 "模特图",
-                "子任务",
                 "预计任务编码",
                 "重复情况",
             ]
@@ -606,7 +605,8 @@ class TaskCreatePage(QWidget):
         if self.account_directory is None:
             return
         project = self.project_combo.currentData()
-        check_product_code = bool(project) and project[0] == "internal"
+        project_scope = project[0] if project else "internal"
+        check_product_code = project_scope == "internal"
         if self.async_mode:
             account_directory = self.account_directory
             self.scan_summary.setText("正在扫描共享盘货号目录…")
@@ -621,6 +621,7 @@ class TaskCreatePage(QWidget):
                     self.actor.id,
                     account_directory.source_date,
                     [product.product_code for product in products],
+                    project_scope=project_scope,
                 )
                 return products, existing
 
@@ -638,6 +639,7 @@ class TaskCreatePage(QWidget):
             self.actor.id,
             self.account_directory.source_date,
             [product.product_code for product in products],
+            project_scope=project_scope,
         )
         self.states = {}
         for product in products:
@@ -766,13 +768,8 @@ class TaskCreatePage(QWidget):
                 state.product_code,
                 str(len(state.garments)),
                 str(len(state.models)),
-                str(len(state.models)),
                 f"{self.actor.display_name}-{state.product_code}-自动流水",
-                (
-                    f"已有 {len(state.existing_tasks)} 个任务"
-                    if state.existing_tasks
-                    else "无重复"
-                ),
+                self._duplicate_text(state),
             )
             for column, value in enumerate(values, start=2):
                 self.product_table.setItem(
@@ -792,6 +789,14 @@ class TaskCreatePage(QWidget):
         self.scan_summary.setText(summary)
         self.product_table.blockSignals(False)
         self._update_select_header()
+
+    @staticmethod
+    def _duplicate_text(state: ProductDraftState) -> str:
+        if state.existing_tasks:
+            return f"已有 {len(state.existing_tasks)} 个任务"
+        if any("多个目录" in error for error in state.errors):
+            return "多个目录同货号"
+        return "无重复"
 
     def _product_check_changed(self, item: QTableWidgetItem) -> None:
         if item.column() == 1:
@@ -1236,7 +1241,7 @@ class TaskCreatePage(QWidget):
                     self.repository.set_project_urgent(
                         existing.id,
                         self.actor,
-                        is_urgent,
+                        state.is_urgent,
                     )
                 else:
                     self.repository.create_project(

@@ -15,8 +15,29 @@ from yixin.collaboration.types import (
 
 
 class CollaborationSchemaTests(unittest.TestCase):
-    def test_schema_version_is_fourteen(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 14)
+    def test_schema_version_is_fifteen(self) -> None:
+        self.assertEqual(SCHEMA_VERSION, 15)
+
+    def test_schema_v15_adds_task_pair_key(self) -> None:
+        with patch(
+            "yixin.collaboration.repository._add_column_if_missing"
+        ) as add_column:
+            MySQLCentralRepository._apply_schema_v15(object())
+        self.assertEqual(
+            add_column.call_args.args[1:4],
+            ("project_tasks", "pair_key", "VARCHAR(64) NOT NULL DEFAULT ''"),
+        )
+
+    def test_generation_pair_key_is_order_independent(self) -> None:
+        from yixin.collaboration.repository import _generation_pair_key
+
+        first = _generation_pair_key(("a", "b"), "person")
+        second = _generation_pair_key(("b", "a"), "person")
+        self.assertEqual(first, second)
+        self.assertNotEqual(
+            first,
+            _generation_pair_key(("a", "b"), "other"),
+        )
 
     def test_schema_v14_adds_project_task_type(self) -> None:
         with patch(
@@ -166,6 +187,7 @@ class CollaborationSchemaTests(unittest.TestCase):
             "assignee_id",
             "claimed_at",
             "task_type",
+            "pair_key",
         ):
             self.assertIn(column, schema)
         self.assertIn("utf8mb4", schema)
@@ -193,6 +215,10 @@ class CollaborationSchemaTests(unittest.TestCase):
         self.assertEqual(TASK_STATUS_LABELS["expanded"], "已拆分")
         self.assertIn(
             "submission_history",
+            ROLE_DEFAULT_MENUS["operations"],
+        )
+        self.assertNotIn(
+            "reports",
             ROLE_DEFAULT_MENUS["operations"],
         )
         self.assertNotIn(

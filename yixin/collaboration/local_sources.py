@@ -81,6 +81,10 @@ class ProjectGarmentStore:
                 source_revision
             ):
                 return None
+            if "models" not in data:
+                # 旧版清单只保存服装，无法判断模特素材状态，
+                # 交给调用方回退到共享盘素材。
+                return None
             garments = tuple(
                 self._deserialize_image(item)
                 for item in data.get("garments", [])
@@ -134,7 +138,11 @@ class ProjectGarmentStore:
         garments: Iterable[StoredImage],
         source_revision: int,
     ) -> None:
-        self.save_all(garments, (), source_revision)
+        # 只更新服装时保留同一版本的模特缓存，
+        # 避免任务/重试流程把主任务已保存的模特清空。
+        cached = self.load_all(source_revision)
+        models = cached[1] if cached is not None else ()
+        self.save_all(garments, models, source_revision)
 
     def _serialize_image(self, image: StoredImage) -> dict:
         data = image.path.read_bytes()
@@ -318,6 +326,7 @@ class LocalTaskSourceStore:
                 mime=image.mime,
                 width=image.width,
                 height=image.height,
+                relative_path=image.relative_path,
             )
             for image in garments
         )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import queue
 import re
@@ -46,7 +47,9 @@ from .types import (
     PROJECT_CANCELLED,
     PROJECT_COMPLETED,
     PROJECT_IN_PROGRESS,
+    PROJECT_SKIPPED,
     PROJECT_SUBMITTED,
+    PROJECT_TASK_TYPE_BUYER_SHOW,
     PROJECT_TASK_TYPE_NORMAL,
     PROJECT_TASK_TYPES,
     ROLE_ADMIN,
@@ -82,7 +85,7 @@ from .types import (
     ROLE_ALLOWED_MENUS,
 )
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 LEGACY_SHARED_ROOT = (
     r"\\fe80--211-32ff-fe87-ba49.ipv6-literal.net\AI作图"
 )
@@ -272,6 +275,7 @@ class MySQLCentralRepository:
                     self._apply_schema_v12(cursor)
                     self._apply_schema_v13(cursor)
                     self._apply_schema_v14(cursor)
+                    self._apply_schema_v15(cursor)
                     self._apply_shared_root_update(cursor)
                     cursor.execute(
                         "INSERT IGNORE INTO schema_migrations(version, applied_at) "
@@ -287,7 +291,7 @@ class MySQLCentralRepository:
     @staticmethod
     def _apply_schema_v2(cursor) -> None:
         user_columns = {
-            "urgent_quota_per_day": "INT NOT NULL DEFAULT 3",
+            "urgent_quota_per_day": "INT NOT NULL DEFAULT 2",
             "max_generation_concurrency": "INT NOT NULL DEFAULT 2",
         }
         for column, definition in user_columns.items():
@@ -707,6 +711,15 @@ class MySQLCentralRepository:
         )
 
     @staticmethod
+    def _apply_schema_v15(cursor) -> None:
+        _add_column_if_missing(
+            cursor,
+            "project_tasks",
+            "pair_key",
+            "VARCHAR(64) NOT NULL DEFAULT ''",
+        )
+
+    @staticmethod
     def _apply_shared_root_update(cursor) -> None:
         cursor.execute(
             """
@@ -953,7 +966,7 @@ class MySQLCentralRepository:
         role: str,
         temporary_password: str,
         *,
-        urgent_quota_per_day: int = 3,
+        urgent_quota_per_day: int = 2,
         max_generation_concurrency: int = 2,
         menu_permissions: Sequence[str] | None = None,
         project_access: Sequence[tuple[str, str]] | None = None,
@@ -1352,6 +1365,31 @@ class MySQLCentralRepository:
                         "账号仍有排队中或生成中的任务，"
                         "请先等待完成或取消："
                         + task_codes
+                    )
+                cursor.execute(
+                    """
+                    SELECT project_code
+                    FROM projects
+                    WHERE assignee_id = %s
+                      AND status NOT IN (%s, %s, %s)
+                    ORDER BY id
+                    LIMIT 10
+                    """,
+                    (
+                        user_id,
+                        PROJECT_COMPLETED,
+                        PROJECT_CANCELLED,
+                        PROJECT_SKIPPED,
+                    ),
+                )
+                claimed_projects = cursor.fetchall()
+                if claimed_projects:
+                    project_codes = "、".join(
+                        row["project_code"] for row in claimed_projects
+                    )
+                    raise StateConflictError(
+                        "账号仍有已领取的主任务，请先完成、取消或改派："
+                        + project_codes
                     )
                 cursor.execute(
                     """
@@ -2581,6 +2619,8 @@ class MySQLCentralRepository:
             conditions.append("p.listing_confirmed_at IS NOT NULL")
         elif query.listing_status == "unlisted":
             conditions.append("p.listing_confirmed_at IS NULL")
+            conditions.append("p.task_type <> %s")
+            params.append(PROJECT_TASK_TYPE_BUYER_SHOW)
         if query.task_type:
             conditions.append("p.task_type = %s")
             params.append(query.task_type)
@@ -2834,16 +2874,23 @@ class MySQLCentralRepository:
         owner_id: int,
         source_date: date,
         product_codes: Sequence[str],
+        *,
+        project_scope: str = "internal",
     ) -> dict[str, list[ProjectRecord]]:
         """一次查出该账号该日期的全部任务，再在内存里按货号归类。
 
-        两边都先按当前规则规范化（只保留到第二个分隔字母），
-        兼容升级前保存的完整货号旧记录。
+        内部项目两边都按当前规则规范化（只保留到第二个分隔字母），
+        兼容升级前保存的完整货号旧记录；外部项目不做货号校验，
+        按目录名精确比较，避免把自由命名的目录误判为同一货号。
         """
+        normalize_code = project_scope == "internal"
 
         def normalize(value: str) -> str:
-            parsed = parse_product_code(value)
-            return parsed.base_code if parsed is not None else value.strip()
+            text = value.strip()
+            if not normalize_code:
+                return text
+            parsed = parse_product_code(text)
+            return parsed.base_code if parsed is not None else text
 
         codes = tuple(
             dict.fromkeys(str(code) for code in product_codes if code)
@@ -2882,6 +2929,8 @@ class MySQLCentralRepository:
                 ]
         normalized_codes = {code: normalize(code) for code in codes}
         for record in records:
+            if str(record.project_scope or "internal") != project_scope:
+                continue
             stored = normalize(str(record.product_code or ""))
             for code in codes:
                 if stored == normalized_codes[code]:
@@ -4211,34 +4260,45 @@ class MySQLCentralRepository:
                 hash_to_model: dict[str, int] = {}
                 fallback_garment_id = 0
                 fallback_model_id = 0
+                first_asset_id = 0
                 for row in cursor.fetchall():
+                    asset_id = int(row["id"])
+                    first_asset_id = first_asset_id or asset_id
                     if row["role"] == "garment":
-                        hash_to_garment[str(row["content_hash"])] = int(
-                            row["id"]
+                        hash_to_garment[str(row["content_hash"])] = (
+                            asset_id
                         )
                         fallback_garment_id = (
-                            fallback_garment_id or int(row["id"])
+                            fallback_garment_id or asset_id
                         )
                     elif row["role"] == "model":
-                        hash_to_model[str(row["content_hash"])] = int(
-                            row["id"]
+                        hash_to_model[str(row["content_hash"])] = (
+                            asset_id
                         )
                         fallback_model_id = (
-                            fallback_model_id or int(row["id"])
+                            fallback_model_id or asset_id
                         )
-                if not fallback_garment_id or not fallback_model_id:
+                if not first_asset_id:
                     # 本机素材需要一条已登记的记录作为占位；
-                    # 两者都不存在说明项目素材已被清空，无法提交。
+                    # 一条都没有说明项目素材已被清空，无法提交。
                     raise StateConflictError(
-                        "主任务缺少服装图或模特图记录，请重新提交主任务"
+                        "主任务没有可用素材，请重新提交主任务"
                     )
+                # 允许主任务没有模特（或衣服）时由 AI 在本机补充；
+                # 数据库列不能为空，回退到任意一条已登记素材占位。
+                fallback_garment_id = (
+                    fallback_garment_id or first_asset_id
+                )
+                fallback_model_id = fallback_model_id or first_asset_id
                 cursor.execute(
                     """
-                    SELECT t.id, t.model_asset_id, tg.garment_asset_id
+                    SELECT t.id, t.pair_key, t.model_asset_id,
+                           tg.garment_asset_id
                     FROM project_tasks t
                     JOIN task_garments tg ON tg.task_id = t.id
                     WHERE t.project_id = %s
                       AND t.status NOT IN (%s, %s, %s)
+                    ORDER BY t.id, tg.position
                     """,
                     (
                         project_id,
@@ -4247,32 +4307,41 @@ class MySQLCentralRepository:
                         TASK_CANCELLED,
                     ),
                 )
+                existing_keys: set[str] = set()
                 existing_assets: set[
                     tuple[int, tuple[int, ...]]
                 ] = set()
                 current_task: int | None = None
                 current_model = 0
+                current_key = ""
                 current_garments: list[int] = []
                 for row in cursor.fetchall():
                     task_id = int(row["id"])
                     if task_id != current_task:
                         if current_task is not None:
-                            existing_assets.add(
-                                (
-                                    current_model,
-                                    tuple(sorted(current_garments)),
+                            if current_key:
+                                existing_keys.add(current_key)
+                            else:
+                                existing_assets.add(
+                                    (
+                                        current_model,
+                                        tuple(sorted(current_garments)),
+                                    )
                                 )
-                            )
                         current_task = task_id
                         current_model = int(row["model_asset_id"] or 0)
+                        current_key = str(row["pair_key"] or "")
                         current_garments = []
                     current_garments.append(
                         int(row["garment_asset_id"])
                     )
                 if current_task is not None:
-                    existing_assets.add(
-                        (current_model, tuple(sorted(current_garments)))
-                    )
+                    if current_key:
+                        existing_keys.add(current_key)
+                    else:
+                        existing_assets.add(
+                            (current_model, tuple(sorted(current_garments)))
+                        )
                 cursor.execute(
                     """
                     SELECT task_no FROM project_tasks
@@ -4292,9 +4361,7 @@ class MySQLCentralRepository:
                 source_revision = int(
                     project["source_revision"] or 1
                 )
-                submitted_keys: set[
-                    tuple[tuple[str, ...], str]
-                ] = set()
+                submitted_keys: set[str] = set()
                 for pair_index, pair in enumerate(clean_pairs):
                     prompt = pair.prompt_text.strip()
                     if not prompt and not pair.skipped:
@@ -4332,15 +4399,20 @@ class MySQLCentralRepository:
                             for content_hash in pair.garment_hashes
                         )
                     )
+                    pair_key = _generation_pair_key(
+                        pair.garment_hashes,
+                        pair.person_hash,
+                    )
+                    # 配对指纹覆盖本机裁剪/新增素材，命中即表示
+                    # 同一配对已在队列或制作中，避免重复建任务。
+                    if pair_key in existing_keys:
+                        continue
+                    # 兼容升级前没有指纹的旧任务：仍按数据库素材去重。
                     if all_registered and (
                         model_asset_id,
                         tuple(sorted(selected_assets)),
                     ) in existing_assets:
                         continue
-                    pair_key = (
-                        tuple(pair.garment_hashes),
-                        pair.person_hash,
-                    )
                     if pair_key in submitted_keys:
                         continue
                     submitted_keys.add(pair_key)
@@ -4359,12 +4431,12 @@ class MySQLCentralRepository:
                             garment_asset_id, model_asset_id, status,
                             assignee_id, prompt_text, model,
                             aspect_ratio, resolution, n, final_quantity,
-                            source_revision, parent_task_id,
+                            source_revision, pair_key, parent_task_id,
                             created_at, updated_at, claimed_at,
                             approved_at
                         ) VALUES (
                             %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, 0, %s, NULL, %s, %s, %s, %s
+                            %s, %s, %s, 0, %s, %s, NULL, %s, %s, %s, %s
                         )
                         """,
                         (
@@ -4381,6 +4453,7 @@ class MySQLCentralRepository:
                             pair.resolution,
                             pair.n,
                             source_revision,
+                            pair_key,
                             now,
                             now,
                             now,
@@ -4614,7 +4687,11 @@ class MySQLCentralRepository:
         url = (listing_url or "").strip()
         if not url:
             raise ValueError("请填写上架链接")
+        if len(url) > 1024:
+            raise ValueError("上架链接过长，不能超过 1024 个字符")
         listing_id = extract_listing_id(url)
+        if len(listing_id) > 200:
+            raise ValueError("上架链接中的链接 ID 过长，不能超过 200 个字符")
         now = utc_now()
         with self.connection() as connection:
             with connection.cursor() as cursor:
@@ -4626,6 +4703,8 @@ class MySQLCentralRepository:
                     raise PermissionDeniedError("只能确认自己提交的任务上架")
                 if project["status"] != PROJECT_COMPLETED:
                     raise StateConflictError("主任务完成后才能确认上架")
+                if project["task_type"] == PROJECT_TASK_TYPE_BUYER_SHOW:
+                    raise StateConflictError("买家秀任务不需要确认上架")
                 cursor.execute(
                     """
                     UPDATE projects
@@ -7849,6 +7928,10 @@ class MySQLCentralRepository:
         current_status = (
             current["status"] if current is not None else PROJECT_SUBMITTED
         )
+        if current_status == PROJECT_SKIPPED:
+            # 主任务已明确标记“无需制作”，之后仍在运行的轮次结束时
+            # 不能把它改回制作中，也不能清空完成时间。
+            return
         if not total:
             # 还没有拆出任何子任务时，不覆盖项目级状态。
             status = current_status
@@ -7940,6 +8023,26 @@ class MySQLCentralRepository:
                 utc_now(),
             ),
         )
+
+
+def _generation_pair_key(
+    garment_hashes: Sequence[str],
+    person_hash: str,
+) -> str:
+    """计算配对指纹，用于判断同一个配对是否已提交。
+
+    使用本机图片 hash，而不是数据库素材 id，这样裁剪/新增的
+    本机素材也能正确去重。
+    """
+    payload = json.dumps(
+        {
+            "garments": sorted(str(value) for value in garment_hashes),
+            "person": str(person_hash or ""),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _load_schema() -> str:
@@ -8036,7 +8139,7 @@ def _auth_user(row: dict[str, Any]) -> AuthUser:
         must_change_password=bool(row["must_change_password"]),
         is_active=bool(row["is_active"]),
         urgent_quota_per_day=int(
-            row.get("urgent_quota_per_day", 3)
+            row.get("urgent_quota_per_day", 2)
         ),
         max_generation_concurrency=int(
             row.get("max_generation_concurrency", 2)

@@ -5,6 +5,7 @@ data/
 data_backup_*.zip
 build/
 dist/
+dist_release*/
 *.log
 ui_preview*.png
 library_preview.png

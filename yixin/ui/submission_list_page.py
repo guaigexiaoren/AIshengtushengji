@@ -36,6 +36,7 @@ from ..collaboration.types import (
     PROJECT_SKIPPED,
     PROJECT_STATUS_LABELS,
     PROJECT_SUBMITTED,
+    PROJECT_TASK_TYPE_BUYER_SHOW,
     PROJECT_TASK_TYPE_LABELS,
     PROJECT_TASK_TYPES,
     ROLE_ADMIN,
@@ -296,7 +297,8 @@ class SubmissionListPage(QWidget):
         grid.setColumnStretch(1, 1)
         layout.addWidget(group)
         self.listing_button = QPushButton("确认上架")
-        self.listing_button.setMinimumHeight(38)
+        self.listing_button.setObjectName("PrimaryButton")
+        self.listing_button.setMinimumHeight(46)
         self.listing_button.setEnabled(False)
         self.listing_button.clicked.connect(self._confirm_listing)
         layout.addWidget(self.listing_button)
@@ -480,7 +482,7 @@ class SubmissionListPage(QWidget):
                     else "未拆分"
                 ),
                 str(project.result_count),
-                "已上架" if project.listing_confirmed_at else "未上架",
+                self._listing_status_text(project),
                 project.listing_id,
                 utc_naive_to_local(project.created_at).strftime(
                     "%Y-%m-%d %H:%M"
@@ -608,6 +610,7 @@ class SubmissionListPage(QWidget):
             self.search_edit,
             self.status_combo,
             self.listing_combo,
+            self.type_combo,
             self.range_combo,
             self.start_date_edit,
             self.end_date_edit,
@@ -616,6 +619,7 @@ class SubmissionListPage(QWidget):
         self.search_edit.clear()
         self.status_combo.setCurrentIndex(0)
         self.listing_combo.setCurrentIndex(0)
+        self.type_combo.setCurrentIndex(0)
         self.range_combo.setCurrentIndex(0)
         self.start_date_edit.clear()
         self.end_date_edit.clear()
@@ -625,6 +629,7 @@ class SubmissionListPage(QWidget):
             self.search_edit,
             self.status_combo,
             self.listing_combo,
+            self.type_combo,
             self.range_combo,
             self.start_date_edit,
             self.end_date_edit,
@@ -648,6 +653,18 @@ class SubmissionListPage(QWidget):
             return
         self._render_project_info(project)
         self._request_ai_results(project)
+
+    @staticmethod
+    def _is_buyer_show(project: ProjectRecord) -> bool:
+        return project.task_type == PROJECT_TASK_TYPE_BUYER_SHOW
+
+    @classmethod
+    def _listing_status_text(cls, project: ProjectRecord) -> str:
+        if project.listing_confirmed_at:
+            return "已上架"
+        if cls._is_buyer_show(project):
+            return "无需上架"
+        return "未上架"
 
     def _set_info(self, key: str, value: str) -> None:
         label = self._info_labels.get(key)
@@ -684,6 +701,16 @@ class SubmissionListPage(QWidget):
         )
         self._set_info("path", project.project_relative_root)
         self._set_info("note", project.note or "无备注")
+        if self._is_buyer_show(project):
+            self._set_info("listing_status", "无需上架")
+            self._set_info("listing_url", "")
+            self._set_info("listing_id", "")
+            self._set_info("listing_time", "")
+            self.listing_button.setVisible(False)
+            self.listing_button.setEnabled(False)
+            self.listing_button.setToolTip("")
+            return
+        self.listing_button.setVisible(True)
         if project.listing_confirmed_at:
             self._set_info("listing_status", "已上架")
             self._set_info("listing_url", project.listing_url)
@@ -710,6 +737,7 @@ class SubmissionListPage(QWidget):
         self.listing_button.setText(
             "修改上架信息" if project.listing_confirmed_at else "确认上架"
         )
+        self._apply_listing_button_style(bool(project.listing_confirmed_at))
         if project.status != PROJECT_COMPLETED:
             self.listing_button.setToolTip("主任务完成后才能确认上架")
         elif not can_confirm:
@@ -717,10 +745,19 @@ class SubmissionListPage(QWidget):
         else:
             self.listing_button.setToolTip("")
 
+    def _apply_listing_button_style(self, listed: bool) -> None:
+        name = "SecondaryButton" if listed else "PrimaryButton"
+        if self.listing_button.objectName() == name:
+            return
+        self.listing_button.setObjectName(name)
+        self.listing_button.style().unpolish(self.listing_button)
+        self.listing_button.style().polish(self.listing_button)
+
     def _clear_details(self) -> None:
         for label in self._info_labels.values():
             label.setText("-")
         self.listing_button.setEnabled(False)
+        self.listing_button.setVisible(False)
         self.listing_button.setText("确认上架")
         self.ai_preview.clear()
         self.ai_path_label.setText("")

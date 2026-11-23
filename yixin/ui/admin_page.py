@@ -191,7 +191,7 @@ class AddUserDialog(QDialog):
         self.password.setPlaceholderText("至少 6 个字符，首次登录后强制修改")
         self.urgent_quota = QSpinBox()
         self.urgent_quota.setRange(0, 99)
-        self.urgent_quota.setValue(3)
+        self.urgent_quota.setValue(2)
         self.max_concurrency = QSpinBox()
         self.max_concurrency.setRange(1, 10)
         self.max_concurrency.setValue(2)

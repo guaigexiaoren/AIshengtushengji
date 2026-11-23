@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 # 常见电商链接里代表商品/链接本身的查询参数名。
@@ -24,7 +24,11 @@ def extract_listing_id(value: str) -> str:
     text = (value or "").strip()
     if not text:
         return ""
-    parsed = urlsplit(text)
+    try:
+        parsed = urlsplit(text)
+    except ValueError:
+        # 全角符号、非法 IPv6 等畸形链接无法解析，按“识别不到”处理。
+        return ""
     if parsed.query:
         query = parse_qs(parsed.query)
         for wanted in ID_QUERY_KEYS:
@@ -40,7 +44,9 @@ def extract_listing_id(value: str) -> str:
         if matched is not None:
             return matched.group(1)
     if segments:
-        last = segments[-1].split("?")[0].split("#")[0].strip()
+        last = unquote(
+            segments[-1].split("?")[0].split("#")[0].strip()
+        )
         if "." in last:
             last = last.rsplit(".", 1)[0]
         return last

@@ -2,6 +2,8 @@
 
 Windows 10/11 x64 桌面生图工具，使用 Nano Banana 三个型号生成和编辑图片。
 
+运营人员使用手册见 `docs/使用手册-运营版.pdf`（可打印 A4 版），源文件和截图脚本在 `docs/manual/`。
+
 ## 当前功能
 
 - Nano Banana 2.1、Nano Banana 2、Nano Banana Pro 切换

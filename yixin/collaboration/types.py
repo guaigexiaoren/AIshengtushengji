@@ -28,7 +28,7 @@ MENU_KEYS = {
     "admin": "管理控制台",
 }
 ROLE_DEFAULT_MENUS = {
-    ROLE_OPERATIONS: ("new_task", "submission_history", "reports"),
+    ROLE_OPERATIONS: ("new_task", "submission_history"),
     ROLE_AI: (
         "new_task",
         "assign_tasks",
@@ -41,7 +41,7 @@ ROLE_DEFAULT_MENUS = {
     ROLE_ADMIN: tuple(MENU_KEYS),
 }
 ROLE_ALLOWED_MENUS = {
-    ROLE_OPERATIONS: ("new_task", "submission_history", "reports"),
+    ROLE_OPERATIONS: ("new_task", "submission_history"),
     ROLE_AI: ROLE_DEFAULT_MENUS[ROLE_AI],
     ROLE_ADMIN: ROLE_DEFAULT_MENUS[ROLE_ADMIN],
 }
@@ -130,7 +130,7 @@ class AuthUser:
     role: str
     must_change_password: bool = False
     is_active: bool = True
-    urgent_quota_per_day: int = 3
+    urgent_quota_per_day: int = 2
     max_generation_concurrency: int = 2
     menu_permissions: tuple[str, ...] | None = None
     project_access: tuple[tuple[str, str], ...] = ()

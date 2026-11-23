@@ -34,15 +34,10 @@ from ..collaboration.shared_paths import SharedPathResolver
 from ..collaboration.types import (
     ATTEMPT_SUCCEEDED,
     PROJECT_STATUS_LABELS,
-    ROLE_ADMIN,
     TASK_AWAITING_ACCEPTANCE,
     TASK_APPROVED,
-    TASK_AVAILABLE,
-    TASK_CLAIMED,
-    TASK_RETURNED,
     TASK_SKIPPED,
     TASK_STATUS_LABELS,
-    TASK_WORKING,
     AuthUser,
     GenerationAttempt,
     GenerationPairSpec,
@@ -73,7 +68,6 @@ from ..worker import TaskWorker
 from .batch_dress_page import (
     BatchDressPage,
     DressTaskGroup,
-    auto_match_groups,
 )
 from .async_queries import get_query_runner
 
@@ -301,17 +295,17 @@ class AIGenerationPage(BatchDressPage):
 
     def _default_prompt(self) -> str:
         for name, prompt in BUILTIN_PROMPT_TEMPLATES:
-            if "多图换装" in name:
+            if "基础服装替换" in name:
                 return prompt
-        return BUILTIN_PROMPT_TEMPLATES[1 if len(BUILTIN_PROMPT_TEMPLATES) > 1 else 0][1]
+        return BUILTIN_PROMPT_TEMPLATES[0][1]
 
     def _select_default_template(self) -> str | None:
-        """把模板下拉切到“多图换装”，返回该模板提示词（没有则 None）。"""
+        """把模板下拉切到“基础服装替换”，返回该模板提示词（没有则 None）。"""
         if not hasattr(self, "template_combo"):
             return None
         for index in range(self.template_combo.count()):
             data = self.template_combo.itemData(index)
-            if data and "多图换装" in str(data.get("name") or ""):
+            if data and "基础服装替换" in str(data.get("name") or ""):
                 self.template_combo.blockSignals(True)
                 self.template_combo.setCurrentIndex(index)
                 self.template_combo.blockSignals(False)
@@ -536,6 +530,10 @@ class AIGenerationPage(BatchDressPage):
         self._generation_projects_by_id = {
             project.id: project for project in projects
         }
+        self.project_progress = {
+            project.id: (project.approved_count, project.task_count)
+            for project in projects
+        }
         self.task_selector.blockSignals(True)
         self.task_selector.clear()
         self.task_selector.addItem("请选择主任务", None)
@@ -592,8 +590,12 @@ class AIGenerationPage(BatchDressPage):
         self.note_label.setText(f"备注：{text}" if text else "备注：无")
         self._apply_note_style(bool(text))
 
-    def _clear_generation_editor(self) -> None:
+    def _clear_generation_editor(self, *, persist: bool = True) -> None:
         self._snapshot_current()
+        if persist:
+            # 切换或清空选择前保存当前主任务/子任务的本机素材，
+            # 避免新增、裁剪的图片随界面清空而丢失。
+            self._persist_current_sources()
         self.current_task = None
         self.current_project = None
         self.local_store = None
@@ -649,7 +651,7 @@ class AIGenerationPage(BatchDressPage):
                 assets = self.repository.list_project_assets(project.id)
             except Exception as exc:
                 QMessageBox.warning(self, "读取主任务素材失败", str(exc))
-                self._clear_generation_editor()
+                self._clear_generation_editor(persist=False)
                 return
             garments = tuple(
                 self._asset_image(project, asset)
@@ -757,18 +759,12 @@ class AIGenerationPage(BatchDressPage):
             state = self.local_store.state
         except Exception as exc:
             QMessageBox.warning(self, "读取任务素材失败", str(exc))
-            self._clear_generation_editor()
+            self._clear_generation_editor(persist=False)
             return
         self.restore_all_button.setEnabled(True)
-        shared_garments = self._project_garments(
-            task.project_id,
-            task.source_revision,
-        )
-        self.garment_assets = (
-            list(shared_garments)
-            if shared_garments is not None
-            else list(state.garments)
-        )
+        # 子任务重试只使用该子任务自己的素材，不能混入主任务全部素材，
+        # 否则一次重试会生成多组配对，也会覆盖主任务级缓存。
+        self.garment_assets = list(state.garments)
         self.person_assets = [state.model] if state.model else []
         self.selected_garment = None
         self.pairs = []
@@ -853,18 +849,6 @@ class AIGenerationPage(BatchDressPage):
             self._project_garment_stores[project_id] = store
         return store
 
-    def _project_garments(
-        self,
-        project_id: int,
-        source_revision: int,
-    ) -> tuple[StoredImage, ...] | None:
-        try:
-            return self._project_garment_store(project_id).load(
-                source_revision
-            )
-        except Exception:
-            return None
-
     def _persist_current_sources(self) -> None:
         project = self.current_project
         if project is not None:
@@ -890,12 +874,6 @@ class AIGenerationPage(BatchDressPage):
             self.local_store.replace_all(
                 tuple(self.garment_assets),
                 self.person_assets[0] if len(self.person_assets) == 1 else None,
-            )
-            self._project_garment_store(
-                self.current_task.project_id
-            ).save(
-                tuple(self.garment_assets),
-                self.current_task.source_revision,
             )
         except Exception as exc:
             QMessageBox.warning(
@@ -963,17 +941,6 @@ class AIGenerationPage(BatchDressPage):
             self._loading_source_state = False
         self._refresh_pairs()
         self._auto_match()
-        task = self.current_task
-        if task is not None:
-            try:
-                self._project_garment_store(task.project_id).save(
-                    tuple(self.garment_assets),
-                    task.source_revision,
-                )
-            except Exception as exc:
-                QMessageBox.warning(
-                    self, "保存本机素材失败", str(exc)
-                )
         self.feedback_label.setText("已恢复全部初始共享盘素材。")
 
     def _enqueue_all(self) -> None:
@@ -1195,193 +1162,10 @@ class AIGenerationPage(BatchDressPage):
             return False
         return True
 
-    def _project_source_tasks(self, project_id: int) -> list[ProjectTask]:
-        allowed = {TASK_CLAIMED, TASK_WORKING, TASK_RETURNED}
-        if self.actor.role == ROLE_ADMIN:
-            allowed.add(TASK_AVAILABLE)
-        tasks: list[ProjectTask] = []
-        seen: set[int] = set()
-        for item in self.generation_tasks:
-            if item.id in seen:
-                continue
-            seen.add(item.id)
-            if (
-                item.project_id == project_id
-                and item.parent_task_id is None
-                and item.status in allowed
-            ):
-                tasks.append(item)
-        return tasks
-
-    def _load_task_groups(
-        self,
-        task: ProjectTask,
-        garments: Sequence[StoredImage] | None = None,
-    ) -> list[DressTaskGroup]:
-        try:
-            store = LocalTaskSourceStore(
-                self.file_store.paths.root / "local_sources",
-                self.actor.id,
-                task,
-                self.resolver,
-            )
-            state = store.state
-        except Exception:
-            return []
-        selected_garments = (
-            tuple(garments) if garments is not None else state.garments
-        )
-        if not selected_garments or state.model is None:
-            return []
-        return auto_match_groups(selected_garments, state.model)
-
-    def _enqueue_project_all(self) -> None:
-        task = self.current_task
-        if (
-            task is None
-            or task.parent_task_id is not None
-            or self.force_direct_retry_task_id == task.id
-        ):
-            QMessageBox.information(
-                self,
-                "未选择子任务",
-                "请先在顶部选择主任务下的子任务。",
-            )
-            return
-        prompt = self.prompt_edit.toPlainText().strip()
-        if not prompt:
-            QMessageBox.information(
-                self,
-                "缺少提示词",
-                "请先填写换装提示词。",
-            )
-            return
-        if not self._check_api_key_ready():
-            return
-        targets = self._project_source_tasks(task.project_id)
-        if len(targets) < 2:
-            QMessageBox.information(
-                self,
-                "没有可提交的子任务",
-                "当前主任务下至少需要两个待制作的子任务。",
-            )
-            return
-        settings = self._current_settings()
-        plans: list[tuple[ProjectTask, list[DressTaskGroup]]] = []
-        errors: list[str] = []
-        for item in targets:
-            groups = (
-                list(self.pairs)
-                if item.id == task.id and self.pairs
-                else self._load_task_groups(
-                    item,
-                    tuple(self.garment_assets),
-                )
-            )
-            if not groups:
-                errors.append(f"{item.task_code}：没有可用素材")
-                continue
-            plans.append((item, groups))
-        if not plans:
-            QMessageBox.warning(self, "无法提交", "\n".join(errors))
-            return
-        pair_total = sum(len(groups) for _, groups in plans)
-        answer = QMessageBox.question(
-            self,
-            "确认整单提交",
-            f"将提交 {len(plans)} 个子任务，共 {pair_total} 个配对。\n"
-            "当前子任务沿用页面上的配对；其他子任务按各自素材自动匹配。\n"
-            "任务会按账号并发上限依次执行，可能产生费用。\n"
-            "确定加入队列吗？",
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        self.project_batch_button.setEnabled(False)
-        completed = 0
-        total = 0
-        try:
-            for item, groups in plans:
-                try:
-                    total += self._split_source_task(
-                        item,
-                        prompt,
-                        groups,
-                        settings,
-                    )
-                    completed += 1
-                except Exception as exc:
-                    errors.append(f"{item.task_code}：{exc}")
-            if total:
-                self.tasks_enqueued.emit(total)
-            self.feedback_label.setText(
-                f"整单提交：成功 {completed} 个子任务、{total} 个配对"
-                + (f"，失败 {len(errors)} 个。" if errors else "。")
-            )
-        finally:
-            self._refresh_generation_tasks()
-            self._resume_queued_jobs()
-            self._pump_queue()
-            self._update_project_batch_state()
-        if errors:
-            QMessageBox.warning(
-                self,
-                "部分子任务未提交",
-                "\n".join(errors),
-            )
-
     def _reset_queue_after_skip(self) -> None:
         self.waiting_jobs.clear()
         self._resume_queued_jobs()
         self._pump_queue()
-
-    def _skip_current_task(self) -> None:
-        task = self.current_task
-        if task is None:
-            QMessageBox.information(
-                self,
-                "未选择子任务",
-                "请先在顶部选择需要制作的子任务。",
-            )
-            return
-        if task.status == TASK_AWAITING_ACCEPTANCE:
-            QMessageBox.information(
-                self,
-                "不能跳过",
-                "该子任务还有待确认结果，请先确认或重试。",
-            )
-            return
-        if int(task.assignee_id or 0) != self.actor.id:
-            QMessageBox.warning(
-                self,
-                "不能跳过",
-                "该子任务不属于当前账号。",
-            )
-            return
-        answer = QMessageBox.question(
-            self,
-            "当前子任务不做图",
-            f"子任务 {task.task_code} 将标记为“无需制作”，不再生成。\n"
-            "确定继续吗？",
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer != QMessageBox.StandardButton.Yes:
-            return
-        try:
-            self.repository.mark_task_skipped(task.id, self.actor)
-        except Exception as exc:
-            QMessageBox.warning(self, "跳过失败", str(exc))
-            return
-        self.feedback_label.setText(
-            f"子任务 {task.task_code} 已标记无需制作。"
-        )
-        self.tasks_skipped.emit(1)
-        self._refresh_generation_tasks()
-        self._reset_queue_after_skip()
 
     def _skip_project_tasks(self) -> None:
         project = self.current_project
@@ -1481,138 +1265,6 @@ class AIGenerationPage(BatchDressPage):
         )
         self._refresh_generation_tasks()
         self._pump_queue()
-
-    def _split_source_task(
-        self,
-        task: ProjectTask,
-        prompt: str,
-        groups: Sequence[DressTaskGroup] | None = None,
-        settings: dict | None = None,
-    ) -> int:
-        settings = settings or self._current_settings()
-        strategy = self.app_settings.auto_strategy()
-        specs: list[GenerationPairSpec] = []
-        group_list = list(groups) if groups is not None else list(self.pairs)
-        selected_model = settings.get("model")
-        aspect_ratio = settings.get("aspect")
-        resolution = settings.get("resolution")
-        provider_code = str(settings.get("provider") or "")
-        provider_name = str(settings.get("provider_name") or "")
-        for group in group_list:
-            group_prompt = (
-                "无需制作"
-                if group.skipped
-                else self._prompt_for_group(prompt, group)
-            )
-            model_id = selected_model
-            if selected_model == AUTO_MODEL_ID:
-                model_id = choose_model(
-                    prompt=group_prompt,
-                    mode="dress_up",
-                    reference_count=len(group.references),
-                    strategy=strategy,
-                ).model
-            if not group.skipped:
-                usable_model = self._resolve_usable_model(
-                    model_id,
-                    len(group.references),
-                    1,
-                )
-                if usable_model is None:
-                    raise ValueError(
-                        "当前模型在已启用平台中没有可用的 API Key，"
-                        "请改用其他模型"
-                    )
-                model_id = usable_model
-            garment_hashes = tuple(
-                image.content_hash
-                for role, image in zip(group.roles, group.references)
-                if role == "garment"
-            )
-            specs.append(
-                GenerationPairSpec(
-                    prompt_text=group_prompt,
-                    model=model_id,
-                    aspect_ratio=aspect_ratio,
-                    resolution=resolution,
-                    n=1,
-                    unit_price=self.repository.current_model_price(
-                        model_id
-                    ),
-                    garment_hashes=garment_hashes,
-                    person_hash=(
-                        group.person.content_hash
-                        if group.person is not None
-                        else ""
-                    ),
-                    skipped=group.skipped,
-                    requested_provider_code=provider_code,
-                    requested_provider_name=provider_name,
-                )
-            )
-        unsupported_models = []
-        if provider_code:
-            for spec in specs:
-                if spec.skipped:
-                    continue
-                routes = self.repository.list_provider_routes(
-                    spec.model,
-                    provider_code=provider_code,
-                )
-                if not routes:
-                    unsupported_models.append(spec.model)
-        if unsupported_models:
-            QMessageBox.information(
-                self,
-                "首选供应商不支持当前模型",
-                "以下模型未配置在该供应商中，将自动切换到其他平台：\n"
-                + "、".join(sorted(set(unsupported_models))),
-            )
-        results = self.repository.split_and_queue_generations(
-            task.id,
-            self.actor,
-            pairs=specs,
-        )
-        snapshot_failures: list[str] = []
-        for result, group in zip(results, group_list):
-            if result.skipped or result.attempt_id is None:
-                continue
-            child = self.repository.get_task(result.task_id)
-            if child is None:
-                continue
-            try:
-                child_store = LocalTaskSourceStore(
-                    self.file_store.paths.root / "local_sources",
-                    self.actor.id,
-                    child,
-                    self.resolver,
-                )
-                garments = tuple(
-                    image
-                    for role, image in zip(group.roles, group.references)
-                    if role == "garment"
-                )
-                child_store.replace_all(garments, group.person)
-                child_store.save_attempt_snapshot(result.attempt_id)
-            except Exception as exc:
-                snapshot_failures.append(result.task_code)
-                try:
-                    self.repository.fail_generation_attempt(
-                        result.attempt_id,
-                        self.actor,
-                        error_code="local_source_snapshot",
-                        error_message=str(exc),
-                    )
-                except Exception:
-                    pass
-        if snapshot_failures:
-            QMessageBox.warning(
-                self,
-                "部分素材保存失败",
-                "以下子任务的本机素材快照保存失败：\n"
-                + "、".join(snapshot_failures),
-            )
-        return len(results)
 
     def _retry_child_task(
         self,

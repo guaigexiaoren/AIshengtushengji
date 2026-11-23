@@ -54,6 +54,7 @@ class ProductCodeTests(unittest.TestCase):
             "DV263q25445",
             "ABC263q1p80723",
             "DV5q25445p8072",
+            "DV２６3q25445p80723",
         ):
             self.assertIsNone(parse_product_code(value), value)
 

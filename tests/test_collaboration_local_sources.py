@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 import base64
@@ -112,6 +113,64 @@ class LocalTaskSourceTests(unittest.TestCase):
                 [image.content_hash for image in local.state.garments],
             )
             self.assertTrue(reloaded[0].source_path.is_file())
+
+    def test_saving_garments_only_keeps_cached_models(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = make_task(root / "share")
+            resolver = SharedPathResolver(root / "share")
+            local = LocalTaskSourceStore(root / "local", 7, task, resolver)
+            store = ProjectGarmentStore(root / "local", 7, task.project_id)
+            store.save_all(
+                local.state.garments,
+                (local.state.model,),
+                task.source_revision,
+            )
+            store.save(local.state.garments, task.source_revision)
+            garments, models = store.load_all(task.source_revision)
+            self.assertEqual(len(garments), 1)
+            self.assertEqual(len(models), 1)
+            self.assertEqual(
+                models[0].content_hash,
+                local.state.model.content_hash,
+            )
+
+    def test_legacy_manifest_without_models_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = make_task(root / "share")
+            resolver = SharedPathResolver(root / "share")
+            local = LocalTaskSourceStore(root / "local", 7, task, resolver)
+            store = ProjectGarmentStore(root / "local", 7, task.project_id)
+            store.save_all(
+                local.state.garments,
+                (local.state.model,),
+                task.source_revision,
+            )
+            manifest = json.loads(
+                store.manifest_path.read_text("utf-8")
+            )
+            manifest.pop("models")
+            store.manifest_path.write_text(
+                json.dumps(manifest),
+                "utf-8",
+            )
+            self.assertIsNone(store.load_all(task.source_revision))
+            self.assertIsNone(store.load(task.source_revision))
+
+    def test_replace_all_keeps_garment_relative_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            task = make_task(root / "share")
+            resolver = SharedPathResolver(root / "share")
+            store = LocalTaskSourceStore(root / "local", 7, task, resolver)
+            expected = store.state.garments[0].relative_path
+            self.assertEqual(expected, "衣服图/衣服1.png")
+            store.replace_all(store.state.garments, store.state.model)
+            self.assertEqual(
+                store.state.garments[0].relative_path,
+                expected,
+            )
 
     def test_local_sources_persist_and_attempt_snapshot_survives(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

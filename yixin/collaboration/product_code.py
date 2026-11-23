@@ -11,10 +11,10 @@ from dataclasses import dataclass
 # 都识别为同一货号 DV263q25445p。
 PRODUCT_CODE_PATTERN = re.compile(
     r"^(?P<brand>[A-Za-z]{2})"
-    r"(?P<year>\d{2})"
+    r"(?P<year>[0-9]{2})"
     r"(?P<season>[1-4])"
     r"(?P<serial_sep>[A-Za-z])"
-    r"(?P<serial>\d+)"
+    r"(?P<serial>[0-9]+)"
     r"(?P<color_sep>[A-Za-z])"
 )
 

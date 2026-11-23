@@ -1,0 +1,390 @@
+@page {
+  size: A4 portrait;
+  margin: 18mm 16mm 18mm 16mm;
+
+  @top-left {
+    content: "亦欣 AI 生图工作台 · 运营使用手册";
+    font-family: "Microsoft YaHei", sans-serif;
+    font-size: 8pt;
+    color: #8a96a9;
+    padding-bottom: 2mm;
+  }
+  @top-right {
+    content: "2026-11 版";
+    font-family: "Microsoft YaHei", sans-serif;
+    font-size: 8pt;
+    color: #8a96a9;
+  }
+  @bottom-center {
+    content: "第 " counter(page) " 页 / 共 " counter(pages) " 页";
+    font-family: "Microsoft YaHei", sans-serif;
+    font-size: 8pt;
+    color: #8a96a9;
+    padding-top: 2mm;
+  }
+}
+
+@page :first {
+  @top-left { content: none; }
+  @top-right { content: none; }
+  @bottom-center { content: none; }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+}
+
+body {
+  margin: 0;
+  font-family: "Microsoft YaHei", "Microsoft YaHei UI", sans-serif;
+  font-size: 10.5pt;
+  line-height: 1.7;
+  color: #243044;
+}
+
+b, strong {
+  color: #1a2433;
+}
+
+/* ---------- 封面 ---------- */
+
+.cover {
+  height: 245mm;
+  padding: 34mm 6mm 0;
+  page-break-after: always;
+}
+
+.cover-brand {
+  font-size: 13pt;
+  letter-spacing: 2pt;
+  color: #3f73cb;
+  font-weight: 700;
+}
+
+.cover-title {
+  margin: 18mm 0 4mm;
+  font-size: 38pt;
+  line-height: 1.2;
+  color: #1f2d43;
+  border: none;
+  padding: 0;
+  page-break-before: auto;
+}
+
+.cover-title::after {
+  content: "";
+  display: block;
+  width: 46mm;
+  height: 1.6mm;
+  margin-top: 7mm;
+  background: #3f73cb;
+  border-radius: 1mm;
+}
+
+.cover-subtitle {
+  margin: 4mm 0 22mm;
+  font-size: 14pt;
+  color: #526078;
+}
+
+.cover-meta p {
+  margin: 1.5mm 0;
+  font-size: 11pt;
+  color: #3b485c;
+}
+
+.cover-note {
+  margin-top: 30mm;
+  padding: 5mm 6mm;
+  font-size: 10pt;
+  line-height: 1.9;
+  color: #3b4a61;
+  background: #f2f6fd;
+  border-left: 1.5mm solid #3f73cb;
+  border-radius: 2mm;
+}
+
+/* ---------- 标题 ---------- */
+
+h1 {
+  page-break-before: always;
+  margin: 0 0 7mm;
+  padding-bottom: 3mm;
+  font-size: 19pt;
+  line-height: 1.35;
+  color: #1f2d43;
+  border-bottom: 0.6mm solid #dce5f2;
+}
+
+#ch1 {
+  page-break-before: auto;
+}
+
+h2 {
+  margin: 8mm 0 3mm;
+  font-size: 14pt;
+  line-height: 1.45;
+  color: #245ab8;
+  page-break-after: avoid;
+}
+
+h3 {
+  margin: 6mm 0 2mm;
+  font-size: 11.5pt;
+  color: #2c3a55;
+  page-break-after: avoid;
+}
+
+p {
+  margin: 2.2mm 0;
+}
+
+ul, ol {
+  margin: 2mm 0 3mm;
+  padding-left: 7mm;
+}
+
+li {
+  margin: 1.2mm 0;
+}
+
+ol.steps li {
+  margin: 2mm 0;
+}
+
+/* ---------- 表格 ---------- */
+
+table {
+  width: 100%;
+  margin: 3mm 0 5mm;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 9.5pt;
+  line-height: 1.55;
+}
+
+thead {
+  display: table-header-group;
+}
+
+th {
+  padding: 2mm 2.2mm;
+  text-align: left;
+  background: #eaf0fb;
+  color: #1f3350;
+  font-weight: 700;
+  border: 0.25mm solid #c9d5e8;
+  word-break: break-all;
+}
+
+td {
+  padding: 2mm 2.2mm;
+  border: 0.25mm solid #d7e0ee;
+  vertical-align: top;
+  word-break: break-all;
+}
+
+tbody tr:nth-child(even) td {
+  background: #f7f9fd;
+}
+
+.code-table td,
+.code-table th {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 9pt;
+}
+
+/* ---------- 图片 ---------- */
+
+figure {
+  margin: 4mm 0 5mm;
+  padding: 0;
+  page-break-inside: avoid;
+  break-inside: avoid;
+  text-align: center;
+}
+
+figure img {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  border: 0.3mm solid #ccd7e6;
+  border-radius: 1.5mm;
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+
+figure.figure-85 img {
+  width: 85%;
+  margin: 0 auto;
+}
+
+figure.figure-compact img {
+  width: 62%;
+  margin: 0 auto;
+}
+
+figure figcaption {
+  margin-top: 2mm;
+  font-size: 9pt;
+  color: #6a788e;
+}
+
+/* ---------- 代码与路径 ---------- */
+
+code {
+  padding: 0.3mm 1.2mm;
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 9pt;
+  color: #24415f;
+  background: #f1f4f9;
+  border-radius: 1mm;
+  word-break: break-all;
+}
+
+pre {
+  margin: 3mm 0 4mm;
+  padding: 3mm 4mm;
+  background: #f5f7fb;
+  border: 0.25mm solid #dce5f2;
+  border-radius: 1.5mm;
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+
+pre code {
+  padding: 0;
+  background: none;
+  font-size: 8.8pt;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* ---------- 提示框 ---------- */
+
+.tip, .warn, .danger {
+  margin: 3mm 0 4mm;
+  padding: 3mm 4mm;
+  font-size: 9.8pt;
+  line-height: 1.7;
+  border-radius: 1.5mm;
+}
+
+.tip {
+  background: #eef5ff;
+  border-left: 1.5mm solid #3f73cb;
+}
+
+.warn {
+  background: #fff8e8;
+  border-left: 1.5mm solid #e0a63c;
+}
+
+.danger {
+  background: #fdeeee;
+  border-left: 1.5mm solid #c94f4f;
+}
+
+/* ---------- 状态标签 ---------- */
+
+.badge {
+  display: inline-block;
+  padding: 0.2mm 2mm;
+  border-radius: 2mm;
+  font-size: 8.6pt;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.badge-gray {
+  color: #526078;
+  background: #eef2f8;
+}
+
+.badge-blue {
+  color: #245ab8;
+  background: #e6efff;
+}
+
+.badge-green {
+  color: #2a7a50;
+  background: #e5f5ec;
+}
+
+.badge-red {
+  color: #a63c3c;
+  background: #fbe9e9;
+}
+
+/* ---------- 业务流程图 ---------- */
+
+.flow {
+  margin: 4mm 0 6mm;
+  page-break-inside: avoid;
+  break-inside: avoid;
+}
+
+.flow-step {
+  display: grid;
+  grid-template-columns: 12mm 1fr 24mm;
+  align-items: center;
+  gap: 3mm;
+  margin: 0 0 2.5mm;
+  padding: 3mm 4mm;
+  background: #f7f9fd;
+  border: 0.25mm solid #dce5f2;
+  border-radius: 2mm;
+}
+
+.flow-num {
+  width: 10mm;
+  height: 10mm;
+  line-height: 10mm;
+  text-align: center;
+  font-size: 12pt;
+  font-weight: 700;
+  color: #ffffff;
+  background: #3f73cb;
+  border-radius: 50%;
+}
+
+.flow-main b {
+  display: block;
+  font-size: 10.5pt;
+  color: #1f2d43;
+}
+
+.flow-main span {
+  display: block;
+  margin-top: 0.8mm;
+  font-size: 9.2pt;
+  line-height: 1.55;
+  color: #526078;
+}
+
+.flow-role {
+  text-align: center;
+  font-size: 8.8pt;
+  font-weight: 700;
+  color: #245ab8;
+  background: #e6efff;
+  border-radius: 2mm;
+  padding: 1.2mm 0;
+}
+
+/* ---------- 其他 ---------- */
+
+img {
+  max-width: 100%;
+}
+
+a {
+  color: #245ab8;
+  text-decoration: none;
+}

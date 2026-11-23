@@ -14,7 +14,7 @@ HAS_PYSIDE = importlib.util.find_spec("PySide6") is not None
 
 if HAS_PYSIDE:
     from PIL import Image
-    from PySide6.QtCore import QPoint, Qt
+    from PySide6.QtCore import QItemSelectionModel, QPoint, Qt
     from PySide6.QtTest import QTest
     from PySide6.QtWidgets import (
         QApplication,
@@ -133,7 +133,13 @@ class FakeCentralRepository:
     def update_subtask_sources(self, task_id, actor, **kwargs):
         self.source_updates.append((task_id, actor, kwargs))
 
-    def find_tasks_by_products(self, _owner_id, _source_date, product_codes):
+    def find_tasks_by_products(
+        self,
+        _owner_id,
+        _source_date,
+        product_codes,
+        **_kwargs,
+    ):
         return {code: [] for code in product_codes}
 
     def update_project(self, *_args):
@@ -606,8 +612,36 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(hasattr(page, "ai_preview"))
         self.assertEqual(page.ai_preview.list_widget.count(), 2)
         self.assertTrue(page.listing_button.isEnabled())
+        self.assertEqual(
+            page.listing_button.objectName(),
+            "PrimaryButton",
+        )
+        self.assertFalse(page.listing_button.isHidden())
         self.assertFalse(hasattr(page, "urgent_button"))
         self.assertFalse(hasattr(page, "review_actions"))
+        page.deleteLater()
+
+    def test_buyer_show_project_does_not_need_listing(self) -> None:
+        project = replace(
+            make_project("completed"),
+            task_type="buyer_show",
+        )
+        self.repository.submission_projects = [project]
+        page = SubmissionListPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            "records",
+        )
+        self.assertEqual(
+            page.project_table.item(0, 8).text(),
+            "无需上架",
+        )
+        self.assertEqual(
+            page._info_labels["listing_status"].text(),
+            "无需上架",
+        )
+        self.assertTrue(page.listing_button.isHidden())
         page.deleteLater()
 
     def test_submission_listing_button_requires_completed_project(
@@ -707,6 +741,38 @@ class CollaborationPageTests(unittest.TestCase):
         ):
             page._claim_selected()
         self.assertEqual(requested, [[project.id]])
+        page.deleteLater()
+
+    def test_assignment_page_keeps_multi_selection_after_rerender(
+        self,
+    ) -> None:
+        first = make_project()
+        second = replace(
+            first,
+            id=2,
+            project_code="春季项目-123-002",
+            product_code="456",
+            name="456",
+        )
+        page = TaskAssignmentPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            auto_load=False,
+        )
+        result = PageResult([first, second], 2, 1, 50)
+        page._render_projects(result)
+        selection = page.project_table.selectionModel()
+        selection.select(
+            page.project_table.model().index(1, 0),
+            QItemSelectionModel.SelectionFlag.Select
+            | QItemSelectionModel.SelectionFlag.Rows,
+        )
+        page._selection_changed()
+        self.assertEqual(sorted(page._selected_project_ids()), [1, 2])
+        page._render_projects(result)
+        self.assertEqual(sorted(page._selected_project_ids()), [1, 2])
+        self.assertEqual(page.claim_button.text(), "领取所选（2）")
         page.deleteLater()
 
     def test_assignment_page_async_pages_projects_and_assets(self) -> None:
@@ -816,12 +882,16 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertTrue(page.count_spin.isHidden())
         self.assertIn("备注", page.note_label.text())
         self.assertIn("fff4d6", page.note_label.styleSheet())
-        multi_prompt = next(
+        base_prompt = next(
             prompt
             for name, prompt in BUILTIN_PROMPT_TEMPLATES
-            if "多图换装" in name
+            if "基础服装替换" in name
         )
-        self.assertEqual(page.prompt_edit.toPlainText(), multi_prompt)
+        self.assertEqual(page.prompt_edit.toPlainText(), base_prompt)
+        self.assertEqual(
+            page.template_combo.currentData()["name"],
+            "内置·基础服装替换",
+        )
         original_hashes = tuple(
             image.content_hash for image in page.garment_assets
         )
@@ -858,6 +928,65 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(page.prompt_edit.toPlainText(), "自定义提示词")
         page._clear_generation_editor()
         self.assertEqual(page.prompt_edit.toPlainText(), "自定义提示词")
+        page.deleteLater()
+
+    def test_ai_generation_default_template_falls_back_when_deleted(
+        self,
+    ) -> None:
+        write_task_images(self.root)
+        task = make_task("claimed")
+        project = make_project("in_progress")
+        self.repository.generation_projects = [project]
+        self.repository.project_assets_by_id[project.id] = (
+            self._project_assets_for(task)
+        )
+        self.repository.list_queued_attempts = lambda _actor_id: []
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        paths = AppPaths(self.root / "ai-default-template-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: "sk-test-123456")
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            AuthUser(4, "ai_amy", "AI Amy", "ai"),
+            client,
+            key_store,
+            database,
+            file_store,
+            LibraryService(database, file_store, paths),
+            TaskWorker(database, client, file_store),
+            key_store,
+            auto_load=False,
+        )
+        template = next(
+            item
+            for item in database.list_templates()
+            if "基础服装替换" in item["name"]
+        )
+        database.delete_template(int(template["id"]))
+        with (
+            patch.object(QMessageBox, "warning"),
+            patch.object(QMessageBox, "information"),
+        ):
+            page.refresh()
+        base_prompt = next(
+            prompt
+            for name, prompt in BUILTIN_PROMPT_TEMPLATES
+            if "基础服装替换" in name
+        )
+        self.assertEqual(page.prompt_edit.toPlainText(), base_prompt)
+        current = page.template_combo.currentData()
+        self.assertNotEqual(
+            str((current or {}).get("name") or ""),
+            "内置·多图换装",
+        )
         page.deleteLater()
 
     def test_ai_generation_skips_whole_project(self) -> None:
@@ -1271,6 +1400,174 @@ class CollaborationPageTests(unittest.TestCase):
         )
         page.deleteLater()
 
+    def test_switching_away_from_project_keeps_cropped_asset(self) -> None:
+        from yixin.collaboration.local_sources import ProjectGarmentStore
+
+        write_task_images(self.root)
+        task = make_task("claimed")
+        project = make_project("in_progress")
+        self.repository.generation_projects = [project]
+        self.repository.project_assets_by_id[project.id] = (
+            self._project_assets_for(task)
+        )
+        self.repository.list_queued_attempts = lambda _actor_id: []
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        paths = AppPaths(self.root / "ai-clear-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: "sk-test-123456")
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            AuthUser(4, "ai_amy", "AI Amy", "ai"),
+            client,
+            key_store,
+            database,
+            file_store,
+            LibraryService(database, file_store, paths),
+            TaskWorker(database, client, file_store),
+            key_store,
+            auto_load=False,
+        )
+        page.refresh()
+        cropped = file_store.save_cropped_reference(
+            page.garment_assets[0],
+            (0, 0, 10, 10),
+        )
+        page.garment_assets[0] = cropped
+        with (
+            patch.object(QMessageBox, "warning"),
+            patch.object(QMessageBox, "information"),
+        ):
+            page.task_selector.setCurrentIndex(0)
+        store = ProjectGarmentStore(
+            paths.root / "local_sources",
+            4,
+            project.id,
+        )
+        cached = store.load_all(project.source_revision)
+        self.assertIsNotNone(cached)
+        self.assertIn(
+            cropped.content_hash,
+            {image.content_hash for image in cached[0]},
+        )
+        page.deleteLater()
+
+    def test_history_retry_uses_child_assets_and_keeps_project_cache(
+        self,
+    ) -> None:
+        from yixin.collaboration.local_sources import ProjectGarmentStore
+
+        write_task_images(self.root)
+        product = self.root / "内部项目" / "春季项目" / "1.2" / "123"
+        red = product / "衣服图" / "红色1.png"
+        green = product / "衣服图" / "绿色1.png"
+        Image.new("RGB", (20, 20), "red").save(red)
+        Image.new("RGB", (20, 20), "green").save(green)
+        red_hash = hashlib.sha256(red.read_bytes()).hexdigest()
+        green_hash = hashlib.sha256(green.read_bytes()).hexdigest()
+        base_task = make_task("claimed")
+        project = make_project("in_progress")
+        assets = (
+            ProjectAssetInput(
+                "garment",
+                "衣服图/红色1.png",
+                "红色1.png",
+                red_hash,
+                "image/png",
+                20,
+                20,
+            ),
+            ProjectAssetInput(
+                "garment",
+                "衣服图/绿色1.png",
+                "绿色1.png",
+                green_hash,
+                "image/png",
+                20,
+                20,
+            ),
+            ProjectAssetInput(
+                "model",
+                base_task.model_path,
+                base_task.model_name,
+                base_task.model_hash,
+                "image/png",
+                20,
+                20,
+            ),
+        )
+        self.repository.generation_projects = [project]
+        self.repository.project_assets_by_id[project.id] = assets
+        self.repository.list_queued_attempts = lambda _actor_id: []
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        paths = AppPaths(self.root / "ai-retry-sources-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: "sk-test-123456")
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            AuthUser(4, "ai_amy", "AI Amy", "ai"),
+            client,
+            key_store,
+            database,
+            file_store,
+            LibraryService(database, file_store, paths),
+            TaskWorker(database, client, file_store),
+            key_store,
+            auto_load=False,
+        )
+        page.refresh()
+        self.assertEqual(len(page.pairs), 2)
+        page._persist_current_sources()
+        child = replace(
+            base_task,
+            id=902,
+            task_code="春季项目-123-001-902",
+            garment_assets=(assets[0],),
+        )
+        self.repository.tasks_by_id[child.id] = child
+        page._generation_tasks_by_id[child.id] = child
+        page.force_direct_retry_task_id = child.id
+        with (
+            patch.object(QMessageBox, "warning"),
+            patch.object(QMessageBox, "information"),
+        ):
+            page._retry_task_changed(child.id)
+        self.assertEqual(len(page.pairs), 1)
+        retry_hashes = {
+            image.content_hash
+            for group in page.pairs
+            for role, image in zip(group.roles, group.references)
+            if role == "garment"
+        }
+        self.assertEqual(retry_hashes, {red_hash})
+        # 重试期间的编辑只写子任务本机素材，不能覆盖主任务级缓存。
+        page._persist_current_sources()
+        store = ProjectGarmentStore(
+            paths.root / "local_sources",
+            4,
+            project.id,
+        )
+        cached = store.load_all(project.source_revision)
+        self.assertIsNotNone(cached)
+        self.assertEqual(len(cached[0]), 2)
+        self.assertEqual(len(cached[1]), 1)
+        page.deleteLater()
+
     def test_ai_generation_page_retries_failed_child_without_split(self) -> None:
         write_task_images(self.root)
         task = replace(
@@ -1311,6 +1608,8 @@ class CollaborationPageTests(unittest.TestCase):
         page._generation_tasks_by_id[task.id] = task
         page.force_direct_retry_task_id = task.id
         page._retry_task_changed(task.id)
+        # 子任务已有提示词时不能被默认模板覆盖。
+        self.assertEqual(page.prompt_edit.toPlainText(), task.prompt_text)
         with (
             patch.object(QMessageBox, "warning"),
             patch.object(QMessageBox, "information"),
@@ -1500,226 +1799,6 @@ class CollaborationPageTests(unittest.TestCase):
         _task_id, _actor, kwargs = self.repository.generation_requests[0]
         self.assertTrue(kwargs["allow_reopen"])
         self.assertFalse(pending_file.exists())
-        page.deleteLater()
-
-    @unittest.skip("旧模型：整单提交按原始子任务拆分，已改为主任务级拆分")
-    def test_ai_generation_submits_all_project_source_tasks(self) -> None:
-        write_task_images(self.root)
-        model2 = (
-            self.root
-            / "内部项目"
-            / "春季项目"
-            / "1.2"
-            / "123"
-            / "模特图"
-            / "模特2.png"
-        )
-        Image.new("RGB", (20, 20), "orange").save(model2)
-        task1 = make_task("claimed")
-        task2 = replace(
-            task1,
-            id=12,
-            task_code="春季项目-123-001-002",
-            model_asset_id=2,
-            model_path="模特图/模特2.png",
-            model_name="模特2.png",
-            model_hash=hashlib.sha256(model2.read_bytes()).hexdigest(),
-        )
-        other_project = replace(
-            task1,
-            id=13,
-            project_id=9,
-            task_code="其他项目-001",
-        )
-        child = replace(
-            task1,
-            id=14,
-            task_code="春季项目-123-001-007",
-            parent_task_id=task1.id,
-        )
-        self.repository.list_ai_generation_tasks = (
-            lambda _actor, **_kwargs: [
-                task1,
-                task2,
-                other_project,
-                child,
-            ]
-        )
-        self.repository.list_queued_attempts = lambda _actor_id: []
-        captured: list[tuple] = []
-
-        def split(task_id, actor, *, pairs):
-            captured.append((task_id, actor.id, tuple(pairs)))
-            return (
-                SplitGenerationItem(
-                    task_id=task_id,
-                    task_code="child",
-                    attempt_id=None,
-                    skipped=True,
-                ),
-            )
-
-        self.repository.split_and_queue_generations = split
-        key_store = type(
-            "KeyStore",
-            (),
-            {"load": staticmethod(lambda: "sk-test-123456")},
-        )()
-        paths = AppPaths(self.root / "project-batch-data")
-        paths.ensure()
-        database = Database(paths.database)
-        database.initialize()
-        file_store = FileStore(paths)
-        client = NanoBananaClient(lambda: "sk-test-123456")
-        page = AIGenerationPage(
-            self.repository,
-            self.resolver,
-            AuthUser(4, "ai_amy", "AI Amy", "ai"),
-            client,
-            key_store,
-            database,
-            file_store,
-            LibraryService(database, file_store, paths),
-            TaskWorker(database, client, file_store),
-            key_store,
-            auto_load=False,
-        )
-        emitted: list[int] = []
-        page.tasks_enqueued.connect(emitted.append)
-        page.refresh()
-        self.assertTrue(page.project_batch_button.isEnabled())
-        with (
-            patch.object(
-                QMessageBox,
-                "question",
-                return_value=QMessageBox.StandardButton.Yes,
-            ),
-            patch.object(QMessageBox, "warning"),
-            patch.object(QMessageBox, "information"),
-        ):
-            page._asset_list_for("garment").setCurrentRow(0)
-            page._remove_selected("garment")
-            page._auto_match()
-            page.task_selector.setCurrentIndex(2)
-            self.assertEqual(len(page.garment_assets), 1)
-            self.assertEqual(
-                page.person_assets[0].content_hash,
-                task2.model_hash,
-            )
-            page.task_selector.setCurrentIndex(1)
-            self.assertEqual(len(page.garment_assets), 1)
-            shared_hashes = tuple(
-                image.content_hash for image in page.garment_assets
-            )
-            page._enqueue_project_all()
-        self.assertEqual(
-            [item[0] for item in captured],
-            [task1.id, task2.id],
-        )
-        self.assertTrue(shared_hashes)
-        for _task_id, _actor_id, pairs in captured:
-            self.assertEqual(pairs[0].garment_hashes, shared_hashes)
-        self.assertEqual(
-            len({item[2][0].prompt_text for item in captured}),
-            1,
-        )
-        self.assertEqual(
-            captured[0][2][0].person_hash,
-            task1.model_hash,
-        )
-        self.assertEqual(
-            captured[1][2][0].person_hash,
-            task2.model_hash,
-        )
-        self.assertEqual(emitted, [2])
-        page.deleteLater()
-
-    @unittest.skip("旧模型：整单提交按原始子任务拆分，已改为主任务级拆分")
-    def test_ai_generation_project_batch_isolates_failures(self) -> None:
-        write_task_images(self.root)
-        model2 = (
-            self.root
-            / "内部项目"
-            / "春季项目"
-            / "1.2"
-            / "123"
-            / "模特图"
-            / "模特2.png"
-        )
-        Image.new("RGB", (20, 20), "orange").save(model2)
-        task1 = make_task("claimed")
-        task2 = replace(
-            task1,
-            id=12,
-            task_code="春季项目-123-001-002",
-            model_asset_id=2,
-            model_path="模特图/模特2.png",
-            model_name="模特2.png",
-            model_hash=hashlib.sha256(model2.read_bytes()).hexdigest(),
-        )
-        self.repository.list_ai_generation_tasks = (
-            lambda _actor, **_kwargs: [task1, task2]
-        )
-        self.repository.list_queued_attempts = lambda _actor_id: []
-
-        def split(task_id, actor, *, pairs):
-            del actor, pairs
-            if task_id == task2.id:
-                raise RuntimeError("模拟素材缺失")
-            return (
-                SplitGenerationItem(
-                    task_id=task_id,
-                    task_code="child",
-                    attempt_id=None,
-                    skipped=True,
-                ),
-            )
-
-        self.repository.split_and_queue_generations = split
-        key_store = type(
-            "KeyStore",
-            (),
-            {"load": staticmethod(lambda: "sk-test-123456")},
-        )()
-        paths = AppPaths(self.root / "project-batch-failure-data")
-        paths.ensure()
-        database = Database(paths.database)
-        database.initialize()
-        file_store = FileStore(paths)
-        client = NanoBananaClient(lambda: "sk-test-123456")
-        page = AIGenerationPage(
-            self.repository,
-            self.resolver,
-            AuthUser(4, "ai_amy", "AI Amy", "ai"),
-            client,
-            key_store,
-            database,
-            file_store,
-            LibraryService(database, file_store, paths),
-            TaskWorker(database, client, file_store),
-            key_store,
-            auto_load=False,
-        )
-        emitted: list[int] = []
-        page.tasks_enqueued.connect(emitted.append)
-        page.refresh()
-        with (
-            patch.object(
-                QMessageBox,
-                "question",
-                return_value=QMessageBox.StandardButton.Yes,
-            ) as question,
-            patch.object(QMessageBox, "warning") as warning,
-            patch.object(QMessageBox, "information"),
-        ):
-            page._enqueue_project_all()
-        self.assertTrue(question.called)
-        self.assertEqual(emitted, [1])
-        self.assertTrue(warning.called)
-        self.assertIn(
-            task2.task_code,
-            str(warning.call_args),
-        )
         page.deleteLater()
 
     def test_unified_history_references_follow_attempt_snapshot(self) -> None:
@@ -1952,7 +2031,7 @@ class CollaborationPageTests(unittest.TestCase):
             invalid / "衣服图" / "衣服1.png"
         )
         self.repository.find_tasks_by_products = (
-            lambda _actor, _date, codes: {
+            lambda _actor, _date, codes, **_kwargs: {
                 code: ([object()] if code == "DV263q99999p" else [])
                 for code in codes
             }
@@ -2480,7 +2559,7 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.assertEqual(
             set(payload["menu_permissions"]),
-            {"new_task", "submission_history", "reports"},
+            {"new_task", "submission_history"},
         )
         self.assertEqual(
             payload["project_access"],
@@ -3739,12 +3818,12 @@ class CollaborationPageTests(unittest.TestCase):
         )
         page._render_generation_projects([first, second])
         page.task_selector.setCurrentIndex(2)
-        multi_prompt = next(
+        base_prompt = next(
             prompt
             for name, prompt in BUILTIN_PROMPT_TEMPLATES
-            if "多图换装" in name
+            if "基础服装替换" in name
         )
-        self.assertEqual(page.prompt_edit.toPlainText(), multi_prompt)
+        self.assertEqual(page.prompt_edit.toPlainText(), base_prompt)
         self.assertEqual(page.aspect_combo.currentData(), "3:4")
         page.task_selector.setCurrentIndex(1)
         self.assertEqual(page.prompt_edit.toPlainText(), "沿用设置")
