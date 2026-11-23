@@ -24,8 +24,36 @@ class EmptyCentralRepository:
     def list_assignment_projects(self, _actor, **_kwargs):
         return []
 
+    def list_assignment_project_counts(self, _actor):
+        return []
+
+    def list_assignment_projects_page(self, _actor, _query, page):
+        from yixin.paging import PageResult
+
+        return PageResult([], 0, page.page, page.page_size)
+
     def list_ai_generation_tasks(self, _actor, **_kwargs):
         return []
+
+    def list_ai_generation_projects_page(self, _actor, _query, page):
+        from yixin.paging import PageResult
+
+        return PageResult([], 0, page.page, page.page_size)
+
+    def list_project_assets(self, _project_id):
+        return ()
+
+    def split_project_and_queue_generations(
+        self,
+        _project_id,
+        _actor,
+        *,
+        pairs,
+    ):
+        return []
+
+    def skip_project(self, _project_id, _actor, reason=""):
+        return 0
 
     def list_project_attempt_history(self, _actor, **_kwargs):
         return []

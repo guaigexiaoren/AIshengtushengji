@@ -15,8 +15,52 @@ from yixin.collaboration.types import (
 
 
 class CollaborationSchemaTests(unittest.TestCase):
-    def test_schema_version_is_eleven(self) -> None:
-        self.assertEqual(SCHEMA_VERSION, 11)
+    def test_schema_version_is_fourteen(self) -> None:
+        self.assertEqual(SCHEMA_VERSION, 14)
+
+    def test_schema_v14_adds_project_task_type(self) -> None:
+        with patch(
+            "yixin.collaboration.repository._add_column_if_missing"
+        ) as add_column:
+            MySQLCentralRepository._apply_schema_v14(object())
+        self.assertEqual(
+            [call.args[2] for call in add_column.call_args_list],
+            ["task_type"],
+        )
+
+    def test_schema_v13_adds_project_assignee(self) -> None:
+        with (
+            patch(
+                "yixin.collaboration.repository._add_column_if_missing"
+            ) as add_column,
+            patch(
+                "yixin.collaboration.repository._add_index_if_missing"
+            ) as add_index,
+        ):
+            MySQLCentralRepository._apply_schema_v13(object())
+        self.assertEqual(
+            [call.args[2] for call in add_column.call_args_list],
+            ["assignee_id", "claimed_at"],
+        )
+        self.assertEqual(
+            add_index.call_args.args[2],
+            "idx_projects_assignee_status",
+        )
+
+    def test_schema_v12_adds_listing_columns(self) -> None:
+        with patch(
+            "yixin.collaboration.repository._add_column_if_missing"
+        ) as add_column:
+            MySQLCentralRepository._apply_schema_v12(object())
+        self.assertEqual(
+            [call.args[2] for call in add_column.call_args_list],
+            [
+                "listing_url",
+                "listing_id",
+                "listing_confirmed_at",
+                "listing_confirmed_by",
+            ],
+        )
 
     def test_schema_v10_migrates_active_identity_uniqueness(self) -> None:
         with (
@@ -115,6 +159,13 @@ class CollaborationSchemaTests(unittest.TestCase):
             "deleted_at",
             "active_username",
             "active_display_name",
+            "listing_url",
+            "listing_id",
+            "listing_confirmed_at",
+            "listing_confirmed_by",
+            "assignee_id",
+            "claimed_at",
+            "task_type",
         ):
             self.assertIn(column, schema)
         self.assertIn("utf8mb4", schema)
@@ -126,6 +177,7 @@ class CollaborationSchemaTests(unittest.TestCase):
             "idx_project_tasks_project_status_created",
             "idx_project_tasks_assignee_status_created",
             "idx_attempts_created_id",
+            "idx_projects_assignee_status",
         ):
             self.assertIn(index, schema)
 

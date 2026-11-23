@@ -28,7 +28,7 @@ MENU_KEYS = {
     "admin": "管理控制台",
 }
 ROLE_DEFAULT_MENUS = {
-    ROLE_OPERATIONS: ("new_task", "submission_history"),
+    ROLE_OPERATIONS: ("new_task", "submission_history", "reports"),
     ROLE_AI: (
         "new_task",
         "assign_tasks",
@@ -41,12 +41,22 @@ ROLE_DEFAULT_MENUS = {
     ROLE_ADMIN: tuple(MENU_KEYS),
 }
 ROLE_ALLOWED_MENUS = {
-    ROLE_OPERATIONS: ("new_task", "submission_history"),
+    ROLE_OPERATIONS: ("new_task", "submission_history", "reports"),
     ROLE_AI: ROLE_DEFAULT_MENUS[ROLE_AI],
     ROLE_ADMIN: ROLE_DEFAULT_MENUS[ROLE_ADMIN],
 }
 
 PROJECT_SCOPES = ("internal", "external")
+PROJECT_TASK_TYPE_NORMAL = "normal"
+PROJECT_TASK_TYPE_BUYER_SHOW = "buyer_show"
+PROJECT_TASK_TYPES = (
+    PROJECT_TASK_TYPE_NORMAL,
+    PROJECT_TASK_TYPE_BUYER_SHOW,
+)
+PROJECT_TASK_TYPE_LABELS = {
+    PROJECT_TASK_TYPE_NORMAL: "普通",
+    PROJECT_TASK_TYPE_BUYER_SHOW: "买家秀",
+}
 PROJECT_SCOPE_LABELS = {
     "internal": "内部项目",
     "external": "外部项目",
@@ -57,12 +67,14 @@ PROJECT_IN_PROGRESS = "in_progress"
 PROJECT_AWAITING_ACCEPTANCE = "awaiting_acceptance"
 PROJECT_COMPLETED = "completed"
 PROJECT_CANCELLED = "cancelled"
+PROJECT_SKIPPED = "skipped"
 PROJECT_STATUS_LABELS = {
     PROJECT_SUBMITTED: "已提交",
     PROJECT_IN_PROGRESS: "制作中",
     PROJECT_AWAITING_ACCEPTANCE: "待审核",
     PROJECT_COMPLETED: "已完成",
     PROJECT_CANCELLED: "已取消",
+    PROJECT_SKIPPED: "无需制作",
 }
 
 TASK_AVAILABLE = "available"
@@ -175,6 +187,7 @@ class ProjectDraft:
     project_scope: str = "internal"
     access_project_name: str = ""
     is_urgent: bool = False
+    task_type: str = PROJECT_TASK_TYPE_NORMAL
 
 
 @dataclass(frozen=True)
@@ -205,6 +218,20 @@ class ProjectRecord:
     is_urgent: bool = False
     urgent_date: date | None = None
     urgent_by: int | None = None
+    completed_at: datetime | None = None
+    assignee_names: str = ""
+    result_count: int = 0
+    garment_count: int = 0
+    model_count: int = 0
+    listing_url: str = ""
+    listing_id: str = ""
+    listing_confirmed_at: datetime | None = None
+    listing_confirmed_by: int | None = None
+    source_revision: int = 1
+    assignee_id: int | None = None
+    assignee_name: str = ""
+    claimed_at: datetime | None = None
+    task_type: str = PROJECT_TASK_TYPE_NORMAL
 
 
 @dataclass(frozen=True)
@@ -363,6 +390,7 @@ class SplitGenerationItem:
     task_code: str
     attempt_id: int | None
     skipped: bool
+    pair_index: int = -1
 
 
 @dataclass(frozen=True)

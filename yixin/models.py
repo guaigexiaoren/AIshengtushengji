@@ -30,6 +30,7 @@ class StoredImage:
     height: int
     original_name: str
     source_path: Path | None = None
+    relative_path: str = ""
 
 
 @dataclass(frozen=True)

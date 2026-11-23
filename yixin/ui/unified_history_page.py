@@ -65,7 +65,7 @@ from ..time_utils import format_task_elapsed, utc_naive_to_local
 from ..worker import TaskWorker
 from ..paging import HistoryQuery, PageRequest, TaskQuery
 from .async_queries import get_query_runner
-from .components import FilterBar, PageActionBar, PageHeader
+from .components import FilterBar, PageActionBar
 from .date_filter import OptionalDateEdit
 from .image_preview import DualImagePreview
 from .pagination_bar import PaginationBar
@@ -182,12 +182,6 @@ class UnifiedHistoryPage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(14)
-        outer.addWidget(
-            PageHeader(
-                "历史记录",
-                "统一查看项目生成轮次和普通创作，并保存或重试结果。",
-            )
-        )
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         left = QFrame()
@@ -218,6 +212,7 @@ class UnifiedHistoryPage(QWidget):
         self.end_date = OptionalDateEdit("结束日期")
         reset = QPushButton("重置筛选")
         refresh = QPushButton("刷新")
+        refresh.setObjectName("SecondaryButton")
         filters.addWidget(self.project_filter, 1)
         filters.addWidget(self.product_search, 1)
         filters.addWidget(self.status_filter)

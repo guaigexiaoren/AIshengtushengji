@@ -50,6 +50,9 @@ class TaskQuery:
     statuses: tuple[str, ...] = ()
     start_date: date | None = None
     end_date: date | None = None
+    listing_status: str | None = None
+    task_type: str | None = None
+    is_urgent: bool | None = None
 
 
 @dataclass(frozen=True)

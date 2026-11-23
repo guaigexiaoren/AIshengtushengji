@@ -57,11 +57,13 @@ from ..collaboration.types import (
     PairingInput,
     ProjectDraft,
     PROJECT_SCOPE_LABELS,
+    PROJECT_TASK_TYPE_LABELS,
+    PROJECT_TASK_TYPES,
 )
 from ..storage import SUPPORTED_IMAGE_SUFFIXES, atomic_copy_file, image_metadata
 from .async_thumbnails import ThumbnailLoader, get_thumbnail_loader
 from .async_queries import get_query_runner
-from .components import PageActionBar, PageHeader
+from .components import PageActionBar
 from .widgets import load_scaled_pixmap, scan_image_inputs
 
 
@@ -77,6 +79,9 @@ class ProductDraftState:
     code_info: ProductCode | None = None
     garment_dir: Path | None = None
     model_dir: Path | None = None
+    task_type: str = "normal"
+    note: str = ""
+    is_urgent: bool = False
 
 
 class DroppableImageList(QListWidget):
@@ -233,6 +238,7 @@ class TaskCreatePage(QWidget):
         self._active_scan_request = -1
         self.states: dict[Path, ProductDraftState] = {}
         self.current_state: ProductDraftState | None = None
+        self._loading_state_fields = False
         self.account_directory: AccountDirectory | None = None
         self.accessible_projects: tuple[tuple[str, str], ...] = ()
         self.pairing_mode = PAIRING_ALL
@@ -259,36 +265,30 @@ class TaskCreatePage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(14)
-        header = QHBoxLayout()
-        page_header = PageHeader(
-            "任务提交",
-            "扫描共享盘货号，确认衣服与模特后创建任务。",
-        )
-        self.refresh_button = QPushButton("刷新扫描")
-        self.refresh_button.clicked.connect(self.refresh)
-        page_header.add_action(self.refresh_button)
-        header.addWidget(page_header)
-        outer.addLayout(header)
 
         path_card = QGroupBox("账号目录")
         path_layout = QVBoxLayout(path_card)
-        project_row = QHBoxLayout()
+        info_row = QHBoxLayout()
         self.project_combo = QComboBox()
+        self.project_combo.setMinimumWidth(180)
         self.project_combo.currentIndexChanged.connect(
             self._project_changed
         )
-        project_row.addWidget(QLabel("当前项目"))
-        project_row.addWidget(self.project_combo, 1)
-        path_layout.addLayout(project_row)
+        self.refresh_button = QPushButton("刷新")
+        self.refresh_button.setObjectName("SecondaryButton")
+        self.refresh_button.clicked.connect(self.refresh)
         self.account_path = QLineEdit()
         self.account_path.returnPressed.connect(self.refresh)
         choose_directory = QPushButton("选择目录")
         choose_directory.clicked.connect(self._choose_directory)
-        path_row = QHBoxLayout()
-        path_row.addWidget(QLabel("账号目录"))
-        path_row.addWidget(self.account_path, 1)
-        path_row.addWidget(choose_directory)
-        path_layout.addLayout(path_row)
+        info_row.addWidget(QLabel("当前项目"))
+        info_row.addWidget(self.project_combo, 1)
+        info_row.addSpacing(10)
+        info_row.addWidget(QLabel("账号目录"))
+        info_row.addWidget(self.account_path, 2)
+        info_row.addWidget(choose_directory)
+        info_row.addWidget(self.refresh_button)
+        path_layout.addLayout(info_row)
         self.date_hint = QLabel()
         self.date_hint.setStyleSheet("color:#60708a;")
         path_layout.addWidget(self.date_hint)
@@ -365,15 +365,29 @@ class TaskCreatePage(QWidget):
 
         action_bar = PageActionBar()
         footer = action_bar.layout
+        footer.addWidget(QLabel("类型"))
+        self.task_type_combo = QComboBox()
+        for value in PROJECT_TASK_TYPES:
+            self.task_type_combo.addItem(
+                PROJECT_TASK_TYPE_LABELS[value],
+                value,
+            )
+        footer.addWidget(self.task_type_combo)
+        footer.addSpacing(10)
         footer.addWidget(QLabel("备注"))
         self.note_edit = QLineEdit()
         self.note_edit.setPlaceholderText(
-            "选填，会应用到本次创建的任务"
+            "选填，会应用到当前选中的货号"
         )
         footer.addWidget(self.note_edit, 1)
         footer.addStretch(1)
         self.urgent_checkbox = QCheckBox("设为加急")
         footer.addWidget(self.urgent_checkbox)
+        self.task_type_combo.currentIndexChanged.connect(
+            self._store_state_fields
+        )
+        self.note_edit.textEdited.connect(self._store_state_fields)
+        self.urgent_checkbox.toggled.connect(self._store_state_fields)
         self.create_button = QPushButton("创建所选任务")
         self.create_button.setObjectName("PrimaryButton")
         self.create_button.setMinimumHeight(42)
@@ -685,8 +699,10 @@ class TaskCreatePage(QWidget):
         )
         if self.product_table.rowCount():
             self.product_table.selectRow(0)
+            self._product_selected()
         else:
             self.current_state = None
+            self._load_state_fields()
             self.detail_title.setText("当前日期没有符合结构的货号目录")
             self.garment_list.clear()
             self.model_list.clear()
@@ -829,9 +845,39 @@ class TaskCreatePage(QWidget):
         return Path(raw) if raw else None
 
     def _product_selected(self) -> None:
+        self._store_state_fields()
         key = self._selected_state_key()
         self.current_state = self.states.get(key) if key else None
+        self._load_state_fields()
         self._show_state()
+
+    def _load_state_fields(self) -> None:
+        state = self.current_state
+        self._loading_state_fields = True
+        try:
+            if state is None:
+                self.task_type_combo.setCurrentIndex(0)
+                self.note_edit.clear()
+                self.urgent_checkbox.setChecked(False)
+            else:
+                index = self.task_type_combo.findData(state.task_type)
+                self.task_type_combo.setCurrentIndex(max(0, index))
+                self.note_edit.setText(state.note)
+                self.urgent_checkbox.setChecked(state.is_urgent)
+        finally:
+            self._loading_state_fields = False
+
+    def _store_state_fields(self, *_args) -> None:
+        if getattr(self, "_loading_state_fields", False):
+            return
+        state = self.current_state
+        if state is None:
+            return
+        state.task_type = (
+            self.task_type_combo.currentData() or "normal"
+        )
+        state.note = self.note_edit.text().strip()
+        state.is_urgent = self.urgent_checkbox.isChecked()
 
     def _show_state(self) -> None:
         state = self.current_state
@@ -1084,11 +1130,14 @@ class TaskCreatePage(QWidget):
             )
             return
         project_scope, project_name = selected_project
-        is_urgent = self.urgent_checkbox.isChecked()
-        if is_urgent:
+        self._store_state_fields()
+        urgent_keys = [
+            key for key in keys if self.states[key].is_urgent
+        ]
+        if urgent_keys:
             new_urgent_count = sum(
                 1
-                for key in keys
+                for key in urgent_keys
                 if not (
                     self.states[key].existing_tasks
                     and self.states[key].existing_tasks[0].is_urgent
@@ -1140,25 +1189,10 @@ class TaskCreatePage(QWidget):
                     f"{state.product_code}：单个模特任务最多 13 张衣服图",
                 )
                 return
-            pairs: tuple = ()
-            if state.models:
-                result = self._current_pairs(state)
-                if result is None or result.errors:
-                    self.product_table.selectRow(self._row_for_key(key))
-                    QMessageBox.warning(
-                        self,
-                        "配对失败",
-                        f"{state.product_code}："
-                        + "；".join(
-                            result.errors if result else ["配对失败"]
-                        ),
-                    )
-                    return
-                pairs = result.pairs
-            validated.append((state, pairs))
+            validated.append((state, ()))
         created = 0
         try:
-            for state, pairs in validated:
+            for state, _pairs in validated:
                 assets = project_assets(
                     state.path,
                     state.garments,
@@ -1174,13 +1208,14 @@ class TaskCreatePage(QWidget):
                     ),
                     pairing_mode=self.pairing_mode,
                     assets=assets,
-                    pairs=pairs,
-                    note=self.note_edit.text().strip(),
+                    pairs=(),
+                    note=state.note.strip(),
                     source_date=account_directory.source_date,
                     product_code=state.product_code,
                     project_scope=project_scope,
                     access_project_name=project_name,
-                    is_urgent=is_urgent,
+                    is_urgent=state.is_urgent,
+                    task_type=state.task_type,
                 )
                 existing = state.existing_tasks[0] if state.existing_tasks else None
                 action = self._duplicate_action(existing) if existing else "new"
@@ -1229,9 +1264,12 @@ class TaskCreatePage(QWidget):
 
     def _duplicate_action(self, existing) -> str:
         tasks = self.repository.list_project_tasks(existing.id)
-        can_overwrite = all(
-            task.status == "available"
-            for task in tasks
+        can_overwrite = (
+            existing.status == "submitted"
+            and (
+                not tasks
+                or all(task.status == "available" for task in tasks)
+            )
         )
         box = QMessageBox(self)
         box.setWindowTitle("发现重复货号")

@@ -32,7 +32,7 @@ from .widgets import (
     scan_image_inputs,
 )
 from .async_thumbnails import get_thumbnail_loader
-from .components import PageActionBar, PageHeader
+from .components import PageActionBar
 
 
 def _drop_inputs(mime) -> list[Path]:
@@ -149,12 +149,6 @@ class LibraryPage(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(14)
-        root.addWidget(
-            PageHeader(
-                "作品库",
-                "管理本机保存的生成结果、参考图和可复用素材。",
-            )
-        )
         root.addWidget(splitter, 1)
 
         left = LibraryDropFrame()

@@ -26,6 +26,8 @@ from ..security import validate_api_key
 from ..time_utils import local_to_utc_naive
 from .api_keys import ApiKeyError, decrypt_api_key, encrypt_api_key
 from .auth import hash_password, validate_new_password, verify_password
+from .listing import extract_listing_id
+from .product_code import parse_product_code
 from .reports import (
     REPORT_DATE_COMPLETED,
     REPORT_DATE_CREATED,
@@ -45,6 +47,8 @@ from .types import (
     PROJECT_COMPLETED,
     PROJECT_IN_PROGRESS,
     PROJECT_SUBMITTED,
+    PROJECT_TASK_TYPE_NORMAL,
+    PROJECT_TASK_TYPES,
     ROLE_ADMIN,
     ROLE_AI,
     ROLE_OPERATIONS,
@@ -78,7 +82,7 @@ from .types import (
     ROLE_ALLOWED_MENUS,
 )
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 14
 LEGACY_SHARED_ROOT = (
     r"\\fe80--211-32ff-fe87-ba49.ipv6-literal.net\AI作图"
 )
@@ -265,6 +269,9 @@ class MySQLCentralRepository:
                     self._apply_schema_v9(cursor)
                     self._apply_schema_v10(cursor)
                     self._apply_schema_v11(cursor)
+                    self._apply_schema_v12(cursor)
+                    self._apply_schema_v13(cursor)
+                    self._apply_schema_v14(cursor)
                     self._apply_shared_root_update(cursor)
                     cursor.execute(
                         "INSERT IGNORE INTO schema_migrations(version, applied_at) "
@@ -545,13 +552,13 @@ class MySQLCentralRepository:
             cursor,
             "generation_results",
             "idx_generation_results_result_path",
-            "(relative_path)",
+            "(relative_path(255))",
         )
         _add_index_if_missing(
             cursor,
             "generation_results",
             "idx_generation_results_thumb_path",
-            "(thumbnail_relative_path)",
+            "(thumbnail_relative_path(255))",
         )
         cursor.execute(
             """
@@ -656,6 +663,47 @@ class MySQLCentralRepository:
             WHERE role = %s AND deleted_at IS NULL
             """,
             (ROLE_ADMIN,),
+        )
+
+    @staticmethod
+    def _apply_schema_v12(cursor) -> None:
+        project_columns = {
+            "listing_url": "VARCHAR(1024) NOT NULL DEFAULT ''",
+            "listing_id": "VARCHAR(200) NOT NULL DEFAULT ''",
+            "listing_confirmed_at": "DATETIME(6) NULL",
+            "listing_confirmed_by": "BIGINT UNSIGNED NULL",
+        }
+        for column, definition in project_columns.items():
+            _add_column_if_missing(cursor, "projects", column, definition)
+
+    @staticmethod
+    def _apply_schema_v13(cursor) -> None:
+        _add_column_if_missing(
+            cursor,
+            "projects",
+            "assignee_id",
+            "BIGINT UNSIGNED NULL",
+        )
+        _add_column_if_missing(
+            cursor,
+            "projects",
+            "claimed_at",
+            "DATETIME(6) NULL",
+        )
+        _add_index_if_missing(
+            cursor,
+            "projects",
+            "idx_projects_assignee_status",
+            "(assignee_id, status)",
+        )
+
+    @staticmethod
+    def _apply_schema_v14(cursor) -> None:
+        _add_column_if_missing(
+            cursor,
+            "projects",
+            "task_type",
+            "VARCHAR(24) NOT NULL DEFAULT 'normal'",
         )
 
     @staticmethod
@@ -1995,6 +2043,11 @@ class MySQLCentralRepository:
         )
         if draft.project_scope not in PROJECT_SCOPES:
             raise ValueError("项目类型不正确")
+        task_type = (
+            draft.task_type
+            if draft.task_type in PROJECT_TASK_TYPES
+            else PROJECT_TASK_TYPE_NORMAL
+        )
         try:
             with self.connection() as connection:
                 with connection.cursor() as cursor:
@@ -2055,10 +2108,10 @@ class MySQLCentralRepository:
                             pairing_mode, source_date, product_code,
                             project_scope, project_name, is_urgent,
                             urgent_date, urgent_by,
-                            source_revision, created_at, updated_at
+                            source_revision, task_type, created_at, updated_at
                         ) VALUES (
                             %s, %s, %s, 'normal', '', '', %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, 1, %s, %s
+                            %s, %s, %s, %s, %s, %s, %s, 1, %s, %s, %s
                         )
                         """,
                         (
@@ -2077,6 +2130,7 @@ class MySQLCentralRepository:
                             int(draft.is_urgent),
                             urgent_day if draft.is_urgent else None,
                             actor.id if draft.is_urgent else None,
+                            task_type,
                             now,
                             now,
                         ),
@@ -2131,6 +2185,13 @@ class MySQLCentralRepository:
                         draft.access_project_name.strip()
                         or draft.name.strip(),
                     )
+                if (
+                    project["status"] != PROJECT_SUBMITTED
+                    or project["assignee_id"] is not None
+                ):
+                    raise StateConflictError(
+                        "主任务已被领取或已开始处理，不能覆盖"
+                    )
                 cursor.execute(
                     """
                     SELECT COUNT(*) AS count FROM project_tasks
@@ -2156,6 +2217,7 @@ class MySQLCentralRepository:
                         source_date = %s, product_code = %s,
                         project_scope = %s, project_name = %s,
                         source_revision = source_revision + 1,
+                        task_type = %s,
                         status = %s, updated_at = %s
                     WHERE id = %s
                     """,
@@ -2178,6 +2240,11 @@ class MySQLCentralRepository:
                         draft.product_code or draft.name,
                         draft.project_scope,
                         draft.access_project_name.strip() or draft.name,
+                        (
+                            draft.task_type
+                            if draft.task_type in PROJECT_TASK_TYPES
+                            else PROJECT_TASK_TYPE_NORMAL
+                        ),
                         PROJECT_SUBMITTED,
                         now,
                         project_id,
@@ -2485,6 +2552,142 @@ class MySQLCentralRepository:
             page.page_size,
         )
 
+    def list_submission_projects_page(
+        self,
+        actor: AuthUser,
+        query: TaskQuery,
+        page: PageRequest,
+    ) -> PageResult[ProjectRecord]:
+        """提交记录页的主任务分页查询（不要求存在子任务）。"""
+        conditions: list[str] = []
+        params: list[Any] = []
+        if actor.role == ROLE_OPERATIONS:
+            conditions.append(
+                "(p.owner_id = %s OR EXISTS ("
+                "SELECT 1 FROM user_project_access upa "
+                "WHERE upa.user_id = %s "
+                "AND upa.project_scope = p.project_scope "
+                "AND upa.project_name = p.project_name))"
+            )
+            params.extend((actor.id, actor.id))
+        clean_statuses = tuple(
+            dict.fromkeys(str(value) for value in query.statuses)
+        )
+        if clean_statuses:
+            placeholders = ", ".join(["%s"] * len(clean_statuses))
+            conditions.append(f"p.status IN ({placeholders})")
+            params.extend(clean_statuses)
+        if query.listing_status == "listed":
+            conditions.append("p.listing_confirmed_at IS NOT NULL")
+        elif query.listing_status == "unlisted":
+            conditions.append("p.listing_confirmed_at IS NULL")
+        if query.task_type:
+            conditions.append("p.task_type = %s")
+            params.append(query.task_type)
+        keyword = query.keyword.strip()
+        if keyword:
+            pattern = f"%{keyword}%"
+            conditions.append(
+                "(p.project_code LIKE %s OR p.product_code LIKE %s "
+                "OR p.name LIKE %s OR p.note LIKE %s "
+                "OR owner.display_name LIKE %s)"
+            )
+            params.extend((pattern,) * 5)
+        if query.start_date is not None:
+            conditions.append("p.created_at >= %s")
+            params.append(
+                local_to_utc_naive(
+                    datetime.combine(query.start_date, time.min)
+                )
+            )
+        if query.end_date is not None:
+            conditions.append("p.created_at <= %s")
+            params.append(
+                local_to_utc_naive(
+                    datetime.combine(query.end_date, time.max)
+                )
+            )
+        where_sql = " AND ".join(conditions) if conditions else "1=1"
+        sort_fields = {
+            "project_code": "p.project_code",
+            "product_code": "p.product_code",
+            "owner_name": "owner.display_name",
+            "status": "p.status",
+            "task_type": "p.task_type",
+            "created_at": "p.created_at",
+            "completed_at": "p.completed_at",
+            "progress": "approved_count / GREATEST(task_count, 1)",
+            "is_urgent": "p.is_urgent",
+        }
+        sort_field = sort_fields.get(page.sort_field, "p.created_at")
+        direction = "ASC" if page.sort_direction == "asc" else "DESC"
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f"""
+                    SELECT COUNT(*) AS count
+                    FROM projects p
+                    JOIN users owner ON owner.id = p.owner_id
+                    WHERE {where_sql}
+                    """,
+                    tuple(params),
+                )
+                total = int(cursor.fetchone()["count"])
+                cursor.execute(
+                    f"""
+                    SELECT p.*, owner.display_name AS owner_name,
+                           COUNT(t.id) AS task_count,
+                           COALESCE(SUM(t.status = %s), 0)
+                               AS approved_count,
+                           COALESCE(SUM(t.status = %s), 0)
+                               AS awaiting_count,
+                           (
+                               SELECT GROUP_CONCAT(
+                                   DISTINCT assignee.display_name
+                                   ORDER BY assignee.display_name
+                               )
+                               FROM project_tasks t2
+                               LEFT JOIN users assignee
+                                 ON assignee.id = t2.assignee_id
+                               WHERE t2.project_id = p.id
+                                 AND t2.status <> %s
+                           ) AS assignee_names,
+                           (
+                               SELECT COUNT(*)
+                               FROM generation_results gr
+                               JOIN generation_attempts ga
+                                 ON ga.id = gr.attempt_id
+                               JOIN project_tasks t3
+                                 ON t3.id = ga.task_id
+                               WHERE t3.project_id = p.id
+                           ) AS result_count
+                    FROM projects p
+                    JOIN users owner ON owner.id = p.owner_id
+                    LEFT JOIN project_tasks t
+                      ON t.project_id = p.id AND t.status <> %s
+                    WHERE {where_sql}
+                    GROUP BY p.id, owner.display_name
+                    ORDER BY {sort_field} {direction}, p.id {direction}
+                    LIMIT %s OFFSET %s
+                    """,
+                    (
+                        TASK_APPROVED,
+                        TASK_AWAITING_ACCEPTANCE,
+                        TASK_EXPANDED,
+                        TASK_EXPANDED,
+                        *params,
+                        page.page_size,
+                        page.offset,
+                    ),
+                )
+                rows = cursor.fetchall()
+        return PageResult(
+            [_project_record(row) for row in rows],
+            total,
+            page.page,
+            page.page_size,
+        )
+
     def list_access_project_names(self, actor: AuthUser) -> list[str]:
         conditions = ["p.project_name <> ''"]
         params: list[Any] = []
@@ -2634,8 +2837,14 @@ class MySQLCentralRepository:
     ) -> dict[str, list[ProjectRecord]]:
         """一次查出该账号该日期的全部任务，再在内存里按货号归类。
 
-        兼容升级前保存的「基础货号 + 1 位尺码」旧记录。
+        两边都先按当前规则规范化（只保留到第二个分隔字母），
+        兼容升级前保存的完整货号旧记录。
         """
+
+        def normalize(value: str) -> str:
+            parsed = parse_product_code(value)
+            return parsed.base_code if parsed is not None else value.strip()
+
         codes = tuple(
             dict.fromkeys(str(code) for code in product_codes if code)
         )
@@ -2671,13 +2880,11 @@ class MySQLCentralRepository:
                 records = [
                     _project_record(row) for row in cursor.fetchall()
                 ]
+        normalized_codes = {code: normalize(code) for code in codes}
         for record in records:
-            stored = str(record.product_code or "")
+            stored = normalize(str(record.product_code or ""))
             for code in codes:
-                if stored == code or (
-                    stored.startswith(code)
-                    and len(stored) == len(code) + 1
-                ):
+                if stored == normalized_codes[code]:
                     grouped[code].append(record)
                     break
         return grouped
@@ -2692,6 +2899,35 @@ class MySQLCentralRepository:
                     (project_id,),
                 )
                 return [_project_task(row) for row in cursor.fetchall()]
+
+    def list_project_assets(
+        self,
+        project_id: int,
+    ) -> tuple[ProjectAssetInput, ...]:
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT role, relative_path, original_name,
+                           content_hash, mime, width, height
+                    FROM project_assets
+                    WHERE project_id = %s
+                    ORDER BY role, id
+                    """,
+                    (project_id,),
+                )
+                return tuple(
+                    ProjectAssetInput(
+                        role=row["role"],
+                        relative_path=row["relative_path"],
+                        original_name=row["original_name"],
+                        content_hash=row["content_hash"],
+                        mime=row["mime"],
+                        width=int(row["width"]),
+                        height=int(row["height"]),
+                    )
+                    for row in cursor.fetchall()
+                )
 
     def list_board_tasks(
         self,
@@ -2755,47 +2991,45 @@ class MySQLCentralRepository:
     ) -> list[ProjectRecord]:
         if actor.role not in (ROLE_AI, ROLE_ADMIN):
             raise PermissionDeniedError("当前角色不能查看待分配任务")
-        project_condition = ""
-        params: list[Any] = [
-            TASK_APPROVED,
-            TASK_AWAITING_ACCEPTANCE,
-            TASK_AVAILABLE,
-            PROJECT_COMPLETED,
-            PROJECT_CANCELLED,
-            TASK_EXPANDED,
-        ]
+        conditions = ["p.status = %s", "p.assignee_id IS NULL"]
+        params: list[Any] = [PROJECT_SUBMITTED]
         if project_name:
-            project_condition = " AND p.project_name = %s"
+            conditions.append("p.project_name = %s")
             params.append(project_name)
         params.append(limit)
+        where_sql = " AND ".join(conditions)
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
                     f"""
                     SELECT p.*, owner.display_name AS owner_name,
-                           COUNT(t.id) AS task_count,
-                           COALESCE(SUM(t.status = %s), 0)
-                               AS approved_count,
-                           COALESCE(SUM(t.status = %s), 0)
-                               AS awaiting_count,
-                           COALESCE(p.is_urgent, 0) AS urgent_count,
-                           COALESCE(SUM(
-                               t.status = %s
-                               AND t.assignee_id IS NULL
-                           ), 0) AS available_count
+                           (SELECT COUNT(*) FROM project_assets a
+                            WHERE a.project_id = p.id
+                              AND a.role = 'garment') AS garment_count,
+                           (SELECT COUNT(*) FROM project_assets a
+                            WHERE a.project_id = p.id
+                              AND a.role = 'model') AS model_count,
+                           (SELECT COUNT(*) FROM project_tasks t
+                            WHERE t.project_id = p.id
+                              AND t.status <> %s) AS task_count,
+                           (SELECT COUNT(*) FROM project_tasks t
+                            WHERE t.project_id = p.id
+                              AND t.status = %s) AS approved_count,
+                           (SELECT COUNT(*) FROM project_tasks t
+                            WHERE t.project_id = p.id
+                              AND t.status = %s) AS awaiting_count
                     FROM projects p
                     JOIN users owner ON owner.id = p.owner_id
-                    JOIN project_tasks t ON t.project_id = p.id
-                    WHERE p.status NOT IN (%s, %s)
-                      AND t.status <> %s
-                      {project_condition}
-                    GROUP BY p.id, owner.display_name
-                    HAVING task_count > 0
-                       AND available_count = task_count
-                    ORDER BY p.is_urgent DESC, p.source_date, p.id
+                    WHERE {where_sql}
+                    ORDER BY p.is_urgent DESC, p.created_at DESC, p.id DESC
                     LIMIT %s
                     """,
-                    tuple(params),
+                    (
+                        TASK_EXPANDED,
+                        TASK_APPROVED,
+                        TASK_AWAITING_ACCEPTANCE,
+                        *params,
+                    ),
                 )
                 return [
                     _project_record(row)
@@ -2812,31 +3046,15 @@ class MySQLCentralRepository:
             with connection.cursor() as cursor:
                 cursor.execute(
                     """
-                    SELECT matched.project_name,
-                           COUNT(*) AS project_count
-                    FROM (
-                        SELECT p.id, p.project_name
-                        FROM projects p
-                        JOIN project_tasks t ON t.project_id = p.id
-                        WHERE p.status NOT IN (%s, %s)
-                          AND p.project_name <> ''
-                          AND t.status <> %s
-                        GROUP BY p.id, p.project_name
-                        HAVING COUNT(*) > 0
-                           AND COUNT(*) = SUM(
-                               t.status = %s
-                               AND t.assignee_id IS NULL
-                           )
-                    ) matched
-                    GROUP BY matched.project_name
-                    ORDER BY matched.project_name
+                    SELECT p.project_name, COUNT(*) AS project_count
+                    FROM projects p
+                    WHERE p.status = %s
+                      AND p.assignee_id IS NULL
+                      AND p.project_name <> ''
+                    GROUP BY p.project_name
+                    ORDER BY p.project_name
                     """,
-                    (
-                        PROJECT_COMPLETED,
-                        PROJECT_CANCELLED,
-                        TASK_EXPANDED,
-                        TASK_AVAILABLE,
-                    ),
+                    (PROJECT_SUBMITTED,),
                 )
                 return [
                     (str(row["project_name"]), int(row["project_count"]))
@@ -2851,15 +3069,8 @@ class MySQLCentralRepository:
     ) -> PageResult[ProjectRecord]:
         if actor.role not in (ROLE_AI, ROLE_ADMIN):
             raise PermissionDeniedError("当前角色不能查看待分配任务")
-        conditions = [
-            "p.status NOT IN (%s, %s)",
-            "t.status <> %s",
-        ]
-        params: list[Any] = [
-            PROJECT_COMPLETED,
-            PROJECT_CANCELLED,
-            TASK_EXPANDED,
-        ]
+        conditions = ["p.status = %s", "p.assignee_id IS NULL"]
+        params: list[Any] = [PROJECT_SUBMITTED]
         if query.start_date is not None:
             conditions.append("p.created_at >= %s")
             params.append(
@@ -2877,6 +3088,10 @@ class MySQLCentralRepository:
         if query.project_name:
             conditions.append("p.project_name = %s")
             params.append(query.project_name)
+        if query.is_urgent is True:
+            conditions.append("p.is_urgent = 1")
+        elif query.is_urgent is False:
+            conditions.append("COALESCE(p.is_urgent, 0) = 0")
         keyword = query.keyword.strip()
         if keyword:
             pattern = f"%{keyword}%"
@@ -2891,47 +3106,52 @@ class MySQLCentralRepository:
         where_sql = " AND ".join(conditions)
         base = f"""
             SELECT p.*, owner.display_name AS owner_name,
-                   COUNT(t.id) AS task_count,
-                   COALESCE(SUM(t.status = %s), 0)
-                       AS approved_count,
-                   COALESCE(SUM(t.status = %s), 0)
-                       AS awaiting_count,
-                   COALESCE(p.is_urgent, 0) AS urgent_count,
-                   COALESCE(SUM(
-                       t.status = %s AND t.assignee_id IS NULL
-                   ), 0) AS available_count
+                   (SELECT COUNT(*) FROM project_assets a
+                    WHERE a.project_id = p.id
+                      AND a.role = 'garment') AS garment_count,
+                   (SELECT COUNT(*) FROM project_assets a
+                    WHERE a.project_id = p.id
+                      AND a.role = 'model') AS model_count,
+                   (SELECT COUNT(*) FROM project_tasks t
+                    WHERE t.project_id = p.id
+                      AND t.status <> %s) AS task_count,
+                   (SELECT COUNT(*) FROM project_tasks t
+                    WHERE t.project_id = p.id
+                      AND t.status = %s) AS approved_count,
+                   (SELECT COUNT(*) FROM project_tasks t
+                    WHERE t.project_id = p.id
+                      AND t.status = %s) AS awaiting_count
             FROM projects p
             JOIN users owner ON owner.id = p.owner_id
-            JOIN project_tasks t ON t.project_id = p.id
             WHERE {where_sql}
-            GROUP BY p.id, owner.display_name
-            HAVING task_count > 0
-               AND available_count = task_count
         """
         base_params = (
+            TASK_EXPANDED,
             TASK_APPROVED,
             TASK_AWAITING_ACCEPTANCE,
-            TASK_AVAILABLE,
             *params,
         )
         sort_fields = {
             "project_code": "p.project_code",
             "product_code": "p.product_code",
             "project_name": "p.project_name",
+            "garment_count": "garment_count",
+            "model_count": "model_count",
             "task_count": "task_count",
             "is_urgent": "p.is_urgent",
             "created_at": "p.created_at",
         }
         sort_field = sort_fields.get(
             page.sort_field,
-            "p.source_date",
+            "p.created_at",
         )
         direction = "ASC" if page.sort_direction == "asc" else "DESC"
         with self.connection() as connection:
             with connection.cursor() as cursor:
                 cursor.execute(
-                    f"SELECT COUNT(*) AS count FROM ({base}) matched",
-                    base_params,
+                    f"SELECT COUNT(*) AS count FROM projects p "
+                    f"WHERE {where_sql}",
+                    tuple(params),
                 )
                 total = int(cursor.fetchone()["count"])
                 cursor.execute(
@@ -2979,55 +3199,30 @@ class MySQLCentralRepository:
                     project = cursor.fetchone()
                     if project is None:
                         raise StateConflictError("主任务不存在")
-                    if project["status"] in (
-                        PROJECT_COMPLETED,
-                        PROJECT_CANCELLED,
+                    if (
+                        project["status"] != PROJECT_SUBMITTED
+                        or project["assignee_id"] is not None
                     ):
                         raise StateConflictError(
-                            f"{project['project_code']} 已结束，不能领取"
-                        )
-                    cursor.execute(
-                        """
-                        SELECT id, task_code, status, assignee_id
-                        FROM project_tasks
-                        WHERE project_id = %s AND status <> %s
-                        FOR UPDATE
-                        """,
-                        (project_id, TASK_EXPANDED),
-                    )
-                    tasks = cursor.fetchall()
-                    if not tasks:
-                        raise StateConflictError(
-                            f"{project['project_code']} 没有可领取子任务"
-                        )
-                    conflicts = [
-                        task for task in tasks
-                        if task["status"] != TASK_AVAILABLE
-                        or task["assignee_id"] is not None
-                    ]
-                    if conflicts:
-                        raise StateConflictError(
-                            f"{project['project_code']} 已有子任务被领取，"
-                            "本次整组领取已取消"
+                            f"{project['project_code']} 已被领取或已结束，"
+                            "不能领取"
                         )
                 for project_id in clean_ids:
                     cursor.execute(
                         """
-                        UPDATE project_tasks
-                        SET assignee_id = %s, status = %s,
-                            claimed_at = %s, updated_at = %s
-                        WHERE project_id = %s AND status = %s
+                        UPDATE projects
+                        SET assignee_id = %s, claimed_at = %s,
+                            status = %s, updated_at = %s
+                        WHERE id = %s
                         """,
                         (
                             actor.id,
-                            TASK_CLAIMED,
                             now,
+                            PROJECT_IN_PROGRESS,
                             now,
                             project_id,
-                            TASK_AVAILABLE,
                         ),
                     )
-                    self._update_project_status(cursor, project_id)
                     self._event(
                         cursor,
                         project_id,
@@ -3158,6 +3353,116 @@ class MySQLCentralRepository:
                         {},
                     )
                 self._update_project_status(cursor, project_id)
+                return len(candidates)
+
+    def skip_project(
+        self,
+        project_id: int,
+        actor: AuthUser,
+        reason: str = "",
+    ) -> int:
+        """把整个主任务标记为无需制作（包括尚未拆分的项目）。"""
+        if actor.role not in (ROLE_AI, ROLE_ADMIN):
+            raise PermissionDeniedError("当前角色不能标记主任务无需制作")
+        now = utc_now()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                project = self._project_row_for_update(
+                    cursor,
+                    project_id,
+                )
+                if (
+                    actor.role != ROLE_ADMIN
+                    and int(project["assignee_id"] or 0) != actor.id
+                ):
+                    raise PermissionDeniedError("该主任务不属于当前账号")
+                if project["status"] in (
+                    PROJECT_COMPLETED,
+                    PROJECT_CANCELLED,
+                    PROJECT_SKIPPED,
+                ):
+                    return 0
+                cursor.execute(
+                    """
+                    SELECT id, status, assignee_id
+                    FROM project_tasks
+                    WHERE project_id = %s
+                    ORDER BY task_no
+                    FOR UPDATE
+                    """,
+                    (project_id,),
+                )
+                candidates = [
+                    task
+                    for task in cursor.fetchall()
+                    if task["status"]
+                    in (
+                        TASK_AVAILABLE,
+                        TASK_CLAIMED,
+                        TASK_RETURNED,
+                    )
+                    and (
+                        actor.role == ROLE_ADMIN
+                        or int(task["assignee_id"] or 0) == actor.id
+                    )
+                ]
+                for task in candidates:
+                    cursor.execute(
+                        """
+                        UPDATE generation_attempts
+                        SET status = %s, error_code = 'cancelled',
+                            error_message = '主任务已标记无需制作',
+                            finished_at = %s
+                        WHERE task_id = %s AND status = %s
+                        """,
+                        (
+                            ATTEMPT_CANCELLED,
+                            now,
+                            int(task["id"]),
+                            ATTEMPT_QUEUED,
+                        ),
+                    )
+                    cursor.execute(
+                        """
+                        UPDATE project_tasks
+                        SET status = %s, final_quantity = 0,
+                            approved_at = %s, updated_at = %s
+                        WHERE id = %s
+                        """,
+                        (TASK_SKIPPED, now, now, int(task["id"])),
+                    )
+                    self._event(
+                        cursor,
+                        project_id,
+                        int(task["id"]),
+                        actor.id,
+                        "task_skipped",
+                        task["status"],
+                        TASK_SKIPPED,
+                        {},
+                    )
+                cursor.execute(
+                    """
+                    UPDATE projects
+                    SET status = %s, completed_at = COALESCE(completed_at, %s),
+                        updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (PROJECT_SKIPPED, now, now, project_id),
+                )
+                self._event(
+                    cursor,
+                    project_id,
+                    None,
+                    actor.id,
+                    "project_skipped",
+                    project["status"],
+                    PROJECT_SKIPPED,
+                    {
+                        "reason": reason,
+                        "skipped_task_count": len(candidates),
+                    },
+                )
                 return len(candidates)
 
     def cancel_queued_generation_attempt(
@@ -3476,6 +3781,115 @@ class MySQLCentralRepository:
             page.page_size,
         )
 
+    def list_ai_generation_projects_page(
+        self,
+        actor: AuthUser,
+        query: TaskQuery,
+        page: PageRequest,
+    ) -> PageResult[ProjectRecord]:
+        if actor.role not in (ROLE_AI, ROLE_ADMIN):
+            raise PermissionDeniedError("当前角色不能查看 AI 生图任务")
+        conditions = ["p.status IN (%s, %s)"]
+        params: list[Any] = [PROJECT_SUBMITTED, PROJECT_IN_PROGRESS]
+        if actor.role == ROLE_AI:
+            conditions.append("p.assignee_id = %s")
+            params.append(actor.id)
+        else:
+            conditions.append(
+                "(p.assignee_id = %s OR p.assignee_id IS NULL)"
+            )
+            params.append(actor.id)
+        if query.project_name:
+            conditions.append("p.project_name = %s")
+            params.append(query.project_name)
+        if query.start_date is not None:
+            conditions.append("p.created_at >= %s")
+            params.append(
+                local_to_utc_naive(
+                    datetime.combine(query.start_date, time.min)
+                )
+            )
+        if query.end_date is not None:
+            conditions.append("p.created_at <= %s")
+            params.append(
+                local_to_utc_naive(
+                    datetime.combine(query.end_date, time.max)
+                )
+            )
+        keyword = query.keyword.strip()
+        if keyword:
+            pattern = f"%{keyword}%"
+            conditions.append(
+                "(p.project_code LIKE %s OR p.product_code LIKE %s "
+                "OR p.name LIKE %s OR p.project_name LIKE %s "
+                "OR p.note LIKE %s)"
+            )
+            params.extend((pattern,) * 5)
+        where_sql = " AND ".join(conditions)
+        base = f"""
+            SELECT p.*, owner.display_name AS owner_name,
+                   COALESCE(assignee.display_name, '') AS assignee_name,
+                   (SELECT COUNT(*) FROM project_assets a
+                    WHERE a.project_id = p.id
+                      AND a.role = 'garment') AS garment_count,
+                   (SELECT COUNT(*) FROM project_assets a
+                    WHERE a.project_id = p.id
+                      AND a.role = 'model') AS model_count,
+                   (SELECT COUNT(*) FROM project_tasks t
+                    WHERE t.project_id = p.id
+                      AND t.status <> %s) AS task_count,
+                   (SELECT COUNT(*) FROM project_tasks t
+                    WHERE t.project_id = p.id
+                      AND t.status = %s) AS approved_count,
+                   (SELECT COUNT(*) FROM project_tasks t
+                    WHERE t.project_id = p.id
+                      AND t.status = %s) AS awaiting_count
+            FROM projects p
+            JOIN users owner ON owner.id = p.owner_id
+            LEFT JOIN users assignee ON assignee.id = p.assignee_id
+            WHERE {where_sql}
+        """
+        base_params = (
+            TASK_EXPANDED,
+            TASK_APPROVED,
+            TASK_AWAITING_ACCEPTANCE,
+            *params,
+        )
+        sort_fields = {
+            "project_code": "p.project_code",
+            "product_code": "p.product_code",
+            "status": "p.status",
+            "created_at": "p.created_at",
+            "is_urgent": "p.is_urgent",
+            "progress": "approved_count / GREATEST(task_count, 1)",
+        }
+        sort_field = sort_fields.get(page.sort_field, "p.created_at")
+        direction = "ASC" if page.sort_direction == "asc" else "DESC"
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT COUNT(*) AS count FROM projects p "
+                    f"WHERE {where_sql}",
+                    tuple(params),
+                )
+                total = int(cursor.fetchone()["count"])
+                cursor.execute(
+                    base
+                    + f"""
+                    ORDER BY p.is_urgent DESC, {sort_field} {direction},
+                             p.id {direction}
+                    LIMIT %s OFFSET %s
+                    """,
+                    (*base_params, page.page_size, page.offset),
+                )
+                rows = cursor.fetchall()
+        return PageResult(
+            [_project_record(row) for row in rows],
+            total,
+            page.page,
+            page.page_size,
+        )
+
     def split_and_queue_generations(
         self,
         source_task_id: int,
@@ -3568,7 +3982,7 @@ class MySQLCentralRepository:
                     if last_task is not None
                     else 1
                 )
-                for pair in clean_pairs:
+                for pair_index, pair in enumerate(clean_pairs):
                     prompt = pair.prompt_text.strip()
                     if not prompt and not pair.skipped:
                         raise ValueError("提示词不能为空")
@@ -3697,6 +4111,7 @@ class MySQLCentralRepository:
                             task_code=child_code,
                             attempt_id=attempt_id,
                             skipped=pair.skipped,
+                            pair_index=pair_index,
                         )
                     )
                 cursor.execute(
@@ -3726,6 +4141,331 @@ class MySQLCentralRepository:
                         ),
                     },
                 )
+        return results
+
+    def split_project_and_queue_generations(
+        self,
+        project_id: int,
+        actor: AuthUser,
+        *,
+        pairs: Sequence[GenerationPairSpec],
+    ) -> list[SplitGenerationItem]:
+        """按主任务的配对直接创建子任务并排队。"""
+        if actor.role not in (ROLE_AI, ROLE_ADMIN):
+            raise PermissionDeniedError("当前角色不能生成项目图片")
+        clean_pairs = tuple(pairs)
+        if not clean_pairs:
+            raise ValueError("至少需要一个配对任务")
+        now = utc_now()
+        results: list[SplitGenerationItem] = []
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    "SELECT * FROM projects WHERE id = %s FOR UPDATE",
+                    (project_id,),
+                )
+                project = cursor.fetchone()
+                if project is None:
+                    raise StateConflictError("主任务不存在")
+                if (
+                    actor.role != ROLE_ADMIN
+                    and int(project["assignee_id"] or 0) != actor.id
+                ):
+                    raise PermissionDeniedError("该主任务不属于当前账号")
+                if project["status"] in (
+                    PROJECT_COMPLETED,
+                    PROJECT_CANCELLED,
+                    PROJECT_SKIPPED,
+                ):
+                    raise StateConflictError("主任务已结束，不能继续生成")
+                if project["status"] not in (
+                    PROJECT_SUBMITTED,
+                    PROJECT_IN_PROGRESS,
+                ):
+                    raise StateConflictError("当前主任务不能生成")
+                if project["status"] == PROJECT_SUBMITTED:
+                    cursor.execute(
+                        """
+                        UPDATE projects
+                        SET assignee_id = %s, claimed_at = %s,
+                            status = %s, updated_at = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            actor.id,
+                            now,
+                            PROJECT_IN_PROGRESS,
+                            now,
+                            project_id,
+                        ),
+                    )
+                cursor.execute(
+                    """
+                    SELECT id, role, content_hash
+                    FROM project_assets
+                    WHERE project_id = %s
+                    """,
+                    (project_id,),
+                )
+                hash_to_garment: dict[str, int] = {}
+                hash_to_model: dict[str, int] = {}
+                fallback_garment_id = 0
+                fallback_model_id = 0
+                for row in cursor.fetchall():
+                    if row["role"] == "garment":
+                        hash_to_garment[str(row["content_hash"])] = int(
+                            row["id"]
+                        )
+                        fallback_garment_id = (
+                            fallback_garment_id or int(row["id"])
+                        )
+                    elif row["role"] == "model":
+                        hash_to_model[str(row["content_hash"])] = int(
+                            row["id"]
+                        )
+                        fallback_model_id = (
+                            fallback_model_id or int(row["id"])
+                        )
+                if not fallback_garment_id or not fallback_model_id:
+                    # 本机素材需要一条已登记的记录作为占位；
+                    # 两者都不存在说明项目素材已被清空，无法提交。
+                    raise StateConflictError(
+                        "主任务缺少服装图或模特图记录，请重新提交主任务"
+                    )
+                cursor.execute(
+                    """
+                    SELECT t.id, t.model_asset_id, tg.garment_asset_id
+                    FROM project_tasks t
+                    JOIN task_garments tg ON tg.task_id = t.id
+                    WHERE t.project_id = %s
+                      AND t.status NOT IN (%s, %s, %s)
+                    """,
+                    (
+                        project_id,
+                        TASK_APPROVED,
+                        TASK_SKIPPED,
+                        TASK_CANCELLED,
+                    ),
+                )
+                existing_assets: set[
+                    tuple[int, tuple[int, ...]]
+                ] = set()
+                current_task: int | None = None
+                current_model = 0
+                current_garments: list[int] = []
+                for row in cursor.fetchall():
+                    task_id = int(row["id"])
+                    if task_id != current_task:
+                        if current_task is not None:
+                            existing_assets.add(
+                                (
+                                    current_model,
+                                    tuple(sorted(current_garments)),
+                                )
+                            )
+                        current_task = task_id
+                        current_model = int(row["model_asset_id"] or 0)
+                        current_garments = []
+                    current_garments.append(
+                        int(row["garment_asset_id"])
+                    )
+                if current_task is not None:
+                    existing_assets.add(
+                        (current_model, tuple(sorted(current_garments)))
+                    )
+                cursor.execute(
+                    """
+                    SELECT task_no FROM project_tasks
+                    WHERE project_id = %s
+                    ORDER BY task_no DESC
+                    LIMIT 1
+                    FOR UPDATE
+                    """,
+                    (project_id,),
+                )
+                last_task = cursor.fetchone()
+                next_task_no = (
+                    int(last_task["task_no"]) + 1
+                    if last_task is not None
+                    else 1
+                )
+                source_revision = int(
+                    project["source_revision"] or 1
+                )
+                submitted_keys: set[
+                    tuple[tuple[str, ...], str]
+                ] = set()
+                for pair_index, pair in enumerate(clean_pairs):
+                    prompt = pair.prompt_text.strip()
+                    if not prompt and not pair.skipped:
+                        raise ValueError("提示词不能为空")
+                    if pair.model not in MODEL_IDS:
+                        raise ValueError("不支持的模型")
+                    if not 1 <= pair.n <= 4:
+                        raise ValueError("每次生成数量必须在 1 到 4 之间")
+                    if pair.unit_price < 0:
+                        raise ValueError("模型单价不能为负数")
+                    if not 1 <= len(pair.garment_hashes) <= 13:
+                        raise ValueError("每个配对必须包含 1 到 13 件衣服")
+                    # 本机裁剪/新增的图片不会登记到 project_assets，
+                    # 这里允许它们存在，数据库列回退到已登记的素材。
+                    matched_assets = tuple(
+                        dict.fromkeys(
+                            hash_to_garment[content_hash]
+                            for content_hash in pair.garment_hashes
+                            if content_hash in hash_to_garment
+                        )
+                    )
+                    selected_assets = matched_assets or (
+                        fallback_garment_id,
+                    )
+                    model_asset_id = int(
+                        hash_to_model.get(
+                            pair.person_hash,
+                            fallback_model_id,
+                        )
+                    )
+                    all_registered = (
+                        pair.person_hash in hash_to_model
+                        and all(
+                            content_hash in hash_to_garment
+                            for content_hash in pair.garment_hashes
+                        )
+                    )
+                    if all_registered and (
+                        model_asset_id,
+                        tuple(sorted(selected_assets)),
+                    ) in existing_assets:
+                        continue
+                    pair_key = (
+                        tuple(pair.garment_hashes),
+                        pair.person_hash,
+                    )
+                    if pair_key in submitted_keys:
+                        continue
+                    submitted_keys.add(pair_key)
+                    task_no = next_task_no
+                    next_task_no += 1
+                    child_code = (
+                        f"{project['project_code']}-{task_no:02d}"
+                    )
+                    child_status = (
+                        TASK_SKIPPED if pair.skipped else TASK_CLAIMED
+                    )
+                    cursor.execute(
+                        """
+                        INSERT INTO project_tasks(
+                            task_code, project_id, task_no,
+                            garment_asset_id, model_asset_id, status,
+                            assignee_id, prompt_text, model,
+                            aspect_ratio, resolution, n, final_quantity,
+                            source_revision, parent_task_id,
+                            created_at, updated_at, claimed_at,
+                            approved_at
+                        ) VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, 0, %s, NULL, %s, %s, %s, %s
+                        )
+                        """,
+                        (
+                            child_code,
+                            project_id,
+                            task_no,
+                            selected_assets[0],
+                            model_asset_id,
+                            child_status,
+                            actor.id,
+                            prompt,
+                            pair.model,
+                            pair.aspect_ratio,
+                            pair.resolution,
+                            pair.n,
+                            source_revision,
+                            now,
+                            now,
+                            now,
+                            now if pair.skipped else None,
+                        ),
+                    )
+                    child_task_id = int(cursor.lastrowid)
+                    for position, garment_asset_id in enumerate(
+                        selected_assets,
+                        start=1,
+                    ):
+                        cursor.execute(
+                            """
+                            INSERT INTO task_garments(
+                                task_id, garment_asset_id, position
+                            ) VALUES (%s, %s, %s)
+                            """,
+                            (
+                                child_task_id,
+                                garment_asset_id,
+                                position,
+                            ),
+                        )
+                    attempt_id: int | None = None
+                    if not pair.skipped:
+                        attempt_id = self._insert_attempt(
+                            cursor,
+                            task_id=child_task_id,
+                            attempt_no=1,
+                            operator_id=actor.id,
+                            model=pair.model,
+                            prompt_text=prompt,
+                            aspect_ratio=pair.aspect_ratio,
+                            resolution=pair.resolution,
+                            n=pair.n,
+                            status=ATTEMPT_QUEUED,
+                            source_revision=source_revision,
+                            unit_price=pair.unit_price,
+                            created_at=now,
+                            requested_provider_code=(
+                                pair.requested_provider_code
+                            ),
+                            requested_provider_name=(
+                                pair.requested_provider_name
+                            ),
+                        )
+                        self._event(
+                            cursor,
+                            project_id,
+                            child_task_id,
+                            actor.id,
+                            "generation_queued",
+                            TASK_CLAIMED,
+                            TASK_CLAIMED,
+                            {
+                                "attempt_id": attempt_id,
+                                "project_id": project_id,
+                            },
+                        )
+                    results.append(
+                        SplitGenerationItem(
+                            task_id=child_task_id,
+                            task_code=child_code,
+                            attempt_id=attempt_id,
+                            skipped=pair.skipped,
+                            pair_index=pair_index,
+                        )
+                    )
+                self._update_project_status(cursor, project_id)
+                if results:
+                    self._event(
+                        cursor,
+                        project_id,
+                        None,
+                        actor.id,
+                        "project_split",
+                        project["status"],
+                        PROJECT_IN_PROGRESS,
+                        {
+                            "child_count": len(results),
+                            "skipped_count": sum(
+                                item.skipped for item in results
+                            ),
+                        },
+                    )
         return results
 
     def claim_task(self, task_id: int, actor: AuthUser) -> ProjectTask:
@@ -3863,6 +4603,50 @@ class MySQLCentralRepository:
                         "urgent_date": today.isoformat() if urgent else "",
                     },
                 )
+
+    def confirm_project_listing(
+        self,
+        project_id: int,
+        actor: AuthUser,
+        listing_url: str,
+    ) -> str:
+        """确认主任务已上架，记录完整链接和从中识别出的链接 ID。"""
+        url = (listing_url or "").strip()
+        if not url:
+            raise ValueError("请填写上架链接")
+        listing_id = extract_listing_id(url)
+        now = utc_now()
+        with self.connection() as connection:
+            with connection.cursor() as cursor:
+                project = self._project_row_for_update(cursor, project_id)
+                if (
+                    actor.role != ROLE_ADMIN
+                    and int(project["owner_id"]) != actor.id
+                ):
+                    raise PermissionDeniedError("只能确认自己提交的任务上架")
+                if project["status"] != PROJECT_COMPLETED:
+                    raise StateConflictError("主任务完成后才能确认上架")
+                cursor.execute(
+                    """
+                    UPDATE projects
+                    SET listing_url = %s, listing_id = %s,
+                        listing_confirmed_at = %s,
+                        listing_confirmed_by = %s, updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (url, listing_id, now, actor.id, now, project_id),
+                )
+                self._event(
+                    cursor,
+                    project_id,
+                    None,
+                    actor.id,
+                    "project_listing_confirmed",
+                    project["status"],
+                    project["status"],
+                    {"listing_url": url, "listing_id": listing_id},
+                )
+        return listing_id
 
     def remaining_urgent_quota(self, actor: AuthUser, day: date) -> int:
         with self.connection() as connection:
@@ -6738,7 +7522,8 @@ class MySQLCentralRepository:
                 raise ValueError("没有模特图时不能包含制作任务")
             return
         if not draft.pairs:
-            raise ValueError("项目至少需要一个制作任务")
+            # 新模型：提交时只保存素材，配对在 AI 生图时再拆分子任务。
+            return
         seen: set[PairingInput] = set()
         garments_by_model: dict[int, set[int]] = {}
         for pair in draft.pairs:
@@ -7056,13 +7841,26 @@ class MySQLCentralRepository:
         )
         counts = {row["status"]: int(row["count"]) for row in cursor.fetchall()}
         total = sum(counts.values())
+        cursor.execute(
+            "SELECT status FROM projects WHERE id = %s",
+            (project_id,),
+        )
+        current = cursor.fetchone()
+        current_status = (
+            current["status"] if current is not None else PROJECT_SUBMITTED
+        )
         if not total:
-            status = PROJECT_SUBMITTED
+            # 还没有拆出任何子任务时，不覆盖项目级状态。
+            status = current_status
         elif (
             counts.get(TASK_APPROVED, 0) + counts.get(TASK_SKIPPED, 0)
             == total
         ):
-            status = PROJECT_COMPLETED
+            status = (
+                PROJECT_SKIPPED
+                if current_status == PROJECT_SKIPPED
+                else PROJECT_COMPLETED
+            )
         else:
             status = PROJECT_IN_PROGRESS
         now = utc_now()
@@ -7070,7 +7868,10 @@ class MySQLCentralRepository:
             """
             UPDATE projects
             SET status = %s, updated_at = %s,
-                completed_at = CASE WHEN %s = %s THEN COALESCE(completed_at, %s) ELSE NULL END
+                completed_at = CASE
+                    WHEN %s IN (%s, %s) THEN COALESCE(completed_at, %s)
+                    ELSE NULL
+                END
             WHERE id = %s
             """,
             (
@@ -7078,6 +7879,7 @@ class MySQLCentralRepository:
                 now,
                 status,
                 PROJECT_COMPLETED,
+                PROJECT_SKIPPED,
                 now,
                 project_id,
             ),
@@ -7270,6 +8072,28 @@ def _project_record(row: dict[str, Any]) -> ProjectRecord:
         is_urgent=bool(row.get("is_urgent")),
         urgent_date=row.get("urgent_date"),
         urgent_by=int(row["urgent_by"]) if row.get("urgent_by") else None,
+        completed_at=row.get("completed_at"),
+        assignee_names=row.get("assignee_names") or "",
+        result_count=int(row.get("result_count") or 0),
+        garment_count=int(row.get("garment_count") or 0),
+        model_count=int(row.get("model_count") or 0),
+        listing_url=row.get("listing_url") or "",
+        listing_id=row.get("listing_id") or "",
+        listing_confirmed_at=row.get("listing_confirmed_at"),
+        listing_confirmed_by=(
+            int(row["listing_confirmed_by"])
+            if row.get("listing_confirmed_by")
+            else None
+        ),
+        source_revision=int(row.get("source_revision") or 1),
+        assignee_id=(
+            int(row["assignee_id"])
+            if row.get("assignee_id")
+            else None
+        ),
+        assignee_name=row.get("assignee_name") or "",
+        claimed_at=row.get("claimed_at"),
+        task_type=row.get("task_type") or PROJECT_TASK_TYPE_NORMAL,
     )
 
 

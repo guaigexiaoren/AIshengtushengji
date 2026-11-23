@@ -164,7 +164,7 @@ class AsyncThumbnailTests(unittest.TestCase):
             self.assertTrue(loaded)
             self.assertEqual(
                 page.product_table.item(0, 2).text(),
-                "DV263q25445p8072",
+                "DV263q25445p",
             )
             thumbnails_loaded = False
             for _ in range(150):

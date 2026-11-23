@@ -29,7 +29,7 @@ from yixin.constants import (
 from yixin.collaboration.shared_paths import SharedPathResolver
 from yixin.database import Database
 from yixin.library import LibraryService
-from yixin.models import ImageRequest
+from yixin.models import ImageRequest, StoredImage
 from yixin.paths import AppPaths
 from yixin.security import SecretStore
 from yixin.settings import INPUT_BATCH_GARMENT, INPUT_BATCH_PERSON, AppSettings
@@ -40,6 +40,8 @@ from yixin.ui.batch_dress_page import (
     DressTaskGroup,
     PAIR_CARD_GAP,
     PAIR_CARD_MIN_WIDTH,
+    auto_match_groups,
+    garment_group_key,
     scan_image_inputs,
 )
 from yixin.ui.main_window import MainWindow
@@ -462,6 +464,108 @@ class BatchDressTests(unittest.TestCase):
         for group in self.page.pairs:
             self.assertLessEqual(len(group.references), 14)
             self.assertEqual(group.roles[-1], "person")
+
+    def test_auto_match_groups_garments_by_color_and_pairs_every_person(
+        self,
+    ) -> None:
+        names = (
+            "白色1.png",
+            "白色2.png",
+            "黑色1.png",
+            "黑色2.png",
+            "粉色1.png",
+            "粉色2.png",
+        )
+        garments = [
+            self._image(name, (20 + index * 20, 50, 80))
+            for index, name in enumerate(names)
+        ]
+        people = [
+            self._image(f"颜色人物{index}.png", (100, 30 + index * 20, 20))
+            for index in range(2)
+        ]
+        self.page._append_assets("garment", garments)
+        self.page._append_assets("person", people)
+        self.page._auto_match()
+        self.assertEqual(len(self.page.pairs), 6)
+        for group in self.page.pairs:
+            self.assertEqual(group.kind, "auto")
+            self.assertEqual(group.garment_count, 2)
+            self.assertEqual(group.references[-1].content_hash,
+                             group.person.content_hash)
+            garment_names = [
+                image.original_name
+                for role, image in zip(group.roles, group.references)
+                if role == "garment"
+            ]
+            self.assertEqual(garment_names[0][:2], garment_names[1][:2])
+        person_hashes = [group.person.content_hash for group in self.page.pairs]
+        for person in self.page.person_assets:
+            self.assertEqual(person_hashes.count(person.content_hash), 3)
+
+    def test_auto_match_one_to_one_pairs_every_garment_with_every_person(
+        self,
+    ) -> None:
+        garments = [
+            self._image(f"逐件服装{index}.png", (30 + index * 20, 60, 90))
+            for index in range(3)
+        ]
+        people = [
+            self._image(f"逐件人物{index}.png", (100, 40 + index * 10, 20))
+            for index in range(2)
+        ]
+        self.page._append_assets("garment", garments)
+        self.page._append_assets("person", people)
+        self.page._auto_match_one_to_one()
+        self.assertEqual(len(self.page.pairs), 6)
+        for group in self.page.pairs:
+            self.assertEqual(group.garment_count, 1)
+            self.assertEqual(group.roles, ("garment", "person"))
+        self.assertIn(
+            "自动匹配（多服装→单人）",
+            self.page.auto_match_button.text(),
+        )
+        self.assertIn(
+            "自动匹配（单服装→单人）",
+            self.page.auto_match_one_button.text(),
+        )
+
+    def test_manual_pair_can_group_multiple_selected_garments(self) -> None:
+        garments = [
+            self._image(f"手动服装{index}.png", (40 + index * 20, 60, 90))
+            for index in range(2)
+        ]
+        person = self._image("手动人物.png", (100, 40, 20))
+        self.page._append_assets("garment", garments)
+        self.page._append_assets("person", [person])
+        self.page.garment_list.selectAll()
+        self.page._person_clicked(self.page.person_list.item(0))
+        self.assertEqual(len(self.page.pairs), 1)
+        self.assertEqual(self.page.pairs[0].garment_count, 2)
+
+    def test_auto_match_reads_color_from_relative_path(self) -> None:
+        def stored(name: str, relative_path: str = "") -> StoredImage:
+            return StoredImage(
+                path=Path(name),
+                content_hash=name,
+                mime="image/png",
+                width=10,
+                height=10,
+                original_name=name,
+                relative_path=relative_path,
+            )
+
+        white = stored("1.png", "衣服图/白色/1.png")
+        black = stored("2.png", "衣服图/黑色/2.png")
+        person = stored("人物.png")
+        self.assertEqual(garment_group_key(white), "白色")
+        self.assertEqual(garment_group_key(black), "黑色")
+        groups = auto_match_groups((white, black), person)
+        self.assertEqual(len(groups), 2)
+        self.assertEqual(
+            [group.garment_count for group in groups],
+            [1, 1],
+        )
 
     def test_auto_groups_update_on_crop_and_remove_with_garment(self) -> None:
         garments = [

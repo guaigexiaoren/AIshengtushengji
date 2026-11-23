@@ -59,7 +59,7 @@ from ..constants import (
 from ..security import validate_api_key
 from ..time_utils import utc_naive_to_local
 from .async_queries import get_query_runner
-from .components import PageActionBar, PageHeader
+from .components import PageActionBar
 
 
 class UserPermissionOptions(QWidget):
@@ -603,12 +603,6 @@ class AdminPage(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(14)
-        layout.addWidget(
-            PageHeader(
-                "管理控制台",
-                "账号、API 平台、共享设置和任务异常。",
-            )
-        )
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_users_tab(), "用户与权限")
         self.tabs.addTab(self._build_api_platforms_tab(), "API 平台")
@@ -652,6 +646,7 @@ class AdminPage(QWidget):
             self._sync_operation_accounts
         )
         refresh_button = QPushButton("刷新")
+        refresh_button.setObjectName("SecondaryButton")
         refresh_button.clicked.connect(self._refresh_users)
         toolbar.addStretch(1)
         toolbar.addWidget(refresh_button)
@@ -714,6 +709,7 @@ class AdminPage(QWidget):
         toolbar = QHBoxLayout()
         edit = QPushButton("编辑所选平台")
         refresh = QPushButton("刷新")
+        refresh.setObjectName("SecondaryButton")
         edit.clicked.connect(self._edit_api_provider)
         refresh.clicked.connect(self._refresh_api_platforms)
         toolbar.addStretch(1)
@@ -858,6 +854,7 @@ class AdminPage(QWidget):
         cancel = QPushButton("取消所选任务")
         reopen = QPushButton("重开所选任务")
         refresh = QPushButton("刷新")
+        refresh.setObjectName("SecondaryButton")
         reassign.clicked.connect(self._reassign_task)
         cancel.clicked.connect(self._admin_cancel_project)
         reopen.clicked.connect(self._reopen_project)

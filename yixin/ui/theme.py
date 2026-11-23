@@ -161,6 +161,18 @@ QPushButton#PrimaryButton {
 QPushButton#PrimaryButton:hover {
     background: #4266d5;
 }
+QPushButton#SecondaryButton {
+    background: #dce8ff;
+    color: #245ab8;
+    border: 1px solid #b8cdf5;
+    font-weight: 600;
+}
+QPushButton#SecondaryButton:hover {
+    background: #cfdefc;
+}
+QPushButton#SecondaryButton:pressed {
+    background: #c2d5f8;
+}
 QPushButton#DangerButton {
     color: #b72f3c;
     border-color: #e9b6bb;

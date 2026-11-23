@@ -5,10 +5,10 @@ from dataclasses import dataclass
 
 
 # 内部项目货号：品牌 2 位 + 年份 2 位 + 季节 1 位 + 分隔字母 + 流水号 +
-# 分隔字母 + 品类 2 位 + 颜色 2 位 + 可选尺码 1 位，
-# 例如 DV263q25445p80723 或去掉尺码的 DV263q25445p8072。
-# 系统里统一只保留到「品类+颜色」，尺码位有或没有都识别为同一货号；
-# 货号后面追加的字符（如 -备注、_1）不参与识别，一律忽略。
+# 分隔字母（截止点），例如 DV263q25445p。
+# 系统只识别到第二个分隔字母为止，后面的品类、颜色、尺码和备注等字符
+# 一律忽略；所以 DV263q25445p80723 与 DV263q25445p8072、DV263q25445p
+# 都识别为同一货号 DV263q25445p。
 PRODUCT_CODE_PATTERN = re.compile(
     r"^(?P<brand>[A-Za-z]{2})"
     r"(?P<year>\d{2})"
@@ -16,10 +16,9 @@ PRODUCT_CODE_PATTERN = re.compile(
     r"(?P<serial_sep>[A-Za-z])"
     r"(?P<serial>\d+)"
     r"(?P<color_sep>[A-Za-z])"
-    r"(?P<tail>\d{4,5})"
 )
 
-PRODUCT_CODE_EXAMPLE = "DV263q25445p80723"
+PRODUCT_CODE_EXAMPLE = "DV263q25445p"
 
 
 @dataclass(frozen=True)
@@ -30,14 +29,13 @@ class ProductCode:
     serial_sep: str
     serial: str
     color_sep: str
-    style_color: str
 
     @property
     def base_code(self) -> str:
         return (
             f"{self.brand}{self.year}{self.season}"
             f"{self.serial_sep}{self.serial}"
-            f"{self.color_sep}{self.style_color}"
+            f"{self.color_sep}"
         )
 
 
@@ -53,5 +51,4 @@ def parse_product_code(value: str) -> ProductCode | None:
         serial_sep=matched.group("serial_sep"),
         serial=matched.group("serial"),
         color_sep=matched.group("color_sep"),
-        style_color=matched.group("tail")[:4],
     )

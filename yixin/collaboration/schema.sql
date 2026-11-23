@@ -49,15 +49,25 @@ CREATE TABLE IF NOT EXISTS projects (
     urgent_date DATE NULL,
     urgent_by BIGINT UNSIGNED NULL,
     source_revision INT NOT NULL DEFAULT 1,
+    assignee_id BIGINT UNSIGNED NULL,
+    claimed_at DATETIME(6) NULL,
+    task_type VARCHAR(24) NOT NULL DEFAULT 'normal',
     created_at DATETIME(6) NOT NULL,
     updated_at DATETIME(6) NOT NULL,
     completed_at DATETIME(6) NULL,
     cancelled_at DATETIME(6) NULL,
+    listing_url VARCHAR(1024) NOT NULL DEFAULT '',
+    listing_id VARCHAR(200) NOT NULL DEFAULT '',
+    listing_confirmed_at DATETIME(6) NULL,
+    listing_confirmed_by BIGINT UNSIGNED NULL,
     CONSTRAINT fk_projects_owner FOREIGN KEY (owner_id) REFERENCES users(id),
     CONSTRAINT fk_projects_urgent_by FOREIGN KEY (urgent_by)
         REFERENCES users(id),
+    CONSTRAINT fk_projects_assignee FOREIGN KEY (assignee_id)
+        REFERENCES users(id),
     INDEX idx_projects_status_deadline (status, deadline),
     INDEX idx_projects_owner_created (owner_id, created_at),
+    INDEX idx_projects_assignee_status (assignee_id, status),
     INDEX idx_projects_scope_name_date (
         project_scope, project_name, source_date, id
     ),
@@ -317,8 +327,8 @@ CREATE TABLE IF NOT EXISTS generation_results (
     UNIQUE KEY uk_generation_result_index (attempt_id, result_index),
     INDEX idx_generation_results_final (attempt_id, is_final),
     INDEX idx_generation_results_expire (is_final, expire_at),
-    INDEX idx_generation_results_result_path (relative_path),
-    INDEX idx_generation_results_thumb_path (thumbnail_relative_path)
+    INDEX idx_generation_results_result_path (relative_path(255)),
+    INDEX idx_generation_results_thumb_path (thumbnail_relative_path(255))
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE IF NOT EXISTS task_reviews (

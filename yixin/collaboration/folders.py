@@ -213,7 +213,8 @@ def _mark_duplicate_codes(
                 product,
                 errors=(
                     *product.errors,
-                    f"多个目录对应同一货号（{names}），请只保留一个",
+                    f"多个目录对应同一货号（{names}），"
+                    "系统只识别到第二个分隔字母，请只保留一个",
                 ),
             )
     return products

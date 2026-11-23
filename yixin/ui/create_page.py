@@ -64,7 +64,7 @@ from ..time_utils import format_task_elapsed
 from ..worker import TaskWorker
 from .dialogs import CompareDialog, LibraryPickerDialog, TemplateManagerDialog
 from .crop import CropDialog
-from .components import PageActionBar, PageHeader
+from .components import PageActionBar
 from .save_helpers import LocalSaveController, show_saved_path, show_saved_toast
 from .widgets import (
     CompareWidget,
@@ -167,17 +167,6 @@ class CreatePage(QWidget):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 4, 4)
         layout.setSpacing(12)
-
-        header = QFrame()
-        header.setObjectName("Card")
-        header_layout = QVBoxLayout(header)
-        header_layout.addWidget(
-            PageHeader(
-                "普通创作",
-                "选择模型和提示词，生成结果会自动加入串行队列。",
-            )
-        )
-        layout.addWidget(header)
 
         settings_card = QGroupBox("生成设置")
         settings_card.setObjectName("Card")
@@ -328,6 +317,7 @@ class CreatePage(QWidget):
         self.queue_hint = QLabel("串行执行；失败不会自动重试，避免重复扣费。")
         self.queue_hint.setStyleSheet("color:#6d7a91;")
         refresh = QPushButton("刷新")
+        refresh.setObjectName("SecondaryButton")
         self.cancel_button = QPushButton("取消任务")
         top.addWidget(self.queue_hint, 1)
         top.addWidget(refresh)

@@ -8,11 +8,13 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QSpinBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -31,6 +33,7 @@ from ..collaboration.repository import MySQLCentralRepository
 from ..collaboration.shared_paths import SharedPathResolver
 from ..collaboration.types import (
     ATTEMPT_SUCCEEDED,
+    PROJECT_STATUS_LABELS,
     ROLE_ADMIN,
     TASK_AWAITING_ACCEPTANCE,
     TASK_APPROVED,
@@ -43,13 +46,21 @@ from ..collaboration.types import (
     AuthUser,
     GenerationAttempt,
     GenerationPairSpec,
+    ProjectRecord,
     ProjectTask,
 )
 from ..collaboration.worker import ProjectGenerationWorker
 from ..constants import (
+    ASPECT_RATIOS,
     AUTO_MODEL_ID,
     BUILTIN_PROMPT_TEMPLATES,
+    DEFAULT_ASPECT_RATIO,
+    DEFAULT_BATCH_SIZE,
+    DEFAULT_MODEL,
+    DEFAULT_RESOLUTION,
     MODEL_LABELS,
+    MODEL_SELECTION_OPTIONS,
+    RESOLUTIONS,
 )
 from ..database import Database
 from ..library import LibraryService
@@ -65,7 +76,6 @@ from .batch_dress_page import (
     auto_match_groups,
 )
 from .async_queries import get_query_runner
-from .components import PageHeader
 
 
 class AIGenerationPage(BatchDressPage):
@@ -95,7 +105,10 @@ class AIGenerationPage(BatchDressPage):
         self.key_store = key_store
         self.generation_tasks: list[ProjectTask] = []
         self._generation_tasks_by_id: dict[int, ProjectTask] = {}
+        self.generation_projects: list[ProjectRecord] = []
+        self._generation_projects_by_id: dict[int, ProjectRecord] = {}
         self.current_task: ProjectTask | None = None
+        self.current_project: ProjectRecord | None = None
         self.local_store: LocalTaskSourceStore | None = None
         self.active_workers: set[ProjectGenerationWorker] = set()
         self.waiting_jobs: deque[dict] = deque()
@@ -130,19 +143,6 @@ class AIGenerationPage(BatchDressPage):
         self.count_spin.setValue(1)
         self.count_spin.hide()
         self.count_label.hide()
-        self.project_batch_button = QPushButton("整单提交")
-        self.project_batch_button.setMinimumHeight(42)
-        self.project_batch_button.setToolTip(
-            "以当前提示词和参数提交同主任务下所有待制作子任务"
-        )
-        self.project_batch_button.setEnabled(False)
-        self.project_batch_button.clicked.connect(
-            self._enqueue_project_all
-        )
-        self.skip_task_button = QPushButton("当前子任务不做图")
-        self.skip_task_button.setMinimumHeight(42)
-        self.skip_task_button.setEnabled(False)
-        self.skip_task_button.clicked.connect(self._skip_current_task)
         self.skip_project_button = QPushButton("本主任务不做图")
         self.skip_project_button.setMinimumHeight(42)
         self.skip_project_button.setEnabled(False)
@@ -150,11 +150,15 @@ class AIGenerationPage(BatchDressPage):
             self._skip_project_tasks
         )
         action_bar = self.generate_button.parentWidget().layout
-        insert_at = action_bar.indexOf(self.project_batch_button)
-        action_bar.insertWidget(insert_at, self.skip_task_button)
-        action_bar.insertWidget(insert_at + 1, self.skip_project_button)
+        action_bar.insertWidget(
+            action_bar.indexOf(self.generate_button),
+            self.skip_project_button,
+        )
         self.task_selector.currentIndexChanged.connect(
-            self._task_changed
+            self._selection_changed
+        )
+        self.project_filter_combo.currentIndexChanged.connect(
+            self._project_filter_changed
         )
         self.task_refresh_button.clicked.connect(self.refresh)
         self._task_search_timer = QTimer(self)
@@ -169,6 +173,8 @@ class AIGenerationPage(BatchDressPage):
         if self.query_runner is not None:
             self.query_runner.succeeded.connect(self._query_succeeded)
             self.query_runner.failed.connect(self._query_failed)
+        self._disposed = False
+        self.destroyed.connect(self._dispose_query_runner)
         self.queue_timer = QTimer(self)
         self.queue_timer.setInterval(1200)
         self.queue_timer.timeout.connect(self._refresh_queue_state)
@@ -182,22 +188,23 @@ class AIGenerationPage(BatchDressPage):
         layout = QVBoxLayout(card)
         layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(8)
-        layout.addWidget(
-            PageHeader(
-                "AI生图",
-                "选择子任务后载入素材，调整配对和参数后加入生成队列。",
-            )
-        )
         title_row = QHBoxLayout()
-        title_row.addWidget(QLabel("子任务"))
+        title_row.addWidget(QLabel("项目"))
+        self.project_filter_combo = QComboBox()
+        self.project_filter_combo.setMinimumWidth(150)
+        self.project_filter_combo.addItem("全部项目", None)
+        title_row.addWidget(self.project_filter_combo)
+        title_row.addSpacing(8)
+        title_row.addWidget(QLabel("主任务"))
         self.task_search_edit = QLineEdit()
-        self.task_search_edit.setPlaceholderText("搜索任务、货号或项目")
+        self.task_search_edit.setPlaceholderText("搜索主任务、货号或项目")
         self.task_search_edit.setFixedWidth(180)
         title_row.addWidget(self.task_search_edit)
         self.task_selector = QComboBox()
         self.task_selector.setMinimumWidth(420)
         title_row.addWidget(self.task_selector)
-        self.task_refresh_button = QPushButton("刷新子任务")
+        self.task_refresh_button = QPushButton("刷新")
+        self.task_refresh_button.setObjectName("SecondaryButton")
         title_row.addWidget(self.task_refresh_button)
         self.restore_all_button = QPushButton("恢复全部素材")
         self.restore_all_button.setEnabled(False)
@@ -209,15 +216,72 @@ class AIGenerationPage(BatchDressPage):
         layout.addLayout(title_row)
         return card
 
-    def _additional_settings_rows(self, form: QFormLayout) -> None:
+    def _additional_settings_rows(self, _form: QFormLayout) -> None:
+        return
+
+    def _build_settings(self) -> QWidget:
+        card = QGroupBox("生成设置")
+        card.setObjectName("Card")
+        layout = QVBoxLayout(card)
+        row = QHBoxLayout()
+        self.model_combo = QComboBox()
+        for name, model_id in MODEL_SELECTION_OPTIONS:
+            self.model_combo.addItem(name, model_id)
+        self.model_combo.setCurrentIndex(
+            next(
+                index
+                for index, (_, model_id) in enumerate(
+                    MODEL_SELECTION_OPTIONS
+                )
+                if model_id == DEFAULT_MODEL
+            )
+        )
+        self.aspect_combo = QComboBox()
+        for value in ASPECT_RATIOS:
+            self.aspect_combo.addItem(value, value)
+        self.aspect_combo.setCurrentText(DEFAULT_ASPECT_RATIO)
+        self.resolution_combo = QComboBox()
+        for value in RESOLUTIONS:
+            self.resolution_combo.addItem(
+                "自动（不发送）" if value == "auto" else value,
+                value,
+            )
+        self.resolution_combo.setCurrentIndex(
+            next(
+                index
+                for index, value in enumerate(RESOLUTIONS)
+                if value == DEFAULT_RESOLUTION
+            )
+        )
+        self.count_spin = QSpinBox()
+        self.count_spin.setRange(1, 4)
+        self.count_spin.setValue(DEFAULT_BATCH_SIZE)
+        self.count_label = QLabel("每对数量")
         self.provider_combo = QComboBox()
         self.provider_combo.addItem("自动选择", "")
-        form.addRow("供应商", self.provider_combo)
-        template_host = QWidget()
-        template_layout = QHBoxLayout(template_host)
-        template_layout.setContentsMargins(0, 0, 0, 0)
-        self._build_template_controls(template_layout)
-        form.addRow("提示词模板", template_host)
+        row.addWidget(QLabel("模型"))
+        row.addWidget(self.model_combo)
+        row.addSpacing(12)
+        row.addWidget(QLabel("参数"))
+        row.addWidget(QLabel("宽高比"))
+        row.addWidget(self.aspect_combo)
+        row.addWidget(QLabel("分辨率"))
+        row.addWidget(self.resolution_combo)
+        row.addWidget(self.count_label)
+        row.addWidget(self.count_spin)
+        row.addSpacing(12)
+        row.addWidget(QLabel("供应商"))
+        row.addWidget(self.provider_combo)
+        row.addSpacing(12)
+        row.addWidget(QLabel("提示词模板"))
+        self._build_template_controls(row)
+        row.addStretch(1)
+        layout.addLayout(row)
+        self.note_label = QLabel("备注：-")
+        self.note_label.setWordWrap(True)
+        self._apply_note_style(False)
+        layout.addWidget(self.note_label)
+        return card
 
     def _build_prompt(self) -> QWidget:
         card = QFrame()
@@ -279,10 +343,14 @@ class AIGenerationPage(BatchDressPage):
         }
 
     def _snapshot_current(self) -> None:
+        settings = self._current_settings()
+        project = self.current_project
+        if project is not None:
+            self._project_settings[project.id] = settings
+            return
         task = self.current_task
         if task is None:
             return
-        settings = self._current_settings()
         self._task_settings[task.id] = settings
         self._project_settings[task.project_id] = settings
 
@@ -320,6 +388,7 @@ class AIGenerationPage(BatchDressPage):
         if not self.async_mode:
             self._refresh_providers()
         self.refresh_templates()
+        self._refresh_generation_project_filter()
         if self.async_mode:
             self._request_generation_tasks()
         else:
@@ -332,88 +401,81 @@ class AIGenerationPage(BatchDressPage):
         self._resume_queued_jobs()
         self._pump_queue()
 
+    def _project_filter_changed(self, _index: int) -> None:
+        self._refresh_generation_tasks()
+
+    def _refresh_generation_project_filter(self) -> None:
+        current = self.project_filter_combo.currentData()
+        names: list[str] = []
+        try:
+            names = list(
+                self.repository.list_access_project_names(self.actor)
+            )
+        except Exception:
+            names = []
+        if not names:
+            try:
+                names = [
+                    name
+                    for _scope, name in (
+                        self.repository.list_accessible_projects(
+                            self.actor
+                        )
+                    )
+                ]
+            except Exception:
+                names = []
+        if not names:
+            names = sorted(
+                {
+                    project.project_name
+                    for project in self.generation_projects
+                    if project.project_name
+                }
+            )
+        self.project_filter_combo.blockSignals(True)
+        self.project_filter_combo.clear()
+        self.project_filter_combo.addItem("全部项目", None)
+        for name in names:
+            self.project_filter_combo.addItem(name, name)
+        index = self.project_filter_combo.findData(current)
+        self.project_filter_combo.setCurrentIndex(max(0, index))
+        self.project_filter_combo.blockSignals(False)
+
+    def _generation_query(self) -> TaskQuery:
+        return TaskQuery(
+            keyword=self.task_search_edit.text().strip(),
+            project_name=self.project_filter_combo.currentData(),
+        )
+
     def _refresh_generation_tasks(self) -> None:
         if self.async_mode:
             self._request_generation_tasks()
             return
         try:
-            tasks = self.repository.list_ai_generation_tasks(
-                self.actor
+            result = self.repository.list_ai_generation_projects_page(
+                self.actor,
+                self._generation_query(),
+                PageRequest(page=1, page_size=10000),
             )
         except Exception as exc:
             QMessageBox.warning(self, "读取AI生图任务失败", str(exc))
             return
-        current_id = self.task_selector.currentData()
-        self.generation_tasks = tasks
-        try:
-            self.project_progress = (
-                self.repository.project_progress_counts(
-                    tuple(task.project_id for task in tasks)
-                )
-            )
-        except Exception:
-            self.project_progress = {}
-        self._generation_tasks_by_id = {
-            task.id: task for task in tasks
-        }
-        self.task_selector.blockSignals(True)
-        self.task_selector.clear()
-        self.task_selector.addItem("请选择子任务", None)
-        for task in tasks:
-            completed, total = self.project_progress.get(
-                task.project_id,
-                (0, 0),
-            )
-            label = (
-                f"{task.task_code} · {task.product_code or task.project_name}"
-                f" · 主任务 {completed}/{total}"
-                f" · {TASK_STATUS_LABELS.get(task.status, task.status)}"
-            )
-            if task.parent_task_id is not None:
-                label += " · 失败重试"
-            self.task_selector.addItem(label, task.id)
-        target = (
-            self.task_selector.findData(current_id)
-            if current_id is not None
-            else (1 if tasks else 0)
-        )
-        self.task_selector.setCurrentIndex(max(0, target))
-        self.task_selector.blockSignals(False)
-        if target < 0:
-            self._clear_generation_editor()
-        elif current_id is None:
-            self._task_changed()
-        else:
-            self.current_task = self._generation_tasks_by_id.get(
-                current_id
-            )
-            self._refresh_task_status_label()
-            self._update_project_batch_state()
+        self._render_generation_projects(list(result.items))
 
     def _request_generation_tasks(self) -> None:
         page = PageRequest(page=1, page_size=10000)
-        query = TaskQuery(
-            keyword=self.task_search_edit.text().strip()
-        )
-        self.task_status_label.setText("正在加载子任务…")
+        query = self._generation_query()
+        self.task_status_label.setText("正在加载主任务…")
         self.task_selector.setEnabled(False)
         self._update_project_batch_state()
 
         def load():
-            result = self.repository.list_ai_generation_tasks_page(
+            result = self.repository.list_ai_generation_projects_page(
                 self.actor,
                 query,
                 page,
             )
-            project_ids = tuple(
-                task.project_id for task in result.items
-            )
-            try:
-                progress = self.repository.project_progress_counts(
-                    project_ids
-                )
-            except Exception:
-                progress = {}
             try:
                 providers = list(
                     self.repository.list_api_providers(
@@ -422,82 +484,118 @@ class AIGenerationPage(BatchDressPage):
                 )
             except Exception:
                 providers = list(self.api_providers)
-            return result.items, progress, providers
+            return result.items, providers
 
         self._active_task_request = self.query_runner.submit(load)
 
+    def _dispose_query_runner(self, *_args) -> None:
+        self._disposed = True
+        if self.query_runner is None:
+            return
+        for signal, slot in (
+            (self.query_runner.succeeded, self._query_succeeded),
+            (self.query_runner.failed, self._query_failed),
+        ):
+            try:
+                signal.disconnect(slot)
+            except Exception:
+                pass
+
     def _query_succeeded(self, request_id: int, result) -> None:
+        if getattr(self, "_disposed", False):
+            return
         if not self.async_mode or request_id != self._active_task_request:
             return
-        tasks, progress, providers = result
+        projects, providers = result
         self._apply_providers(providers)
-        self._render_generation_tasks(tasks, progress)
+        self._render_generation_projects(projects)
 
     def _query_failed(self, request_id: int, message: str) -> None:
+        if getattr(self, "_disposed", False):
+            return
         if not self.async_mode or request_id != self._active_task_request:
             return
         self.task_selector.setEnabled(True)
-        self.task_status_label.setText("子任务加载失败")
+        self.task_status_label.setText("主任务加载失败")
         self._update_project_batch_state()
         QMessageBox.warning(self, "读取AI生图任务失败", message)
 
-    def _render_generation_tasks(
+    def _find_selector_data(self, data) -> int:
+        for index in range(self.task_selector.count()):
+            if self.task_selector.itemData(index) == data:
+                return index
+        return -1
+
+    def _render_generation_projects(
         self,
-        tasks: list[ProjectTask],
-        progress: dict[int, tuple[int, int]],
+        projects: list[ProjectRecord],
     ) -> None:
-        current_id = self.task_selector.currentData()
+        current = self.task_selector.currentData()
         forced_id = self.force_direct_retry_task_id
-        tasks = list(tasks)
-        if forced_id is not None and all(
-            task.id != forced_id for task in tasks
-        ):
-            forced_task = self._generation_tasks_by_id.get(forced_id)
-            if forced_task is not None:
-                tasks.append(forced_task)
-        self.generation_tasks = list(tasks)
-        self.project_progress = progress
-        self._generation_tasks_by_id = {
-            task.id: task for task in tasks
+        self.generation_projects = list(projects)
+        self._generation_projects_by_id = {
+            project.id: project for project in projects
         }
         self.task_selector.blockSignals(True)
         self.task_selector.clear()
-        self.task_selector.addItem("请选择子任务", None)
-        for task in tasks:
-            completed, total = self.project_progress.get(
-                task.project_id,
-                (0, 0),
-            )
+        self.task_selector.addItem("请选择主任务", None)
+        for project in projects:
+            urgent_prefix = "【加急】" if project.is_urgent else ""
             label = (
-                f"{task.task_code} · {task.product_code or task.project_name}"
-                f" · 主任务 {completed}/{total}"
-                f" · {TASK_STATUS_LABELS.get(task.status, task.status)}"
+                f"{urgent_prefix}{project.project_code} · "
+                f"{project.product_code or project.name}"
+                f" · 子任务 {project.approved_count}/{project.task_count}"
+                f" · {PROJECT_STATUS_LABELS.get(project.status, project.status)}"
             )
-            if task.parent_task_id is not None:
-                label += " · 失败重试"
-            self.task_selector.addItem(label, task.id)
+            self.task_selector.addItem(
+                label,
+                ("project", project.id),
+            )
+        if forced_id is not None:
+            task = self._generation_tasks_by_id.get(forced_id)
+            if task is not None:
+                self.task_selector.addItem(
+                    f"{task.task_code} · 历史重试",
+                    ("retry", forced_id),
+                )
         target = (
-            self.task_selector.findData(current_id)
-            if current_id is not None
-            else (1 if tasks else 0)
+            self._find_selector_data(current)
+            if current is not None
+            else (1 if (projects or forced_id is not None) else 0)
         )
         self.task_selector.setCurrentIndex(max(0, target))
         self.task_selector.setEnabled(True)
         self.task_selector.blockSignals(False)
-        if target < 0:
+        if target <= 0:
             self._clear_generation_editor()
-        elif current_id is None:
-            self._task_changed()
         else:
-            self.current_task = self._generation_tasks_by_id.get(
-                current_id
+            self._selection_changed()
+
+    def _apply_note_style(self, has_note: bool) -> None:
+        if has_note:
+            self.note_label.setStyleSheet(
+                "color:#8a4b00;background:#fff4d6;"
+                "border:1px solid #f0c36d;border-radius:6px;"
+                "padding:6px 10px;font-weight:600;"
             )
-            self._refresh_task_status_label()
-            self._update_project_batch_state()
+        else:
+            self.note_label.setStyleSheet(
+                "color:#60708a;background:#f4f6fa;"
+                "border:1px solid #e3e9f2;border-radius:6px;"
+                "padding:6px 10px;"
+            )
+
+    def _set_note(self, note: str) -> None:
+        if not hasattr(self, "note_label"):
+            return
+        text = (note or "").strip()
+        self.note_label.setText(f"备注：{text}" if text else "备注：无")
+        self._apply_note_style(bool(text))
 
     def _clear_generation_editor(self) -> None:
         self._snapshot_current()
         self.current_task = None
+        self.current_project = None
         self.local_store = None
         self.restore_all_button.setEnabled(False)
         self.garment_assets = []
@@ -506,40 +604,145 @@ class AIGenerationPage(BatchDressPage):
         self._refresh_role("garment")
         self._refresh_role("person")
         self._refresh_pairs()
-        self.task_status_label.setText("没有可制作的子任务")
+        self.task_status_label.setText("没有可制作的主任务")
+        self.task_status_label.setStyleSheet("color:#60708a;")
+        self._set_note("")
         self._update_asset_actions()
         self._update_project_batch_state()
 
     def _update_project_batch_state(self) -> None:
-        button = getattr(self, "project_batch_button", None)
-        if button is None:
-            return
-        task = self.current_task
-        button.setEnabled(
-            task is not None
-            and task.parent_task_id is None
-            and self.force_direct_retry_task_id != task.id
-            and self.task_selector.isEnabled()
-            and len(self._project_source_tasks(task.project_id)) >= 2
-        )
         self._update_skip_buttons()
 
     def _update_skip_buttons(self) -> None:
-        if not hasattr(self, "skip_task_button"):
-            return
+        project = self.current_project
         task = self.current_task
-        self.skip_task_button.setEnabled(
-            task is not None
-            and int(task.assignee_id or 0) == self.actor.id
-            and task.status != TASK_AWAITING_ACCEPTANCE
-        )
-        self.skip_project_button.setEnabled(task is not None)
+        enabled = False
+        if project is not None:
+            enabled = self.task_selector.isEnabled()
+        elif task is not None:
+            enabled = self.force_direct_retry_task_id != task.id
+        self.skip_project_button.setEnabled(enabled)
 
-    def _task_changed(self, _index: int | None = None) -> None:
+    def _selection_changed(self, _index: int | None = None) -> None:
+        data = self.task_selector.currentData()
+        if isinstance(data, tuple) and data[0] == "retry":
+            self._retry_task_changed(int(data[1]))
+        elif isinstance(data, tuple) and data[0] == "project":
+            project = self._generation_projects_by_id.get(int(data[1]))
+            if project is None:
+                self._clear_generation_editor()
+            else:
+                self._project_changed(project)
+        else:
+            self._clear_generation_editor()
+
+    def _project_changed(self, project: ProjectRecord) -> None:
         self._snapshot_current()
         self._persist_current_sources()
-        task_id = self.task_selector.currentData()
+        self.current_project = project
+        self.current_task = None
+        self.local_store = None
+        store = self._project_garment_store(project.id)
+        cached = store.load_all(project.source_revision)
+        if cached is None:
+            try:
+                assets = self.repository.list_project_assets(project.id)
+            except Exception as exc:
+                QMessageBox.warning(self, "读取主任务素材失败", str(exc))
+                self._clear_generation_editor()
+                return
+            garments = tuple(
+                self._asset_image(project, asset)
+                for asset in assets
+                if asset.role == "garment"
+            )
+            models = tuple(
+                self._asset_image(project, asset)
+                for asset in assets
+                if asset.role == "model"
+            )
+        else:
+            garments, models = cached
+        self.garment_assets = list(garments)
+        self.person_assets = list(models)
+        self.restore_all_button.setEnabled(True)
+        self.selected_garment = None
+        self.pairs = []
+        self._loading_source_state = True
+        try:
+            self._refresh_role("garment")
+            self._refresh_role("person")
+        finally:
+            self._loading_source_state = False
+        self._refresh_pairs()
+        self._auto_match()
+        settings = self._project_settings.get(project.id) or {}
+        prompt = str(settings.get("prompt") or "")
+        if not prompt:
+            prompt = (
+                self._select_default_template()
+                or self._default_prompt()
+            )
+        self.prompt_edit.setPlainText(prompt)
+        model_id = settings.get("model") or DEFAULT_MODEL
+        index = self.model_combo.findData(model_id)
+        if index >= 0:
+            self.model_combo.setCurrentIndex(index)
+        aspect_value = (
+            settings.get("aspect") or DEFAULT_ASPECT_RATIO
+        )
+        index = self.aspect_combo.findData(aspect_value)
+        if index >= 0:
+            self.aspect_combo.setCurrentIndex(index)
+        resolution_value = (
+            settings.get("resolution") or DEFAULT_RESOLUTION
+        )
+        index = self.resolution_combo.findData(resolution_value)
+        if index >= 0:
+            self.resolution_combo.setCurrentIndex(index)
+        provider_code = settings.get("provider") or ""
+        index = self.provider_combo.findData(provider_code)
+        if index >= 0:
+            self.provider_combo.setCurrentIndex(index)
+        urgent_text = " · 加急款" if project.is_urgent else ""
+        self.task_status_label.setText(
+            f"{PROJECT_STATUS_LABELS.get(project.status, project.status)}"
+            f" · 子任务 {project.approved_count}/{project.task_count}"
+            f" · 服装 {len(self.garment_assets)}"
+            f" · 模特 {len(self.person_assets)}"
+            f"{urgent_text}"
+        )
+        self.task_status_label.setStyleSheet(
+            "color:#b72f3c;font-weight:700;"
+            if project.is_urgent
+            else "color:#60708a;"
+        )
+        self._set_note(project.note)
+        self._update_asset_actions()
+        self._update_project_batch_state()
+
+    def _asset_image(self, project: ProjectRecord, asset):
+        path = self.resolver.resolve_project_path(
+            project.project_relative_root,
+            asset.relative_path,
+        )
+        return StoredImage(
+            path=path,
+            content_hash=asset.content_hash,
+            mime=asset.mime,
+            width=asset.width,
+            height=asset.height,
+            original_name=asset.original_name,
+            relative_path=asset.relative_path,
+        )
+
+    def _retry_task_changed(self, task_id: int) -> None:
+        self._snapshot_current()
+        self._persist_current_sources()
         task = self._generation_tasks_by_id.get(task_id)
+        self.current_project = None
+        self.task_status_label.setStyleSheet("color:#60708a;")
+        self._set_note("")
         if task is None:
             self._clear_generation_editor()
             return
@@ -663,6 +866,21 @@ class AIGenerationPage(BatchDressPage):
             return None
 
     def _persist_current_sources(self) -> None:
+        project = self.current_project
+        if project is not None:
+            try:
+                self._project_garment_store(project.id).save_all(
+                    tuple(self.garment_assets),
+                    tuple(self.person_assets),
+                    project.source_revision,
+                )
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "保存本机素材失败",
+                    str(exc),
+                )
+            return
         if (
             self.current_task is None
             or self.local_store is None
@@ -692,6 +910,40 @@ class AIGenerationPage(BatchDressPage):
             self._persist_current_sources()
 
     def _restore_all_sources(self) -> None:
+        project = self.current_project
+        if project is not None:
+            try:
+                assets = self.repository.list_project_assets(project.id)
+                self.garment_assets = [
+                    self._asset_image(project, asset)
+                    for asset in assets
+                    if asset.role == "garment"
+                ]
+                self.person_assets = [
+                    self._asset_image(project, asset)
+                    for asset in assets
+                    if asset.role == "model"
+                ]
+                self._project_garment_store(project.id).save_all(
+                    tuple(self.garment_assets),
+                    tuple(self.person_assets),
+                    project.source_revision,
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "恢复失败", str(exc))
+                return
+            self._loading_source_state = True
+            try:
+                self._refresh_role("garment")
+                self._refresh_role("person")
+            finally:
+                self._loading_source_state = False
+            self.pairs = []
+            self.selected_pair_key = None
+            self._refresh_pairs()
+            self._auto_match()
+            self.feedback_label.setText("已恢复全部初始共享盘素材。")
+            return
         if self.local_store is None:
             return
         try:
@@ -726,11 +978,16 @@ class AIGenerationPage(BatchDressPage):
 
     def _enqueue_all(self) -> None:
         task = self.current_task
-        if task is None:
+        project = self.current_project
+        retry_mode = (
+            task is not None
+            and self.force_direct_retry_task_id == task.id
+        )
+        if not retry_mode and project is None:
             QMessageBox.information(
                 self,
-                "未选择子任务",
-                "请先在顶部选择需要制作的子任务。",
+                "未选择主任务",
+                "请先在顶部选择需要制作的主任务。",
             )
             return
         if not self.pairs:
@@ -752,28 +1009,180 @@ class AIGenerationPage(BatchDressPage):
         if active_pairs and not self._check_api_key_ready():
             return
         try:
-            if (
-                task.parent_task_id is None
-                and self.force_direct_retry_task_id != task.id
-            ):
-                count = self._split_source_task(task, prompt)
-            else:
+            if retry_mode:
                 count = self._retry_child_task(task, prompt)
+            else:
+                specs = self._build_pair_specs(
+                    self.pairs,
+                    prompt,
+                    self._current_settings(),
+                )
+                results = self.repository.split_project_and_queue_generations(
+                    project.id,
+                    self.actor,
+                    pairs=specs,
+                )
+                self._save_project_child_snapshots(results, self.pairs)
+                count = len(results)
         except Exception as exc:
             QMessageBox.warning(self, "加入队列失败", str(exc))
             return
         if count == 0:
+            self.feedback_label.setText(
+                "没有新的配对需要提交，可能已在队列或已完成。"
+            )
             return
         self.pairs.clear()
         self._refresh_pairs()
         self.tasks_enqueued.emit(count)
         self.feedback_label.setText(
-            f"已处理 {count} 个配对任务。"
+            f"已提交 {count} 个配对任务。"
         )
         self._refresh_generation_tasks()
         self._resume_queued_jobs()
         self._pump_queue()
         self.force_direct_retry_task_id = None
+
+    def _build_pair_specs(
+        self,
+        groups: Sequence[DressTaskGroup],
+        prompt: str,
+        settings: dict,
+    ) -> list[GenerationPairSpec]:
+        strategy = self.app_settings.auto_strategy()
+        specs: list[GenerationPairSpec] = []
+        selected_model = settings.get("model")
+        aspect_ratio = settings.get("aspect")
+        resolution = settings.get("resolution")
+        provider_code = str(settings.get("provider") or "")
+        provider_name = str(settings.get("provider_name") or "")
+        for group in groups:
+            group_prompt = (
+                "无需制作"
+                if group.skipped
+                else self._prompt_for_group(prompt, group)
+            )
+            model_id = selected_model
+            if selected_model == AUTO_MODEL_ID:
+                model_id = choose_model(
+                    prompt=group_prompt,
+                    mode="dress_up",
+                    reference_count=len(group.references),
+                    strategy=strategy,
+                ).model
+            if not group.skipped:
+                usable_model = self._resolve_usable_model(
+                    model_id,
+                    len(group.references),
+                    1,
+                )
+                if usable_model is None:
+                    raise ValueError(
+                        "当前模型在已启用平台中没有可用的 API Key，"
+                        "请改用其他模型"
+                    )
+                model_id = usable_model
+            garment_hashes = tuple(
+                image.content_hash
+                for role, image in zip(group.roles, group.references)
+                if role == "garment"
+            )
+            specs.append(
+                GenerationPairSpec(
+                    prompt_text=group_prompt,
+                    model=model_id,
+                    aspect_ratio=aspect_ratio,
+                    resolution=resolution,
+                    n=1,
+                    unit_price=self.repository.current_model_price(
+                        model_id
+                    ),
+                    garment_hashes=garment_hashes,
+                    person_hash=(
+                        group.person.content_hash
+                        if group.person is not None
+                        else ""
+                    ),
+                    skipped=group.skipped,
+                    requested_provider_code=provider_code,
+                    requested_provider_name=provider_name,
+                )
+            )
+        unsupported_models = []
+        if provider_code:
+            for spec in specs:
+                if spec.skipped:
+                    continue
+                routes = self.repository.list_provider_routes(
+                    spec.model,
+                    provider_code=provider_code,
+                )
+                if not routes:
+                    unsupported_models.append(spec.model)
+        if unsupported_models:
+            QMessageBox.information(
+                self,
+                "首选供应商不支持当前模型",
+                "以下模型未配置在该供应商中，将自动切换到其他平台：\n"
+                + "、".join(sorted(set(unsupported_models))),
+            )
+        return specs
+
+    def _save_project_child_snapshots(
+        self,
+        results,
+        groups: Sequence[DressTaskGroup],
+    ) -> None:
+        snapshot_failures: list[str] = []
+        for result in results:
+            if result.skipped or result.attempt_id is None:
+                continue
+            child = self.repository.get_task(result.task_id)
+            if child is None:
+                continue
+            group = (
+                groups[result.pair_index]
+                if 0 <= result.pair_index < len(groups)
+                else None
+            )
+            try:
+                child_store = LocalTaskSourceStore(
+                    self.file_store.paths.root / "local_sources",
+                    self.actor.id,
+                    child,
+                    self.resolver,
+                )
+                # 轮次快照必须使用页面上实际发送的素材，
+                # 这样裁剪/新增的图片才能进入生成和历史记录。
+                if group is not None:
+                    garments = tuple(
+                        image
+                        for role, image in zip(
+                            group.roles,
+                            group.references,
+                        )
+                        if role == "garment"
+                    )
+                    child_store.replace_all(garments, group.person)
+                child_store.save_attempt_snapshot(result.attempt_id)
+            except Exception as exc:
+                snapshot_failures.append(result.task_code)
+                try:
+                    self.repository.fail_generation_attempt(
+                        result.attempt_id,
+                        self.actor,
+                        error_code="local_source_snapshot",
+                        error_message=str(exc),
+                    )
+                except Exception:
+                    pass
+        if snapshot_failures:
+            QMessageBox.warning(
+                self,
+                "部分素材保存失败",
+                "以下子任务的本机素材快照保存失败：\n"
+                + "、".join(snapshot_failures),
+            )
 
     def _check_api_key_ready(self) -> bool:
         try:
@@ -975,12 +1384,18 @@ class AIGenerationPage(BatchDressPage):
         self._reset_queue_after_skip()
 
     def _skip_project_tasks(self) -> None:
+        project = self.current_project
         task = self.current_task
-        if task is None:
+        project_id = (
+            project.id
+            if project is not None
+            else (task.project_id if task is not None else None)
+        )
+        if project_id is None:
             QMessageBox.information(
                 self,
-                "未选择子任务",
-                "请先在顶部选择主任务下的子任务。",
+                "未选择主任务",
+                "请先在顶部选择需要制作的主任务。",
             )
             return
         answer = QMessageBox.question(
@@ -995,15 +1410,15 @@ class AIGenerationPage(BatchDressPage):
         if answer != QMessageBox.StandardButton.Yes:
             return
         try:
-            count = self.repository.skip_project_tasks(
-                task.project_id,
+            count = self.repository.skip_project(
+                project_id,
                 self.actor,
             )
         except Exception as exc:
             QMessageBox.warning(self, "跳过失败", str(exc))
             return
         self.feedback_label.setText(
-            f"本主任务已标记 {count} 个子任务无需制作。"
+            f"本主任务已标记无需制作（{count} 个子任务）。"
         )
         self.tasks_skipped.emit(count)
         self._refresh_generation_tasks()
@@ -1029,15 +1444,16 @@ class AIGenerationPage(BatchDressPage):
         self.generation_tasks = [
             item for item in self.generation_tasks if item.id != task.id
         ] + [task]
-        if self.task_selector.findData(task.id) < 0:
+        retry_data = ("retry", task.id)
+        index = self._find_selector_data(retry_data)
+        if index < 0:
             self.task_selector.addItem(
                 f"{task.task_code} · 历史重试",
-                task.id,
+                retry_data,
             )
-        self.task_selector.setCurrentIndex(
-            self.task_selector.findData(task.id)
-        )
-        self._task_changed()
+            index = self.task_selector.count() - 1
+        self.task_selector.setCurrentIndex(index)
+        self._retry_task_changed(task.id)
         self.prompt_edit.setPlainText(attempt.prompt_text)
         model_index = self.model_combo.findData(attempt.model)
         if model_index >= 0:

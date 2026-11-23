@@ -113,6 +113,12 @@ class FakeCentralRepository:
         self.replaced_results = []
         self.confirmed_results = []
         self.report_result = None
+        self.submission_projects = []
+        self.listing_confirmations = []
+        self.generation_projects = []
+        self.project_assets_by_id = {}
+        self.project_splits = []
+        self.skipped_projects = []
 
     def replace_attempt_result(self, attempt_id, result_id, _actor, **kwargs):
         self.replaced_results.append((attempt_id, result_id, kwargs))
@@ -135,6 +141,51 @@ class FakeCentralRepository:
 
     def list_projects(self, **_kwargs):
         return []
+
+    def list_submission_projects_page(self, _actor, _query, page):
+        projects = list(self.submission_projects)
+        return PageResult(
+            projects,
+            len(projects),
+            page.page,
+            page.page_size,
+        )
+
+    def list_ai_generation_projects_page(self, _actor, _query, page):
+        projects = list(self.generation_projects)
+        return PageResult(
+            projects,
+            len(projects),
+            page.page,
+            page.page_size,
+        )
+
+    def list_project_assets(self, project_id):
+        return tuple(
+            self.project_assets_by_id.get(int(project_id), ())
+        )
+
+    def split_project_and_queue_generations(
+        self,
+        project_id,
+        actor,
+        *,
+        pairs,
+    ):
+        self.project_splits.append(
+            (project_id, actor, list(pairs))
+        )
+        return []
+
+    def skip_project(self, project_id, actor, reason=""):
+        self.skipped_projects.append((project_id, actor, reason))
+        return 0
+
+    def confirm_project_listing(self, project_id, actor, listing_url):
+        self.listing_confirmations.append(
+            (project_id, actor, listing_url)
+        )
+        return ""
 
     def list_exception_projects(self, _cutoff, **_kwargs):
         return self.list_projects()
@@ -501,9 +552,7 @@ class CollaborationPageTests(unittest.TestCase):
             "records",
         )
         admin = AdminPage(self.repository, self.actor)
-        title = create.findChild(QLabel, "PageTitle")
-        self.assertIsNotNone(title)
-        self.assertEqual(title.text(), "任务提交")
+        self.assertIsNone(create.findChild(QLabel, "PageTitle"))
         self.assertEqual(create.product_table.rowCount(), 0)
         self.assertEqual(records.project_table.rowCount(), 0)
         self.assertEqual(admin.user_table.rowCount(), 0)
@@ -523,25 +572,19 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertGreaterEqual(page.garment_list.minimumHeight(), 240)
         page.deleteLater()
 
-    def test_submission_records_are_read_only_and_hide_expanded_parents(
-        self,
-    ) -> None:
-        project = make_project()
-        available = replace(make_task("available"), id=11)
-        approved = replace(
-            make_task("approved"),
-            id=12,
-            task_code="春季项目-123-001-002",
+    def test_submission_records_show_projects_and_ai_preview(self) -> None:
+        project = replace(
+            make_project("completed"),
+            task_count=0,
+            approved_count=0,
         )
-        expanded = replace(
-            make_task("expanded"),
-            id=13,
-            task_code="春季项目-123-001-003",
-        )
-        self.repository.list_projects = lambda **_kwargs: [project]
-        self.repository.list_board_tasks = (
-            lambda _actor, **_kwargs: [available, approved, expanded]
-        )
+        ai_dir = self.root / project.project_relative_root / "AI成品"
+        ai_dir.mkdir(parents=True)
+        for name in ("a.png", "b.png"):
+            Image.new("RGB", (20, 20), (30, 40, 50)).save(
+                ai_dir / name
+            )
+        self.repository.submission_projects = [project]
         page = SubmissionListPage(
             self.repository,
             self.resolver,
@@ -549,23 +592,84 @@ class CollaborationPageTests(unittest.TestCase):
             "records",
         )
         self.assertEqual(page.project_table.rowCount(), 1)
-        self.assertTrue(page.project_table.isColumnHidden(6))
-        self.assertEqual(page.task_table.rowCount(), 2)
-        self.assertFalse(page.result_panel.isHidden())
-        self.assertFalse(
-            page.dual_preview.upload_button.isVisibleTo(page)
+        self.assertTrue(page.project_table.isColumnHidden(12))
+        self.assertEqual(
+            page.project_table.item(0, 2).text(),
+            "普通",
         )
-        self.assertIs(
-            page.result_panel,
-            page.dual_preview.result_pane,
+        self.assertEqual(
+            page.project_table.item(0, 6).text(),
+            "未拆分",
         )
-        self.assertIs(
-            page.reference_panel,
-            page.dual_preview.reference_pane,
-        )
+        self.assertFalse(hasattr(page, "task_table"))
+        self.assertFalse(hasattr(page, "dual_preview"))
+        self.assertTrue(hasattr(page, "ai_preview"))
+        self.assertEqual(page.ai_preview.list_widget.count(), 2)
+        self.assertTrue(page.listing_button.isEnabled())
         self.assertFalse(hasattr(page, "urgent_button"))
         self.assertFalse(hasattr(page, "review_actions"))
         page.deleteLater()
+
+    def test_submission_listing_button_requires_completed_project(
+        self,
+    ) -> None:
+        project = make_project("in_progress")
+        self.repository.submission_projects = [project]
+        page = SubmissionListPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            "records",
+        )
+        self.assertFalse(page.listing_button.isEnabled())
+        page.deleteLater()
+
+    def test_submission_confirm_listing_uses_dialog_and_repository(
+        self,
+    ) -> None:
+        project = make_project("completed")
+        self.repository.submission_projects = [project]
+
+        class FakeDialog:
+            def __init__(self, _url, _parent):
+                pass
+
+            def exec(self):
+                return QDialog.DialogCode.Accepted
+
+            def listing_url(self):
+                return "https://shop.example.com/item/123456789"
+
+        page = SubmissionListPage(
+            self.repository,
+            self.resolver,
+            self.actor,
+            "records",
+        )
+        with patch(
+            "yixin.ui.submission_list_page.ListingConfirmDialog",
+            FakeDialog,
+        ):
+            page._confirm_listing()
+        self.assertEqual(len(self.repository.listing_confirmations), 1)
+        self.assertEqual(
+            self.repository.listing_confirmations[0][0],
+            project.id,
+        )
+        page.deleteLater()
+
+    def _project_assets_for(self, task):
+        return task.garment_assets + (
+            ProjectAssetInput(
+                "model",
+                task.model_path,
+                task.model_name,
+                task.model_hash,
+                "image/png",
+                20,
+                20,
+            ),
+        )
 
     def test_assignment_page_multi_select_and_claim(self) -> None:
         write_task_images(self.root)
@@ -574,7 +678,9 @@ class CollaborationPageTests(unittest.TestCase):
         self.repository.list_assignment_projects = (
             lambda _actor, **_kwargs: [project]
         )
-        self.repository.list_project_tasks = lambda _project_id: [task]
+        self.repository.project_assets_by_id[project.id] = (
+            self._project_assets_for(task)
+        )
         requested: list[list[int]] = []
 
         def claim(project_ids, _actor):
@@ -590,8 +696,11 @@ class CollaborationPageTests(unittest.TestCase):
         )
         page.refresh()
         self.assertEqual(page.project_table.rowCount(), 1)
-        self.assertEqual(page.task_table.rowCount(), 1)
-        self.assertEqual(page.source_strip.count(), 3)
+        self.assertEqual(
+            page.garment_preview.list_widget.count(),
+            len(task.garment_assets),
+        )
+        self.assertEqual(page.model_preview.list_widget.count(), 1)
         page.project_table.selectRow(0)
         with patch(
             "yixin.ui.task_assignment_page.QMessageBox.information"
@@ -600,28 +709,27 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(requested, [[project.id]])
         page.deleteLater()
 
-    def test_assignment_page_async_pages_projects_and_tasks(self) -> None:
+    def test_assignment_page_async_pages_projects_and_assets(self) -> None:
         write_task_images(self.root)
         project = make_project()
         task = replace(make_task("available"), assignee_id=None)
+        queries = []
         self.repository.list_assignment_projects_page = (
-            lambda _actor, _query, page: PageResult(
-                [project],
-                1,
-                page.page,
-                page.page_size,
+            lambda _actor, query, page: (
+                queries.append(query)
+                or PageResult(
+                    [project],
+                    1,
+                    page.page,
+                    page.page_size,
+                )
             )
         )
         self.repository.list_assignment_project_counts = (
             lambda _actor: [("春季项目", 1)]
         )
-        self.repository.list_board_tasks_for_project_page = (
-            lambda project_id, _actor, _statuses, _query, page: PageResult(
-                [task],
-                1,
-                page.page,
-                page.page_size,
-            )
+        self.repository.project_assets_by_id[project.id] = (
+            self._project_assets_for(task)
         )
         page = TaskAssignmentPage(
             self.repository,
@@ -636,7 +744,7 @@ class CollaborationPageTests(unittest.TestCase):
             self.app.processEvents()
             loaded = (
                 page.project_table.rowCount() == 1
-                and page.task_table.rowCount() == 1
+                and page.model_preview.list_widget.count() == 1
             )
             if loaded:
                 break
@@ -652,13 +760,25 @@ class CollaborationPageTests(unittest.TestCase):
             0,
         )
         self.assertFalse(hasattr(page, "task_pagination"))
+        page.urgent_filter.setCurrentIndex(
+            page.urgent_filter.findData(True)
+        )
+        page._request_projects()
+        for _ in range(100):
+            self.app.processEvents()
+            if len(queries) >= 2:
+                break
+            QTest.qWait(10)
+        self.assertIs(queries[-1].is_urgent, True)
         page.deleteLater()
 
-    def test_ai_generation_page_loads_subtask_and_toggles_skip(self) -> None:
+    def test_ai_generation_page_loads_project_and_toggles_skip(self) -> None:
         write_task_images(self.root)
+        project = replace(make_project("in_progress"), is_urgent=True)
         task = replace(make_task("claimed"), prompt_text="")
-        self.repository.list_ai_generation_tasks = (
-            lambda _actor, **_kwargs: [task]
+        self.repository.generation_projects = [project]
+        self.repository.project_assets_by_id[project.id] = (
+            self._project_assets_for(task)
         )
         self.repository.list_queued_attempts = lambda _actor_id: []
         key_store = type(
@@ -688,10 +808,14 @@ class CollaborationPageTests(unittest.TestCase):
         )
         page.refresh()
         self.assertEqual(page.task_selector.count(), 2)
+        self.assertIn("【加急】", page.task_selector.itemText(1))
+        self.assertIn("加急款", page.task_status_label.text())
         self.assertEqual(len(page.garment_assets), 2)
         self.assertEqual(len(page.person_assets), 1)
         self.assertEqual(len(page.pairs), 1)
         self.assertTrue(page.count_spin.isHidden())
+        self.assertIn("备注", page.note_label.text())
+        self.assertIn("fff4d6", page.note_label.styleSheet())
         multi_prompt = next(
             prompt
             for name, prompt in BUILTIN_PROMPT_TEMPLATES
@@ -720,15 +844,8 @@ class CollaborationPageTests(unittest.TestCase):
             page.template_combo.parentWidget(),
             page.prompt_edit.parentWidget(),
         )
-        skip_buttons = [
-            button
-            for button in page.findChildren(QPushButton)
-            if button.text() == "不做图" and button.isVisibleTo(page)
-        ]
-        self.assertEqual(skip_buttons, [])
-        self.assertTrue(page.skip_task_button.isVisibleTo(page))
+        self.assertFalse(hasattr(page, "skip_task_button"))
         self.assertTrue(page.skip_project_button.isVisibleTo(page))
-        self.assertTrue(page.skip_task_button.isEnabled())
         self.assertTrue(page.skip_project_button.isEnabled())
         button_texts = {
             button.text() for button in page.findChildren(QPushButton)
@@ -737,17 +854,19 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertNotIn("提交验收", button_texts)
         self.assertNotIn("验收通过", button_texts)
         page.prompt_edit.setPlainText("自定义提示词")
-        page._task_changed()
+        page._project_changed(project)
         self.assertEqual(page.prompt_edit.toPlainText(), "自定义提示词")
         page._clear_generation_editor()
         self.assertEqual(page.prompt_edit.toPlainText(), "自定义提示词")
         page.deleteLater()
 
-    def test_ai_generation_skips_current_task_and_whole_project(self) -> None:
+    def test_ai_generation_skips_whole_project(self) -> None:
         write_task_images(self.root)
         task = make_task("claimed")
-        self.repository.list_ai_generation_tasks = (
-            lambda _actor, **_kwargs: [task]
+        project = make_project("in_progress")
+        self.repository.generation_projects = [project]
+        self.repository.project_assets_by_id[project.id] = (
+            self._project_assets_for(task)
         )
         self.repository.list_queued_attempts = lambda _actor_id: []
         key_store = type(
@@ -787,24 +906,21 @@ class CollaborationPageTests(unittest.TestCase):
             patch.object(QMessageBox, "warning"),
             patch.object(QMessageBox, "information"),
         ):
-            page.skip_task_button.click()
             page.skip_project_button.click()
         self.assertEqual(
-            self.repository.skip_task_requests,
-            [(task.id, actor)],
+            self.repository.skipped_projects,
+            [(project.id, actor, "")],
         )
-        self.assertEqual(
-            self.repository.skip_project_requests,
-            [(task.project_id, actor)],
-        )
-        self.assertEqual(emitted, [1, 1])
+        self.assertEqual(emitted, [0])
         page.deleteLater()
 
     def test_ai_generation_removes_multiple_selected_assets(self) -> None:
         write_task_images(self.root)
         task = make_task("claimed")
-        self.repository.list_ai_generation_tasks = (
-            lambda _actor, **_kwargs: [task]
+        project = make_project("in_progress")
+        self.repository.generation_projects = [project]
+        self.repository.project_assets_by_id[project.id] = (
+            self._project_assets_for(task)
         )
         self.repository.list_queued_attempts = lambda _actor_id: []
         key_store = type(
@@ -856,11 +972,20 @@ class CollaborationPageTests(unittest.TestCase):
     ) -> None:
         write_task_images(self.root)
         task = make_task("claimed")
+        project = make_project("in_progress")
+        self.repository.project_assets_by_id[project.id] = (
+            self._project_assets_for(task)
+        )
         queries = []
-        self.repository.list_ai_generation_tasks_page = (
+        self.repository.list_ai_generation_projects_page = (
             lambda _actor, query, page: (
                 queries.append((query, page))
-                or PageResult([task], 1, page.page, page.page_size)
+                or PageResult(
+                    [project],
+                    1,
+                    page.page,
+                    page.page_size,
+                )
             )
         )
         paths = AppPaths(self.root / "ai-async-data")
@@ -898,13 +1023,22 @@ class CollaborationPageTests(unittest.TestCase):
                 break
             QTest.qWait(10)
         self.assertEqual(queries[-1][0].keyword, "春季项目")
+        page._dispose_query_runner()
         page.deleteLater()
 
-    def test_ai_generation_page_splits_each_pair_into_child_task(self) -> None:
+    def test_ai_generation_page_splits_project_pairs_into_child_tasks(
+        self,
+    ) -> None:
         write_task_images(self.root)
         task = make_task("claimed")
-        self.repository.list_ai_generation_tasks = (
-            lambda _actor, **_kwargs: [task]
+        project = replace(
+            make_project("in_progress"),
+            approved_count=2,
+            task_count=5,
+        )
+        self.repository.generation_projects = [project]
+        self.repository.project_assets_by_id[project.id] = (
+            self._project_assets_for(task)
         )
         self.repository.list_queued_attempts = lambda _actor_id: []
         self.repository.list_api_providers = lambda **_kwargs: [
@@ -918,16 +1052,13 @@ class CollaborationPageTests(unittest.TestCase):
                 priority=30,
             )
         ]
-        self.repository.project_progress_counts = (
-            lambda _ids: {task.project_id: (2, 5)}
-        )
         captured: list[tuple] = []
 
-        def split(task_id, actor, *, pairs):
-            captured.append((task_id, actor.id, tuple(pairs)))
+        def split(project_id, actor, *, pairs):
+            captured.append((project_id, actor.id, tuple(pairs)))
             return ()
 
-        self.repository.split_and_queue_generations = split
+        self.repository.split_project_and_queue_generations = split
         key_store = type(
             "KeyStore",
             (),
@@ -954,9 +1085,7 @@ class CollaborationPageTests(unittest.TestCase):
         )
         page.refresh()
         self.assertEqual(page.provider_combo.count(), 2)
-        self.assertFalse(page.project_batch_button.isEnabled())
-        self.assertIn("主任务 2/5", page.task_selector.itemText(1))
-        self.assertIn("待制作", page.task_selector.itemText(1))
+        self.assertIn("子任务 2/5", page.task_selector.itemText(1))
         with (
             patch.object(
                 QMessageBox,
@@ -973,7 +1102,7 @@ class CollaborationPageTests(unittest.TestCase):
             page.provider_combo.setCurrentIndex(1)
             page._enqueue_all()
         self.assertEqual(len(captured), 1)
-        self.assertEqual(captured[0][0], task.id)
+        self.assertEqual(captured[0][0], project.id)
         specs = captured[0][2]
         self.assertEqual(len(specs), 1)
         self.assertEqual(len(specs[0].garment_hashes), 1)
@@ -985,6 +1114,160 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(
             specs[0].requested_provider_code,
             "a6api",
+        )
+        page.deleteLater()
+
+    def test_ai_generation_submits_cropped_local_asset(self) -> None:
+        write_task_images(self.root)
+        task = make_task("claimed")
+        project = make_project("in_progress")
+        self.repository.generation_projects = [project]
+        self.repository.project_assets_by_id[project.id] = (
+            self._project_assets_for(task)
+        )
+        self.repository.list_queued_attempts = lambda _actor_id: []
+        captured: list[tuple] = []
+
+        def split(project_id, actor, *, pairs):
+            del actor
+            captured.append((project_id, tuple(pairs)))
+            return ()
+
+        self.repository.split_project_and_queue_generations = split
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        paths = AppPaths(self.root / "ai-crop-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: "sk-test-123456")
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            AuthUser(4, "ai_amy", "AI Amy", "ai"),
+            client,
+            key_store,
+            database,
+            file_store,
+            LibraryService(database, file_store, paths),
+            TaskWorker(database, client, file_store),
+            key_store,
+            auto_load=False,
+        )
+        page.refresh()
+        cropped = file_store.save_cropped_reference(
+            page.garment_assets[0],
+            (0, 0, 10, 10),
+        )
+        with (
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(QMessageBox, "warning") as warning,
+            patch.object(QMessageBox, "information"),
+        ):
+            page.garment_assets[0] = cropped
+            page._auto_match()
+            page._enqueue_all()
+        self.assertFalse(
+            any(
+                "素材已修改" in str(call)
+                for call in warning.call_args_list
+            )
+        )
+        self.assertEqual(len(captured), 1)
+        garment_hashes = captured[0][1][0].garment_hashes
+        self.assertIn(cropped.content_hash, garment_hashes)
+        page.deleteLater()
+
+    def test_cropped_asset_is_written_to_attempt_snapshot(self) -> None:
+        from yixin.collaboration.local_sources import LocalTaskSourceStore
+
+        write_task_images(self.root)
+        task = make_task("claimed")
+        project = make_project("in_progress")
+        self.repository.generation_projects = [project]
+        self.repository.project_assets_by_id[project.id] = (
+            self._project_assets_for(task)
+        )
+        self.repository.list_queued_attempts = lambda _actor_id: []
+        child = replace(
+            task,
+            id=901,
+            task_code="春季项目-123-001-901",
+        )
+        self.repository.tasks_by_id[child.id] = child
+
+        def split(_project_id, _actor, *, pairs):
+            del pairs
+            return (
+                SplitGenerationItem(
+                    task_id=child.id,
+                    task_code=child.task_code,
+                    attempt_id=555,
+                    skipped=False,
+                    pair_index=0,
+                ),
+            )
+
+        self.repository.split_project_and_queue_generations = split
+        key_store = type(
+            "KeyStore",
+            (),
+            {"load": staticmethod(lambda: "sk-test-123456")},
+        )()
+        paths = AppPaths(self.root / "ai-crop-snapshot-data")
+        paths.ensure()
+        database = Database(paths.database)
+        database.initialize()
+        file_store = FileStore(paths)
+        client = NanoBananaClient(lambda: "sk-test-123456")
+        page = AIGenerationPage(
+            self.repository,
+            self.resolver,
+            AuthUser(4, "ai_amy", "AI Amy", "ai"),
+            client,
+            key_store,
+            database,
+            file_store,
+            LibraryService(database, file_store, paths),
+            TaskWorker(database, client, file_store),
+            key_store,
+            auto_load=False,
+        )
+        page.refresh()
+        cropped = file_store.save_cropped_reference(
+            page.garment_assets[0],
+            (0, 0, 10, 10),
+        )
+        with (
+            patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch.object(QMessageBox, "warning"),
+            patch.object(QMessageBox, "information"),
+        ):
+            page.garment_assets[0] = cropped
+            page._auto_match()
+            page._enqueue_all()
+        snapshot = LocalTaskSourceStore.read_attempt_snapshot(
+            paths.root / "local_sources",
+            4,
+            child,
+            555,
+        )
+        self.assertIsNotNone(snapshot)
+        self.assertIn(
+            cropped.content_hash,
+            {image.content_hash for image in snapshot},
         )
         page.deleteLater()
 
@@ -1025,7 +1308,14 @@ class CollaborationPageTests(unittest.TestCase):
             auto_load=False,
         )
         page.refresh()
-        page._enqueue_all()
+        page._generation_tasks_by_id[task.id] = task
+        page.force_direct_retry_task_id = task.id
+        page._retry_task_changed(task.id)
+        with (
+            patch.object(QMessageBox, "warning"),
+            patch.object(QMessageBox, "information"),
+        ):
+            page._enqueue_all()
         self.assertEqual(len(self.repository.generation_requests), 1)
         task_id, _actor, _kwargs = self.repository.generation_requests[0]
         self.assertEqual(task_id, task.id)
@@ -1212,6 +1502,7 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertFalse(pending_file.exists())
         page.deleteLater()
 
+    @unittest.skip("旧模型：整单提交按原始子任务拆分，已改为主任务级拆分")
     def test_ai_generation_submits_all_project_source_tasks(self) -> None:
         write_task_images(self.root)
         model2 = (
@@ -1343,6 +1634,7 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(emitted, [2])
         page.deleteLater()
 
+    @unittest.skip("旧模型：整单提交按原始子任务拆分，已改为主任务级拆分")
     def test_ai_generation_project_batch_isolates_failures(self) -> None:
         write_task_images(self.root)
         model2 = (
@@ -1661,7 +1953,7 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.repository.find_tasks_by_products = (
             lambda _actor, _date, codes: {
-                code: ([object()] if code == "DV263q99999p8072" else [])
+                code: ([object()] if code == "DV263q99999p" else [])
                 for code in codes
             }
         )
@@ -1689,19 +1981,19 @@ class CollaborationPageTests(unittest.TestCase):
             for row in range(page.product_table.rowCount())
         }
         self.assertTrue(
-            states["DV263q25445p8072"].flags()
+            states["DV263q25445p"].flags()
             & Qt.ItemFlag.ItemIsUserCheckable
         )
         self.assertFalse(
-            states["DV263q99999p8072"].flags()
+            states["DV263q99999p"].flags()
             & Qt.ItemFlag.ItemIsUserCheckable
         )
         self.assertTrue(
-            states["DV264q25445p8072"].flags()
+            states["DV264q25445p"].flags()
             & Qt.ItemFlag.ItemIsUserCheckable
         )
         self.assertEqual(header.check_state(), Qt.CheckState.Checked)
-        states["DV263q25445p8072"].setCheckState(Qt.CheckState.Unchecked)
+        states["DV263q25445p"].setCheckState(Qt.CheckState.Unchecked)
         self.assertEqual(
             header.check_state(),
             Qt.CheckState.PartiallyChecked,
@@ -1751,7 +2043,7 @@ class CollaborationPageTests(unittest.TestCase):
         for row in range(2):
             self.assertEqual(
                 page.product_table.item(row, 2).text(),
-                "DV263q25445p8072",
+                "DV263q25445p",
             )
             self.assertFalse(
                 page.product_table.item(row, 1).flags()
@@ -1813,7 +2105,7 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(page.product_table.rowCount(), 1)
         self.assertEqual(
             page.product_table.item(0, 2).text(),
-            "DV263q25445p8072",
+            "DV263q25445p",
         )
         self.assertTrue(
             page.product_table.item(0, 1).flags()
@@ -1849,6 +2141,55 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(page.product_table.item(0, 3).text(), "1")
         page.deleteLater()
 
+    def test_task_type_and_note_follow_each_product(self) -> None:
+        date_folder = current_date_folder(
+            self.root / "内部项目" / "春季项目"
+        )
+        for code in ("DV263q25445p80723", "DV262q10001p80724"):
+            product = date_folder.path / code
+            (product / "衣服图").mkdir(parents=True)
+            (product / "模特图").mkdir(parents=True)
+            Image.new("RGB", (20, 20), "red").save(
+                product / "衣服图" / "衣服1.png"
+            )
+            Image.new("RGB", (20, 20), "blue").save(
+                product / "模特图" / "模特1.png"
+            )
+        page = TaskCreatePage(
+            self.repository,
+            self.resolver,
+            self.actor,
+        )
+        self.assertEqual(page.product_table.rowCount(), 2)
+        rows = {
+            page.product_table.item(row, 2).text(): row
+            for row in range(2)
+        }
+        first_row = rows["DV263q25445p"]
+        second_row = rows["DV262q10001p"]
+
+        page.product_table.selectRow(first_row)
+        page.task_type_combo.setCurrentIndex(
+            page.task_type_combo.findData("buyer_show")
+        )
+        page.note_edit.setText("第一个货号备注")
+        page.urgent_checkbox.setChecked(True)
+
+        page.product_table.selectRow(second_row)
+        self.assertEqual(page.task_type_combo.currentData(), "normal")
+        self.assertEqual(page.note_edit.text(), "")
+        self.assertFalse(page.urgent_checkbox.isChecked())
+        page.note_edit.setText("第二个货号备注")
+
+        page.product_table.selectRow(first_row)
+        self.assertEqual(
+            page.task_type_combo.currentData(),
+            "buyer_show",
+        )
+        self.assertEqual(page.note_edit.text(), "第一个货号备注")
+        self.assertTrue(page.urgent_checkbox.isChecked())
+        page.deleteLater()
+
     def test_product_code_with_suffix_is_submitted_as_base_code(
         self,
     ) -> None:
@@ -1871,7 +2212,7 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.assertEqual(
             page.product_table.item(0, 2).text(),
-            "DV263q25445p8072",
+            "DV263q25445p",
         )
         page.product_table.selectRow(0)
         page.product_table.item(0, 1).setCheckState(
@@ -1888,7 +2229,26 @@ class CollaborationPageTests(unittest.TestCase):
         self.assertEqual(len(self.repository.created_drafts), 1)
         self.assertEqual(
             self.repository.created_drafts[0].product_code,
-            "DV263q25445p8072",
+            "DV263q25445p",
+        )
+        self.assertEqual(
+            self.repository.created_drafts[0].task_type,
+            "normal",
+        )
+        page.task_type_combo.setCurrentIndex(
+            page.task_type_combo.findData("buyer_show")
+        )
+        with (
+            patch(
+                "yixin.ui.task_create_page.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.Yes,
+            ),
+            patch("yixin.ui.task_create_page.QMessageBox.information"),
+        ):
+            page._create_selected()
+        self.assertEqual(
+            self.repository.created_drafts[-1].task_type,
+            "buyer_show",
         )
         page.deleteLater()
 
@@ -2120,7 +2480,7 @@ class CollaborationPageTests(unittest.TestCase):
         )
         self.assertEqual(
             set(payload["menu_permissions"]),
-            {"new_task", "submission_history"},
+            {"new_task", "submission_history", "reports"},
         )
         self.assertEqual(
             payload["project_access"],
@@ -2363,9 +2723,13 @@ class CollaborationPageTests(unittest.TestCase):
             page._create_selected()
         self.assertEqual(len(self.repository.created_drafts), 1)
         draft = self.repository.created_drafts[0]
-        self.assertEqual(draft.product_code, "DV262q10001p8072")
+        self.assertEqual(draft.product_code, "DV262q10001p")
         self.assertEqual(draft.project_code, "")
-        self.assertEqual(len(draft.pairs), 6)
+        self.assertEqual(draft.pairs, ())
+        self.assertEqual(
+            len([a for a in draft.assets if a.role == "model"]),
+            2,
+        )
         page.deleteLater()
 
 
@@ -2585,23 +2949,12 @@ class CollaborationPageTests(unittest.TestCase):
     def test_submission_page_uses_async_paged_repository_queries(
         self,
     ) -> None:
-        write_task_images(self.root)
         project = make_project()
-        task = make_task("approved")
         project_queries = []
-        task_queries = []
-        self.repository.list_board_projects_page = (
-            lambda _actor, statuses, query, page: (
-                project_queries.append((statuses, query, page))
+        self.repository.list_submission_projects_page = (
+            lambda _actor, query, page: (
+                project_queries.append((query, page))
                 or PageResult([project], 125, page.page, page.page_size)
-            )
-        )
-        self.repository.list_board_tasks_for_project_page = (
-            lambda project_id, _actor, statuses, query, page: (
-                task_queries.append(
-                    (project_id, statuses, query, page)
-                )
-                or PageResult([task], 1, page.page, page.page_size)
             )
         )
         page = SubmissionListPage(
@@ -2615,34 +2968,51 @@ class CollaborationPageTests(unittest.TestCase):
         page.refresh()
         for _ in range(100):
             self.app.processEvents()
-            if page.task_table.rowCount():
+            if page.project_table.rowCount():
                 break
             QTest.qWait(10)
         self.assertEqual(page.project_table.rowCount(), 1)
-        self.assertEqual(page.task_table.rowCount(), 1)
-        self.assertEqual(project_queries[0][2].page_size, 100)
-        self.assertEqual(task_queries[0][3].page, 1)
-        self.assertEqual(task_queries[0][3].page_size, 10000)
+        self.assertEqual(project_queries[0][1].page_size, 100)
         self.assertIn("共 125 条", page.project_pagination.summary.text())
-        self.assertFalse(hasattr(page, "task_pagination"))
         page.project_pagination.next_button.click()
         for _ in range(100):
             self.app.processEvents()
             if len(project_queries) >= 2:
                 break
             QTest.qWait(10)
-        self.assertEqual(project_queries[-1][2].page, 2)
+        self.assertEqual(project_queries[-1][1].page, 2)
+        for combo, value in (
+            (page.status_combo, "completed"),
+            (page.listing_combo, "listed"),
+            (page.type_combo, "buyer_show"),
+            (page.range_combo, "7d"),
+        ):
+            combo.blockSignals(True)
+            combo.setCurrentIndex(combo.findData(value))
+            combo.blockSignals(False)
+        page._async_filter_requested()
+        for _ in range(100):
+            self.app.processEvents()
+            if len(project_queries) >= 3:
+                break
+            QTest.qWait(10)
+        query = project_queries[-1][0]
+        self.assertEqual(query.statuses, ("completed",))
+        self.assertEqual(query.listing_status, "listed")
+        self.assertEqual(query.task_type, "buyer_show")
+        self.assertEqual(
+            query.start_date,
+            date.today() - timedelta(days=6),
+        )
         page.deleteLater()
 
     def test_submission_page_ignores_stale_async_response(self) -> None:
         import time
 
-        write_task_images(self.root)
         project = make_project()
-        task = make_task("approved")
         calls = []
 
-        def load_projects(_actor, _statuses, query, page):
+        def load_projects(_actor, query, page):
             calls.append(query.keyword)
             if query.keyword == "旧":
                 time.sleep(0.08)
@@ -2656,15 +3026,7 @@ class CollaborationPageTests(unittest.TestCase):
                 page.page_size,
             )
 
-        self.repository.list_board_projects_page = load_projects
-        self.repository.list_board_tasks_for_project_page = (
-            lambda _project_id, _actor, _statuses, _query, page: PageResult(
-                [task],
-                1,
-                page.page,
-                page.page_size,
-            )
-        )
+        self.repository.list_submission_projects_page = load_projects
         page = SubmissionListPage(
             self.repository,
             self.resolver,
@@ -3329,21 +3691,20 @@ class CollaborationPageTests(unittest.TestCase):
 
     def test_ai_generation_inherits_settings_within_project(self) -> None:
         write_task_images(self.root)
-        first = replace(
-            make_task("claimed"),
-            id=901,
-            task_code="T-901",
-            prompt_text="",
-        )
+        task = make_task("claimed")
+        first = make_project("in_progress")
         second = replace(
-            make_task("claimed"),
-            id=902,
-            task_code="T-902",
-            prompt_text="",
+            make_project("in_progress"),
+            id=2,
+            project_code="春季项目-456-001",
         )
-        self.repository.list_ai_generation_tasks = (
-            lambda _actor, **_kwargs: [first, second]
+        self.repository.project_assets_by_id[first.id] = (
+            self._project_assets_for(task)
         )
+        self.repository.project_assets_by_id[second.id] = (
+            self._project_assets_for(task)
+        )
+        self.repository.generation_projects = [first]
         self.repository.list_queued_attempts = lambda _actor_id: []
         key_store = type(
             "KeyStore",
@@ -3376,29 +3737,18 @@ class CollaborationPageTests(unittest.TestCase):
         page.aspect_combo.setCurrentIndex(
             page.aspect_combo.findData("16:9")
         )
+        page._render_generation_projects([first, second])
         page.task_selector.setCurrentIndex(2)
-        self.assertEqual(page.prompt_edit.toPlainText(), "沿用设置")
-        self.assertEqual(page.aspect_combo.currentData(), "16:9")
-
         multi_prompt = next(
             prompt
             for name, prompt in BUILTIN_PROMPT_TEMPLATES
             if "多图换装" in name
         )
-        other_project = replace(
-            make_task("claimed"),
-            id=903,
-            task_code="T-903",
-            project_id=99,
-            prompt_text="",
-        )
-        self.repository.list_ai_generation_tasks = (
-            lambda _actor, **_kwargs: [other_project]
-        )
-        page.refresh()
-        page.task_selector.setCurrentIndex(1)
         self.assertEqual(page.prompt_edit.toPlainText(), multi_prompt)
         self.assertEqual(page.aspect_combo.currentData(), "3:4")
+        page.task_selector.setCurrentIndex(1)
+        self.assertEqual(page.prompt_edit.toPlainText(), "沿用设置")
+        self.assertEqual(page.aspect_combo.currentData(), "16:9")
         page.deleteLater()
 
     def test_generation_worker_pending_dir_is_not_doubled(self) -> None:

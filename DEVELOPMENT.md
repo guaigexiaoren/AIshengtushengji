@@ -60,7 +60,7 @@ main.py
 
 - `yixin/ui/main_window.py`：顶部导航、按权限加载页面、页面缓存和跨页面刷新。
 - `task_create_page.py`：运营创建任务、扫描共享盘和提交项目。
-- `submission_list_page.py`：查看提交记录和任务详情。
+- `submission_list_page.py`：查看主任务、共享盘 AI 成品并确认上架。
 - `task_assignment_page.py`：AI 人员领取待分配主任务。
 - `ai_generation_page.py`：处理子任务、参考图、提示词和生成队列。
 - `batch_dress_page.py`：批量换装、素材配对和批量入队。

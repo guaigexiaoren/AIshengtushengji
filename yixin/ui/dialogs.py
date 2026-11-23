@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..collaboration.listing import extract_listing_id
 from ..database import Database
 from ..settings import (
     AUTO_STRATEGIES,
@@ -32,6 +33,64 @@ from ..settings import (
     AppSettings,
 )
 from .widgets import CompareWidget, load_scaled_pixmap
+
+
+class ListingConfirmDialog(QDialog):
+    """确认主任务上架：填写完整链接，并显示识别出的链接 ID。"""
+
+    def __init__(
+        self,
+        listing_url: str = "",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("确认上架")
+        self.setMinimumWidth(560)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText("粘贴完整商品链接，例如 https://...")
+        self.url_edit.setText(listing_url)
+        form.addRow("上架链接", self.url_edit)
+        self.id_label = QLabel("")
+        self.id_label.setStyleSheet("color:#60708a;")
+        self.id_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        form.addRow("识别到的 ID", self.id_label)
+        layout.addLayout(form)
+        hint = QLabel(
+            "确认后会同时保存完整链接和识别出的链接 ID；"
+            "之后可以再次点击修改上架信息。"
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#69768c;")
+        layout.addWidget(hint)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("取消")
+        self.confirm_button = QPushButton("确认上架")
+        buttons.addWidget(cancel)
+        buttons.addWidget(self.confirm_button)
+        layout.addLayout(buttons)
+        cancel.clicked.connect(self.reject)
+        self.confirm_button.clicked.connect(self.accept)
+        self.url_edit.textChanged.connect(self._update_id)
+        self._update_id()
+
+    def _update_id(self) -> None:
+        url = self.url_edit.text().strip()
+        listing_id = extract_listing_id(url)
+        if not url:
+            self.id_label.setText("请先填写完整链接")
+        elif listing_id:
+            self.id_label.setText(listing_id)
+        else:
+            self.id_label.setText("未识别到 ID，仍可保存链接")
+        self.confirm_button.setEnabled(bool(url))
+
+    def listing_url(self) -> str:
+        return self.url_edit.text().strip()
 
 
 class SettingsDialog(QDialog):

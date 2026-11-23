@@ -4,6 +4,7 @@ from PySide6.QtCore import QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QFrame,
     QHeaderView,
     QHBoxLayout,
     QLabel,
@@ -37,10 +38,10 @@ from ..collaboration.types import (
 from ..time_utils import utc_naive_to_local
 from ..paging import PageRequest, PageResult, TaskQuery
 from .async_queries import get_query_runner
-from .components import FilterBar, PageActionBar, PageHeader
+from .components import FilterBar, PageActionBar
 from .date_filter import OptionalDateEdit
+from .image_preview import ImagePreviewPane
 from .pagination_bar import PaginationBar
-from .widgets import ImageStrip
 
 
 class TaskAssignmentPage(QWidget):
@@ -91,44 +92,45 @@ class TaskAssignmentPage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(14)
-        header = QHBoxLayout()
-        page_header = PageHeader(
-            "待分配",
-            "选择完整未分配的主任务并整组领取；任一子任务已被领取时整批取消。"
-        )
         self.claim_button = QPushButton("领取所选")
         self.claim_button.setObjectName("PrimaryButton")
         self.claim_button.setEnabled(False)
         self.claim_button.clicked.connect(self._claim_selected)
         refresh = QPushButton("刷新")
+        refresh.setObjectName("SecondaryButton")
         refresh.clicked.connect(self.refresh)
-        page_header.add_action(refresh)
-        header.addWidget(page_header)
-        outer.addLayout(header)
 
         filter_bar = FilterBar()
         filters = filter_bar.layout
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("搜索任务编码、货号、项目或备注")
+        self.search_edit.setPlaceholderText("搜索主任务编码、货号、项目或备注")
         self.project_filter = QComboBox()
         self.project_filter.setMinimumWidth(180)
+        self.urgent_filter = QComboBox()
+        self.urgent_filter.addItem("全部加急情况", None)
+        self.urgent_filter.addItem("仅加急", True)
+        self.urgent_filter.addItem("仅非加急", False)
         self.start_date_edit = OptionalDateEdit("开始日期")
         self.end_date_edit = OptionalDateEdit("结束日期")
         reset_filter = QPushButton("重置筛选")
         filters.addWidget(self.search_edit, 1)
         filters.addWidget(QLabel("项目"))
         filters.addWidget(self.project_filter)
+        filters.addWidget(QLabel("加急"))
+        filters.addWidget(self.urgent_filter)
         filters.addWidget(QLabel("创建时间"))
         filters.addWidget(self.start_date_edit)
         filters.addWidget(QLabel("至"))
         filters.addWidget(self.end_date_edit)
         filters.addWidget(reset_filter)
+        filters.addWidget(refresh)
         outer.addWidget(filter_bar)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        left = QWidget()
+        left = QFrame()
+        left.setObjectName("Card")
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 8, 0)
+        left_layout.setContentsMargins(8, 8, 8, 8)
         project_header = QHBoxLayout()
         project_title = QLabel("主任务")
         project_title.setStyleSheet("font-size:16px;font-weight:700;")
@@ -140,13 +142,14 @@ class TaskAssignmentPage(QWidget):
         project_header.addStretch(1)
         project_header.addWidget(selection_hint)
         left_layout.addLayout(project_header)
-        self.project_table = QTableWidget(0, 6)
+        self.project_table = QTableWidget(0, 7)
         self.project_table.setHorizontalHeaderLabels(
             [
                 "主任务编码",
                 "货号",
                 "项目",
-                "子任务数",
+                "衣服数",
+                "模特数",
                 "加急",
                 "创建时间",
             ]
@@ -166,7 +169,7 @@ class TaskAssignmentPage(QWidget):
         self.project_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Interactive
         )
-        for column, width in enumerate((200, 90, 150, 80, 60, 135)):
+        for column, width in enumerate((200, 100, 140, 70, 70, 60, 135)):
             self.project_table.setColumnWidth(column, width)
         self.project_table.itemSelectionChanged.connect(
             self._selection_changed
@@ -180,53 +183,21 @@ class TaskAssignmentPage(QWidget):
         splitter.addWidget(left)
 
         right = QSplitter(Qt.Orientation.Vertical)
-        task_host = QWidget()
-        task_layout = QVBoxLayout(task_host)
-        task_layout.setContentsMargins(8, 0, 0, 0)
-        task_title = QLabel("子任务明细")
-        task_title.setStyleSheet("font-size:16px;font-weight:700;")
-        task_layout.addWidget(task_title)
-        self.task_table = QTableWidget(0, 5)
-        self.task_table.setHorizontalHeaderLabels(
-            [
-                "子任务编码",
-                "衣服数",
-                "状态",
-                "制作人员",
-                "创建时间",
-            ]
+        self.garment_preview = ImagePreviewPane(
+            "garment_source",
+            "服装素材",
+            async_thumbnails=self.async_mode,
         )
-        self.task_table.verticalHeader().setVisible(False)
-        self.task_table.setSelectionBehavior(
-            QAbstractItemView.SelectionBehavior.SelectRows
+        self.model_preview = ImagePreviewPane(
+            "model_source",
+            "模特素材",
+            async_thumbnails=self.async_mode,
         )
-        self.task_table.setEditTriggers(
-            QAbstractItemView.EditTrigger.NoEditTriggers
-        )
-        self.task_table.setSortingEnabled(True)
-        self.task_table.horizontalHeader().setStretchLastSection(True)
-        self.task_table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Interactive
-        )
-        for column, width in enumerate((210, 70, 90, 110, 135)):
-            self.task_table.setColumnWidth(column, width)
-        self.task_table.itemSelectionChanged.connect(self._task_selected)
-        task_layout.addWidget(self.task_table, 1)
-        right.addWidget(task_host)
-
-        source_host = QWidget()
-        source_layout = QVBoxLayout(source_host)
-        source_layout.setContentsMargins(8, 8, 0, 0)
-        source_title = QLabel("参考图")
-        source_title.setStyleSheet("font-size:16px;font-weight:700;")
-        source_layout.addWidget(source_title)
-        self.source_strip = ImageStrip(icon_size=126)
-        source_layout.addWidget(self.source_strip)
-        source_layout.addStretch(1)
-        right.addWidget(source_host)
-        right.setSizes([430, 220])
+        right.addWidget(self.garment_preview)
+        right.addWidget(self.model_preview)
+        right.setSizes([420, 300])
         splitter.addWidget(right)
-        splitter.setSizes([540, 660])
+        splitter.setSizes([900, 600])
         outer.addWidget(splitter, 1)
         action_bar = PageActionBar()
         action_bar.layout.addStretch(1)
@@ -236,27 +207,22 @@ class TaskAssignmentPage(QWidget):
         self.project_filter.currentIndexChanged.connect(
             self._filter_changed
         )
+        self.urgent_filter.currentIndexChanged.connect(
+            self._filter_changed
+        )
         self.start_date_edit.dateChanged.connect(self._filter_changed)
         self.end_date_edit.dateChanged.connect(self._filter_changed)
         reset_filter.clicked.connect(self._reset_filters)
         if self.async_mode:
             self.project_table.setSortingEnabled(False)
-            self.task_table.setSortingEnabled(False)
-            self.project_table.horizontalHeader().setSortIndicatorShown(True)
-            self.task_table.horizontalHeader().setSortIndicatorShown(True)
-            self.project_table.horizontalHeader().setSortIndicator(
-                5,
+            header = self.project_table.horizontalHeader()
+            header.setSortIndicatorShown(True)
+            header.setSortIndicator(
+                6,
                 Qt.SortOrder.DescendingOrder,
             )
-            self.task_table.horizontalHeader().setSortIndicator(
-                4,
-                Qt.SortOrder.DescendingOrder,
-            )
-            self.project_table.horizontalHeader().sectionClicked.connect(
+            header.sectionClicked.connect(
                 self._project_sort_requested
-            )
-            self.task_table.horizontalHeader().sectionClicked.connect(
-                self._task_sort_requested
             )
 
     def refresh(self) -> None:
@@ -294,7 +260,8 @@ class TaskAssignmentPage(QWidget):
                 project.project_code,
                 project.product_code or project.name,
                 project.project_name,
-                str(project.task_count),
+                str(project.garment_count),
+                str(project.model_count),
                 "是" if project.is_urgent else "否",
                 utc_naive_to_local(project.created_at).strftime(
                     "%Y-%m-%d %H:%M"
@@ -312,9 +279,8 @@ class TaskAssignmentPage(QWidget):
         if self.project_table.rowCount():
             self.project_table.selectRow(0)
         else:
-            self.tasks = []
-            self.task_table.setRowCount(0)
-            self.source_strip.clear()
+            self.garment_preview.clear()
+            self.model_preview.clear()
         self._selection_changed()
 
     def _task_query(self) -> TaskQuery:
@@ -323,6 +289,7 @@ class TaskAssignmentPage(QWidget):
             project_name=self.project_filter.currentData(),
             start_date=self.start_date_edit.python_date(),
             end_date=self.end_date_edit.python_date(),
+            is_urgent=self.urgent_filter.currentData(),
         )
 
     def _refresh_project_filter(self) -> None:
@@ -464,7 +431,8 @@ class TaskAssignmentPage(QWidget):
                 project.project_code,
                 project.product_code or project.name,
                 project.project_name,
-                str(project.task_count),
+                str(project.garment_count),
+                str(project.model_count),
                 "是" if project.is_urgent else "否",
                 utc_naive_to_local(project.created_at).strftime(
                     "%Y-%m-%d %H:%M"
@@ -490,10 +458,8 @@ class TaskAssignmentPage(QWidget):
             self.project_table.selectRow(0)
             self.project_table.blockSignals(False)
         if not self.projects:
-            self.tasks = []
-            self._tasks_by_id = {}
-            self.task_table.setRowCount(0)
-            self.source_strip.clear()
+            self.garment_preview.clear()
+            self.model_preview.clear()
         self._selection_changed()
 
     def _render_tasks(
@@ -583,17 +549,20 @@ class TaskAssignmentPage(QWidget):
         for widget in (
             self.search_edit,
             self.project_filter,
+            self.urgent_filter,
             self.start_date_edit,
             self.end_date_edit,
         ):
             widget.blockSignals(True)
         self.search_edit.clear()
         self.project_filter.setCurrentIndex(0)
+        self.urgent_filter.setCurrentIndex(0)
         self.start_date_edit.clear()
         self.end_date_edit.clear()
         for widget in (
             self.search_edit,
             self.project_filter,
+            self.urgent_filter,
             self.start_date_edit,
             self.end_date_edit,
         ):
@@ -615,9 +584,10 @@ class TaskAssignmentPage(QWidget):
             0: "project_code",
             1: "product_code",
             2: "project_name",
-            3: "task_count",
-            4: "is_urgent",
-            5: "created_at",
+            3: "garment_count",
+            4: "model_count",
+            5: "is_urgent",
+            6: "created_at",
         }
         field = fields.get(column)
         if field is None:
@@ -710,85 +680,43 @@ class TaskAssignmentPage(QWidget):
         )
         self.claim_button.setEnabled(bool(selected_ids))
         project = self._current_project()
-        project_id = project.id if project is not None else None
-        if project_id is not None:
-            if self.async_mode:
-                self._task_page = PageRequest(
-                    page=1,
-                    page_size=100,
-                    sort_field=self._task_sort_field,
-                    sort_direction=self._task_sort_direction,
-                )
-                self._request_tasks(
-                    project_id,
-                    preserve_selection=False,
-                )
-            else:
-                self._load_project_tasks(project_id)
+        if project is None:
+            self.garment_preview.clear()
+            self.model_preview.clear()
+            return
+        self._load_project_assets(project)
 
-    def _load_project_tasks(self, project_id: int) -> None:
+    def _load_project_assets(self, project: ProjectRecord) -> None:
         try:
-            self.tasks = self.repository.list_project_tasks(project_id)
+            assets = self.repository.list_project_assets(project.id)
         except Exception as exc:
-            QMessageBox.warning(self, "读取子任务失败", str(exc))
+            QMessageBox.warning(self, "读取主任务素材失败", str(exc))
             return
-        self._tasks_by_id = {task.id: task for task in self.tasks}
-        self.task_table.setSortingEnabled(False)
-        self.task_table.setRowCount(0)
-        for task in self.tasks:
-            row = self.task_table.rowCount()
-            self.task_table.insertRow(row)
-            values = (
-                task.task_code,
-                str(len(task.garment_assets)),
-                TASK_STATUS_LABELS.get(task.status, task.status),
-                task.assignee_name or "未分配",
-                utc_naive_to_local(task.created_at).strftime(
-                    "%Y-%m-%d %H:%M"
-                ),
-            )
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column == 0:
-                    item.setData(
-                        Qt.ItemDataRole.UserRole,
-                        task.id,
-                    )
-                self.task_table.setItem(row, column, item)
-        self.task_table.setSortingEnabled(True)
-        if self.task_table.rowCount():
-            self.task_table.selectRow(0)
-        else:
-            self.source_strip.clear()
-
-    def _task_selected(self) -> None:
-        row = self.task_table.currentRow()
-        item = self.task_table.item(row, 0) if row >= 0 else None
-        task_id = (
-            int(item.data(Qt.ItemDataRole.UserRole))
-            if item is not None
-            else None
-        )
-        task = self._tasks_by_id.get(task_id)
-        if task is None:
-            self.source_strip.clear()
-            return
-        images: list[tuple[object, str, object]] = []
-        for index, asset in enumerate(task.garment_assets, start=1):
+        garment_items = []
+        model_items = []
+        for asset in assets:
             path = self.resolver.resolve_project_path(
-                task.project_relative_root,
+                project.project_relative_root,
                 asset.relative_path,
             )
-            images.append((path, f"衣服 {index}", asset.relative_path))
-        model_path = self.resolver.resolve_project_path(
-            task.project_relative_root,
-            task.model_path,
-        )
-        images.append((model_path, "模特", task.model_path))
-        if self.async_mode:
-            self.source_strip.set_images_async(images)
-        else:
-            self.source_strip.set_images(images)
+            if asset.role == "garment":
+                garment_items.append(
+                    (
+                        path,
+                        f"服装 {len(garment_items) + 1}",
+                        asset.relative_path,
+                    )
+                )
+            elif asset.role == "model":
+                model_items.append(
+                    (
+                        path,
+                        f"模特 {len(model_items) + 1}",
+                        asset.relative_path,
+                    )
+                )
+        self.garment_preview.set_images(garment_items)
+        self.model_preview.set_images(model_items)
 
     def _claim_selected(self) -> None:
         project_ids = self._selected_project_ids()

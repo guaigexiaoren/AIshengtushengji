@@ -59,7 +59,7 @@ from ..worker import TaskWorker
 from .crop import CropDialog
 from .dialogs import LibraryPickerDialog, TemplateManagerDialog
 from .async_thumbnails import get_thumbnail_loader
-from .components import PageActionBar, PageHeader
+from .components import PageActionBar
 from .widgets import (
     load_scaled_pixmap,
     scan_image_inputs,
@@ -79,6 +79,87 @@ GROUP_KIND_LABELS = {
     "free": "自由组合",
     "auto": "自动组",
 }
+# 颜色词按长度从长到短匹配，避免「白」先命中「白色」以外的内容。
+COLOR_KEYWORDS = (
+    "藏青",
+    "卡其",
+    "牛仔",
+    "咖啡",
+    "米白",
+    "深蓝",
+    "浅蓝",
+    "白色",
+    "黑色",
+    "粉色",
+    "红色",
+    "蓝色",
+    "绿色",
+    "黄色",
+    "灰色",
+    "米色",
+    "杏色",
+    "紫色",
+    "橙色",
+    "银色",
+    "金色",
+    "棕色",
+    "white",
+    "black",
+    "pink",
+    "red",
+    "blue",
+    "green",
+    "yellow",
+    "gray",
+    "grey",
+    "purple",
+    "orange",
+    "beige",
+    "khaki",
+    "navy",
+    "brown",
+    "silver",
+    "gold",
+    "白",
+    "黑",
+    "粉",
+    "红",
+    "蓝",
+    "绿",
+    "黄",
+    "灰",
+    "紫",
+    "橙",
+    "棕",
+)
+
+
+def _color_from_text(text: str) -> str:
+    if not text:
+        return ""
+    folded = text.casefold()
+    for keyword in COLOR_KEYWORDS:
+        if keyword in folded:
+            return keyword
+    return ""
+
+
+def garment_group_key(image: StoredImage) -> str:
+    """推断一张服装图的颜色分组，识别不到返回空串。"""
+    color = _color_from_text(Path(image.original_name).stem)
+    if color:
+        return color
+    if image.relative_path:
+        parts = Path(image.relative_path).parts
+        for part in reversed(parts[:-1]):
+            color = _color_from_text(part)
+            if color:
+                return color
+    if image.source_path is not None:
+        color = _color_from_text(Path(image.source_path).parent.name)
+        if color:
+            return color
+    return ""
 
 
 def _drop_local_paths(mime) -> list[Path]:
@@ -142,6 +223,33 @@ class DressTaskGroup:
             auto_prompt=False,
         )
 
+    @classmethod
+    def grouped(
+        cls,
+        garments: Sequence[StoredImage],
+        person: StoredImage,
+    ) -> DressTaskGroup:
+        chunk = tuple(garments)
+        return cls(
+            references=(*chunk, person),
+            roles=("garment",) * len(chunk) + ("person",),
+            kind="manual",
+            auto_prompt=False,
+        )
+
+    @classmethod
+    def single(
+        cls,
+        garment: StoredImage,
+        person: StoredImage,
+    ) -> DressTaskGroup:
+        return cls(
+            references=(garment, person),
+            roles=("garment", "person"),
+            kind="auto",
+            auto_prompt=True,
+        )
+
 
 DressPair = DressTaskGroup
 
@@ -150,19 +258,24 @@ def auto_match_groups(
     garments: Sequence[StoredImage],
     person: StoredImage,
 ) -> list[DressTaskGroup]:
-    """按参考图上限把衣服分组，每组配同一个人物。"""
+    """按颜色分组，每组衣服配同一个人物；同色超限时继续按上限切分。"""
     garment_chunk_size = MAX_REFERENCE_IMAGES - 1
+    grouped: dict[str, list[StoredImage]] = {}
+    for garment in garments:
+        key = garment_group_key(garment) or "其他"
+        grouped.setdefault(key, []).append(garment)
     groups: list[DressTaskGroup] = []
-    for start in range(0, len(garments), garment_chunk_size):
-        chunk = tuple(garments[start : start + garment_chunk_size])
-        groups.append(
-            DressTaskGroup(
-                references=(*chunk, person),
-                roles=("garment",) * len(chunk) + ("person",),
-                kind="auto",
-                auto_prompt=True,
+    for items in grouped.values():
+        for start in range(0, len(items), garment_chunk_size):
+            chunk = tuple(items[start : start + garment_chunk_size])
+            groups.append(
+                DressTaskGroup(
+                    references=(*chunk, person),
+                    roles=("garment",) * len(chunk) + ("person",),
+                    kind="auto",
+                    auto_prompt=True,
+                )
             )
-        )
     return groups
 
 
@@ -194,6 +307,7 @@ class BatchAssetList(QListWidget):
         self.setDragDropMode(QListWidget.DragDropMode.DropOnly)
         self.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.setWordWrap(True)
+        self.setMinimumHeight(200)
         self._drag_start: QPoint | None = None
         self._drag_row: int | None = None
         self._drag_active = False
@@ -879,7 +993,9 @@ class BatchDressPage(QWidget):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 0, 4, 4)
         layout.setSpacing(8)
-        layout.addWidget(self._build_header())
+        header = self._build_header()
+        if header is not None:
+            layout.addWidget(header)
         if external_top is not None:
             layout.addWidget(external_top)
         self.top_options_host = QWidget()
@@ -916,19 +1032,8 @@ class BatchDressPage(QWidget):
         self.pair_group.setFixedHeight(target)
         self.layout().activate()
 
-    def _build_header(self) -> QWidget:
-        card = QFrame()
-        card.setObjectName("Card")
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(12, 8, 12, 8)
-        layout.setSpacing(2)
-        layout.addWidget(
-            PageHeader(
-                "批量换装",
-                "上传服装和人物素材，完成配对后统一加入生成队列。",
-            )
-        )
-        return card
+    def _build_header(self) -> QWidget | None:
+        return None
 
     def _build_settings(self) -> QWidget:
         card = QGroupBox("生成设置")
@@ -1187,12 +1292,14 @@ class BatchDressPage(QWidget):
         self.pair_count_label = QLabel("已建立 0 个配对")
         self.pair_count_label.setStyleSheet("color:#2e64c4;font-weight:600;")
         self.free_compose_button = QPushButton("自由组合")
-        self.auto_match_button = QPushButton("自动匹配")
+        self.auto_match_button = QPushButton("自动匹配（多服装→单人）")
+        self.auto_match_one_button = QPushButton("自动匹配（单服装→单人）")
         clear_pairs = QPushButton("清空配对")
         top.addWidget(self.pair_count_label)
         top.addStretch(1)
         top.addWidget(self.free_compose_button)
         top.addWidget(self.auto_match_button)
+        top.addWidget(self.auto_match_one_button)
         top.addWidget(clear_pairs)
         layout.addLayout(top)
 
@@ -1215,6 +1322,9 @@ class BatchDressPage(QWidget):
         group.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.free_compose_button.clicked.connect(self._free_compose)
         self.auto_match_button.clicked.connect(self._auto_match)
+        self.auto_match_one_button.clicked.connect(
+            self._auto_match_one_to_one
+        )
         clear_pairs.clicked.connect(self._clear_pairs)
         self._refresh_pairs()
         return group
@@ -1661,8 +1771,10 @@ class BatchDressPage(QWidget):
         self.selected_garment = image if isinstance(image, StoredImage) else None
         self._update_asset_actions()
         if self.selected_garment:
+            count = len(self.garment_list.selectedItems()) or 1
             self.feedback_label.setText(
-                f"已选择服装：{self.selected_garment.original_name}，请点击右侧人物图片。"
+                f"已选择 {count} 张服装，点击人物图片即可组成一组"
+                "（可 Ctrl/Shift 多选）。"
             )
 
     def _person_selection_changed(
@@ -1677,10 +1789,31 @@ class BatchDressPage(QWidget):
         image = item.data(Qt.ItemDataRole.UserRole)
         if not isinstance(image, StoredImage):
             return
-        if self.selected_garment is None:
+        garments = self._selected_garments()
+        if not garments:
             self.feedback_label.setText("请先点击一张服装图片，再点击人物图片。")
             return
-        self._add_pair(self.selected_garment, image)
+        if len(garments) > MAX_REFERENCE_IMAGES - 1:
+            self.feedback_label.setText(
+                f"一次最多选择 {MAX_REFERENCE_IMAGES - 1} 张服装图片。"
+            )
+            return
+        self._add_pair_group(garments, image)
+
+    def _selected_garments(self) -> list[StoredImage]:
+        rows = sorted(
+            self.garment_list.row(item)
+            for item in self.garment_list.selectedItems()
+        )
+        garments: list[StoredImage] = []
+        for row in rows:
+            item = self.garment_list.item(row)
+            data = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if isinstance(data, StoredImage):
+                garments.append(data)
+        if garments:
+            return garments
+        return [self.selected_garment] if self.selected_garment else []
 
     def _garment_dropped(self, content_hash: str, person_row: int) -> None:
         garment = next(
@@ -1743,17 +1876,8 @@ class BatchDressPage(QWidget):
                 "请先上传至少一张人物图片。",
             )
             return
-        if self.pairs:
-            answer = QMessageBox.question(
-                self,
-                "替换现有配对",
-                f"自动匹配将替换当前 {len(self.pairs)} 个配对，"
-                "已上传素材不会删除。\n确定继续吗？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                return
+        if not self._confirm_replace_pairs():
+            return
 
         groups: list[DressTaskGroup] = []
         for person in self.person_assets:
@@ -1763,11 +1887,59 @@ class BatchDressPage(QWidget):
         self.pairs = groups
         self._reset_pair_selection()
         self._refresh_pairs()
-        garment_chunk_size = MAX_REFERENCE_IMAGES - 1
-        split_count = (len(self.garment_assets) + garment_chunk_size - 1) // garment_chunk_size
-        split_hint = f"，每位人物拆为 {split_count} 组" if split_count > 1 else ""
+        color_keys = {
+            garment_group_key(image) or "其他"
+            for image in self.garment_assets
+        }
         self.feedback_label.setText(
-            f"自动匹配已生成 {len(groups)} 组{split_hint}。"
+            f"自动匹配已生成 {len(groups)} 组"
+            f"（按 {len(color_keys)} 个颜色组匹配 "
+            f"{len(self.person_assets)} 个人物）。"
+        )
+
+    def _confirm_replace_pairs(self) -> bool:
+        if not self.pairs:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "替换现有配对",
+            f"自动匹配将替换当前 {len(self.pairs)} 个配对，"
+            "已上传素材不会删除。\n确定继续吗？",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _auto_match_one_to_one(self) -> None:
+        if not self.garment_assets:
+            QMessageBox.information(
+                self,
+                "缺少服装素材",
+                "请先上传至少一张服装图片。",
+            )
+            return
+        if not self.person_assets:
+            QMessageBox.information(
+                self,
+                "缺少人物素材",
+                "请先上传至少一张人物图片。",
+            )
+            return
+        if not self._confirm_replace_pairs():
+            return
+        groups = [
+            DressTaskGroup.single(garment, person)
+            for person in self.person_assets
+            for garment in self.garment_assets
+        ]
+        self.pairs = groups
+        self._reset_pair_selection()
+        self._refresh_pairs()
+        self.feedback_label.setText(
+            f"1 对 1 匹配已生成 {len(groups)} 组"
+            f"（{len(self.garment_assets)} 张服装 × "
+            f"{len(self.person_assets)} 个人物）。"
         )
 
     def _add_pair(self, garment: StoredImage, person: StoredImage) -> None:
@@ -1780,6 +1952,26 @@ class BatchDressPage(QWidget):
         self.feedback_label.setText(
             f"已建立配对 {len(self.pairs)}："
             f"{garment.original_name} × {person.original_name}"
+        )
+        self._reset_pair_selection()
+        self._refresh_pairs()
+
+    def _add_pair_group(
+        self,
+        garments: Sequence[StoredImage],
+        person: StoredImage,
+    ) -> None:
+        pair = DressTaskGroup.grouped(garments, person)
+        if any(existing.key == pair.key for existing in self.pairs):
+            self.feedback_label.setText(
+                "这组“服装 × 人物”已经配对，无需重复添加。"
+            )
+            self._reset_pair_selection()
+            return
+        self.pairs.append(pair)
+        self.feedback_label.setText(
+            f"已建立配对 {len(self.pairs)}："
+            f"{len(garments)} 张服装 × {person.original_name}"
         )
         self._reset_pair_selection()
         self._refresh_pairs()

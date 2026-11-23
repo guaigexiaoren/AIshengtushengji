@@ -66,10 +66,13 @@ class ProjectGarmentStore:
         self.manifest_path = self.task_root / "garments.json"
         self.image_folder = self.task_root / "garments"
 
-    def load(
+    def load_all(
         self,
         source_revision: int,
-    ) -> tuple[StoredImage, ...] | None:
+    ) -> tuple[
+        tuple[StoredImage, ...],
+        tuple[StoredImage, ...],
+    ] | None:
         if not self.manifest_path.is_file():
             return None
         try:
@@ -82,57 +85,82 @@ class ProjectGarmentStore:
                 self._deserialize_image(item)
                 for item in data.get("garments", [])
             )
+            models = tuple(
+                self._deserialize_image(item)
+                for item in data.get("models", [])
+            )
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError):
             return None
-        if not all(image.path.is_file() for image in garments):
+        if not all(image.path.is_file() for image in (*garments, *models)):
             return None
-        return garments
+        return garments, models
 
-    def save(
+    def load(
+        self,
+        source_revision: int,
+    ) -> tuple[StoredImage, ...] | None:
+        result = self.load_all(source_revision)
+        return None if result is None else result[0]
+
+    def save_all(
         self,
         garments: Iterable[StoredImage],
+        models: Iterable[StoredImage],
         source_revision: int,
     ) -> None:
         self.image_folder.mkdir(parents=True, exist_ok=True)
-        payload = []
-        for image in garments:
-            data = image.path.read_bytes()
-            content_hash = sha256_bytes(data)
-            suffix = image.path.suffix.lower() or ".png"
-            destination = self.image_folder / (
-                f"{content_hash[:20]}{suffix}"
-            )
-            if not destination.exists():
-                atomic_copy_file(image.path, destination)
-            payload.append(
-                {
-                    "path": destination.relative_to(
-                        self.task_root
-                    ).as_posix(),
-                    "content_hash": content_hash,
-                    "mime": image.mime,
-                    "width": image.width,
-                    "height": image.height,
-                    "original_name": image.original_name,
-                    "source_path": (
-                        str(image.source_path)
-                        if image.source_path is not None
-                        else ""
-                    ),
-                }
-            )
+        garment_payload = [
+            self._serialize_image(image) for image in garments
+        ]
+        model_payload = [
+            self._serialize_image(image) for image in models
+        ]
         atomic_write_bytes(
             self.manifest_path,
             json.dumps(
                 {
                     "source_revision": int(source_revision),
-                    "garments": payload,
+                    "garments": garment_payload,
+                    "models": model_payload,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
                 indent=2,
             ).encode("utf-8"),
         )
+
+    def save(
+        self,
+        garments: Iterable[StoredImage],
+        source_revision: int,
+    ) -> None:
+        self.save_all(garments, (), source_revision)
+
+    def _serialize_image(self, image: StoredImage) -> dict:
+        data = image.path.read_bytes()
+        content_hash = sha256_bytes(data)
+        suffix = image.path.suffix.lower() or ".png"
+        destination = self.image_folder / (
+            f"{content_hash[:20]}{suffix}"
+        )
+        if not destination.exists():
+            atomic_copy_file(image.path, destination)
+        return {
+            "path": destination.relative_to(
+                self.task_root
+            ).as_posix(),
+            "content_hash": content_hash,
+            "mime": image.mime,
+            "width": image.width,
+            "height": image.height,
+            "original_name": image.original_name,
+            "source_path": (
+                str(image.source_path)
+                if image.source_path is not None
+                else ""
+            ),
+            "relative_path": image.relative_path,
+        }
 
     def _deserialize_image(self, data: dict) -> StoredImage:
         path = (self.task_root / str(data["path"])).resolve()
@@ -146,6 +174,7 @@ class ProjectGarmentStore:
             height=int(data["height"]),
             original_name=str(data["original_name"]),
             source_path=Path(source_text) if source_text else None,
+            relative_path=str(data.get("relative_path") or ""),
         )
 
 
@@ -219,6 +248,7 @@ class LocalTaskSourceStore:
                 mime=mime,
                 width=width,
                 height=height,
+                relative_path=source.parent.name,
             )
             if role == "model":
                 model = stored
@@ -250,6 +280,7 @@ class LocalTaskSourceStore:
             mime=image.mime,
             width=image.width,
             height=image.height,
+            relative_path=image.relative_path,
         )
         if role == "garment":
             garments = list(self.state.garments)
@@ -300,6 +331,7 @@ class LocalTaskSourceStore:
                 mime=model.mime,
                 width=model.width,
                 height=model.height,
+                relative_path=model.relative_path,
             )
             if model is not None
             else None
@@ -325,6 +357,7 @@ class LocalTaskSourceStore:
             mime="",
             width=0,
             height=0,
+            relative_path=current.relative_path,
         )
         if role == "garment":
             garments = list(self.state.garments)
@@ -414,6 +447,7 @@ class LocalTaskSourceStore:
                         height=image.height,
                         original_name=image.original_name,
                         source_path=image.source_path,
+                        relative_path=image.relative_path,
                     )
                 )
             )
@@ -505,6 +539,7 @@ class LocalTaskSourceStore:
                     width=asset.width,
                     height=asset.height,
                     destination_folder=self.baseline_root / "garments",
+                    relative_path=asset.relative_path,
                 )
             )
         model_path = self.resolver.resolve_project_path(
@@ -567,6 +602,7 @@ class LocalTaskSourceStore:
                             destination_folder=(
                                 self.baseline_root / "garments"
                             ),
+                            relative_path=asset.relative_path,
                         )
                     )
                 source = available.get(self.task.model_hash)
@@ -615,6 +651,7 @@ class LocalTaskSourceStore:
                     image.content_hash,
                     image.path,
                 ),
+                relative_path=image.relative_path,
             )
 
         return LocalSourceState(
@@ -635,6 +672,7 @@ class LocalTaskSourceStore:
         width: int,
         height: int,
         destination_folder: Path | None = None,
+        relative_path: str = "",
     ) -> StoredImage:
         source = Path(source).resolve()
         if not source.is_file():
@@ -666,6 +704,7 @@ class LocalTaskSourceStore:
                 if source_path
                 else destination.resolve()
             ),
+            relative_path=relative_path,
         )
 
     def _save(self) -> None:
@@ -773,6 +812,7 @@ class LocalTaskSourceStore:
                 if image.source_path is not None
                 else ""
             ),
+            "relative_path": image.relative_path,
         }
 
     def _deserialize_image(self, data: dict) -> StoredImage:
@@ -787,4 +827,5 @@ class LocalTaskSourceStore:
             height=int(data["height"]),
             original_name=str(data["original_name"]),
             source_path=Path(source_text) if source_text else None,
+            relative_path=str(data.get("relative_path") or ""),
         )

@@ -40,7 +40,7 @@ from ..collaboration.types import (
 from ..constants import MODEL_OPTIONS
 from ..time_utils import utc_naive_to_local
 from .async_queries import get_query_runner
-from .components import FilterBar, PageActionBar, PageHeader, SectionCard
+from .components import FilterBar, SectionCard
 
 
 class MetricCard(QFrame):
@@ -159,12 +159,6 @@ class ReportsPage(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(14)
-        outer.addWidget(
-            PageHeader(
-                "经营报告",
-                "查看真实生成轮次、图片产出、人员效率与成本数据。",
-            )
-        )
 
         filter_bar = FilterBar()
         filters = filter_bar.layout
@@ -201,7 +195,18 @@ class ReportsPage(QWidget):
         filters.addWidget(QLabel("AI人员"))
         filters.addWidget(self.user_filter)
         filters.addWidget(self.model_filter)
+        self.status_label = QLabel("正在加载经营数据…")
+        self.status_label.setObjectName("PageSubtitle")
+        self.refresh_button = QPushButton("刷新数据")
+        self.refresh_button.setObjectName("PrimaryButton")
+        self.refresh_button.clicked.connect(self.refresh)
+        self.export_button = QPushButton("导出 Excel")
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(self._export_report)
+        filters.addWidget(self.export_button)
+        filters.addWidget(self.refresh_button)
         filters.addStretch(1)
+        filters.addWidget(self.status_label)
         outer.addWidget(filter_bar)
 
         scroll = QScrollArea()
@@ -331,20 +336,6 @@ class ReportsPage(QWidget):
         content_layout.addStretch(1)
         scroll.setWidget(content)
         outer.addWidget(scroll, 1)
-
-        action_bar = PageActionBar()
-        self.status_label = QLabel("正在加载经营数据…")
-        self.status_label.setObjectName("PageSubtitle")
-        self.refresh_button = QPushButton("刷新数据")
-        self.refresh_button.setObjectName("PrimaryButton")
-        self.refresh_button.clicked.connect(self.refresh)
-        self.export_button = QPushButton("导出 Excel")
-        self.export_button.setEnabled(False)
-        self.export_button.clicked.connect(self._export_report)
-        action_bar.layout.addWidget(self.status_label, 1)
-        action_bar.layout.addWidget(self.export_button)
-        action_bar.layout.addWidget(self.refresh_button)
-        outer.addWidget(action_bar)
 
         self.preset_filter.currentIndexChanged.connect(
             self._preset_changed

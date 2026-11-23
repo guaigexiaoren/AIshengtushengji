@@ -509,6 +509,23 @@ class MySQLIntegrationTests(unittest.TestCase):
                 repository.get_project(project_id).status,
                 "completed",
             )
+            listing_url = "https://shop.example.com/item/987654321"
+            listing_id = repository.confirm_project_listing(
+                project_id,
+                operator,
+                listing_url,
+            )
+            self.assertEqual(listing_id, "987654321")
+            listed = repository.get_project(project_id)
+            self.assertEqual(listed.listing_url, listing_url)
+            self.assertEqual(listed.listing_id, "987654321")
+            self.assertIsNotNone(listed.listing_confirmed_at)
+            with self.assertRaises(PermissionDeniedError):
+                repository.confirm_project_listing(
+                    project_id,
+                    ai_one,
+                    listing_url,
+                )
             repository.delete_user(admin, operator.id)
             self.assertNotIn(
                 operator.username,

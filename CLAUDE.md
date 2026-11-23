@@ -62,14 +62,16 @@ Qt 初始化 → `AppPaths.ensure()` + 单实例锁 → 旧数据备份/迁移 �
 
 ## 协作业务模型（命名对应关系）
 
-- **项目 project = 主任务**：一次「货号」的提交，`ProjectRecord`。
-- **子任务 task**：每个模特图一个原始子任务；AI 生图按配对拆分出拆后子任务，`ProjectTask`。没有模特图的项目允许提交，但不生成子任务。
+- **项目 project = 主任务**：一次「货号」的提交，包含全部服装和模特素材，`ProjectRecord`。提交阶段**不生成子任务**。
+- **任务类型 task_type**：`normal`（普通）/ `buyer_show`（买家秀），提交时由运营选择，提交记录可按类型筛选。
+- **领取 claim**：待分配页按主任务领取，`projects.assignee_id / claimed_at` 记录领取 AI 人员。
+- **子任务 task**：AI 生图页按主任务载入全部素材，提交配对时每个配对生成一个子任务，`ProjectTask`。`parent_task_id` 新数据为 NULL，不再使用原始子任务和 `expanded` 拆分链。
 - **轮次 attempt**：一次生成请求，`GenerationAttempt`，状态 `queued → running → succeeded/failed/cancelled`。
 - 状态常量集中在 `yixin/collaboration/types.py`，不要硬编码字符串。
 
-链式关系：`projects → project_tasks → task_garments / project_assets → generation_attempts → generation_results`。
+链式关系：`projects → project_assets → project_tasks（配对生成）→ task_garments → generation_attempts → generation_results`。
 
-「提交记录」页只读；「历史记录」页用于查看与重试，两者不是同一功能。
+「提交记录」页按主任务展示，点选后可查看共享盘 `AI成品` 文件夹；运营本人或管理员在主任务完成后可「确认上架」并记录完整链接和链接 ID。「历史记录」页用于查看与重试，两者不是同一功能。
 
 ## 共享盘目录规则
 
@@ -82,8 +84,9 @@ Qt 初始化 → `AppPaths.ensure()` + 单实例锁 → 旧数据备份/迁移 �
 ```
 
 - **只有「内部项目」校验货号格式**（`yixin/collaboration/product_code.py`），外部项目保持自由命名。
-- 货号形如 `DV263q25445p80723`：品牌 2 位 + 年份 2 位 + 季节 1 位（1春2夏3秋4冬）+ 分隔字母 + 流水号 + 分隔字母 + 品类 2 位 + 颜色 2 位 + 可选尺码 1 位。
-- 货号按**前缀**识别，后面追加的字符（`-备注`、`_1` 等）一律忽略；系统统一截断到「品类+颜色」（`base_code`）。
+- 货号形如 `DV263q25445p80723`：品牌 2 位 + 年份 2 位 + 季节 1 位（1春2夏3秋4冬）+ 分隔字母 + 流水号 + 第二个分隔字母。
+- 货号按**前缀**识别，只保留到第二个分隔字母（`DV263q25445p`，`base_code`）；后面的品类、颜色、尺码和备注等字符一律忽略。
+- 截断后同前缀目录视为同一货号，同时出现时标「多个目录对应同一货号」并禁止勾选。
 - 日期目录支持 `11.10`、`2026.11.10`、`11-10`、`2026-11-10`、`20261110`。
 - 衣服图目录别名 `衣服图`/`衣服`/`garment`，模特图目录别名 `模特图`/`模特`/`model`（英文不区分大小写，取优先级最高的一个）。
 - 图片递归扫描会跳过 `备份`、`backup`、`副本`、`temp`、`tmp`、`临时`、`缓存` 和隐藏目录。
@@ -93,7 +96,10 @@ Qt 初始化 → `AppPaths.ensure()` + 单实例锁 → 旧数据备份/迁移 �
 
 - `yixin/provider_router.py`：多平台按优先级调用；网络错误/限流/5xx 自动切换，**请求超时不会自动切换**（服务端可能已生成并计费），这是业务要求。
 - 账号并发名额已满时抛 `GenerationSlotBusyError`，轮次保持排队、延迟重试，不能当成失败处理。
+- AI 生图按主任务操作：选择主任务后载入全部服装和全部模特，提交配对时才创建子任务。
 - AI 生图每个配对固定生成 1 张；普通创作与批量换装支持 1–4 张。
+- 自动匹配有两个入口：「多服装→单人」按颜色分组后每组配一个人物；「单服装→单人」为每张服装 × 每个人物。
+- 服装素材自动匹配时按颜色分组（文件名或子目录中的颜色词），每个颜色组分别与每个人物素材配对；识别不到颜色时退回「每人全部服装」。界面支持 Ctrl/Shift 多选服装后点击人物，手动组成一个多服装配对组。
 - 生成成功后子任务自动完成，全部完成或标记「无需制作」后主任务自动完成。
 - 轮次插入逻辑统一走 `repository._insert_attempt` 等 5 个内部助手（`_next_attempt_no`、`_assign_task_to_actor`、`_update_task_generation_params`、`_attempt_record`），不要在新入口里再复制一份 SQL。
 
